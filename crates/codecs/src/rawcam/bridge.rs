@@ -12,6 +12,12 @@
 //! desynchronises the byte stream, so [`DecodeSession::request_frame`] reports it and the caller
 //! discards the session.
 //!
+//! Protocol 2 bridges say so in their `metadata` event (`"protocol":2,"caps":"…"`, see
+//! [`Caps`]): `frame <index> <scale>` picks the debayer tier per command (one session serves
+//! every tier), and a frame that cannot be produced is answered by
+//! `{"type":"error","index":N,…}` in its place in the reply order — that one request fails, the
+//! session goes on ([`Reply`]). Bridges without the fields are spoken to as before.
+//!
 //! Everything a bridge says is untrusted: dimensions are capped ([`MAX_FRAME_DIM`],
 //! [`MAX_FRAME_BYTES`]) before anything is allocated, pixel reads run on a reader thread so a
 //! stalled bridge times out instead of hanging its caller, and every child process is killed
@@ -28,6 +34,33 @@ pub const MAX_FRAME_DIM: u32 = 16384;
 /// Largest frame a bridge may send, in bytes (a 12K RGBA frame is ~320 MB).
 pub const MAX_FRAME_BYTES: usize = 512 << 20;
 
+/// What a bridge's persistent mode supports, from the `caps` list of its `metadata` event (all
+/// off for a bridge that predates the field).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Caps {
+    /// `frame <index> <scale>`: the debayer tier per command.
+    pub scale: bool,
+    /// `{"type":"error","index":N}` answers one request; the session stays usable.
+    pub frame_errors: bool,
+    /// `--shm <path>`: frames through a shared-memory ring instead of stdout.
+    pub shm: bool,
+}
+
+impl Caps {
+    fn parse(list: Option<&str>) -> Self {
+        let mut caps = Caps::default();
+        for word in list.unwrap_or_default().split(',').map(str::trim) {
+            match word {
+                "scale" => caps.scale = true,
+                "frame-errors" => caps.frame_errors = true,
+                "shm" => caps.shm = true,
+                _ => {}
+            }
+        }
+        caps
+    }
+}
+
 /// Clip facts from a bridge's `metadata` event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Metadata {
@@ -37,6 +70,9 @@ pub struct Metadata {
     pub width: u32,
     pub height: u32,
     pub frame_count: u64,
+    /// Protocol version (1 when absent).
+    pub protocol: u32,
+    pub caps: Caps,
 }
 
 /// The pixel layout of the bytes a bridge sends after a `frame` event (`format` field; absent
@@ -108,6 +144,12 @@ pub enum Event {
         width: u32,
         height: u32,
         format: FrameFormat,
+    },
+    /// One requested frame could not be produced (protocol 2): it takes that request's place in
+    /// the reply order, no pixels follow, the session goes on.
+    FrameError {
+        index: u64,
+        message: String,
     },
     /// After a frame's pixels: the dimensions actually produced.
     Verify {
@@ -188,11 +230,19 @@ pub fn parse_event(line: &str) -> Option<Event> {
             width: json_u32(line, "width")?,
             height: json_u32(line, "height")?,
             frame_count: json_u64(line, "frame_count")?,
+            protocol: json_u32(line, "protocol").unwrap_or(1),
+            caps: Caps::parse(json_str(line, "caps").as_deref()),
         })),
         Some(kind @ ("frame" | "verify")) => json_dims(line, kind),
         Some("progress") => Some(Event::Progress { frame: json_u64(line, "frame")?, total: json_u64(line, "total")? }),
         Some("done") => Some(Event::Done),
-        Some("error") => Some(Event::Error(json_str(line, "message").unwrap_or_else(|| "unknown bridge error".into()))),
+        Some("error") => {
+            let message = json_str(line, "message").unwrap_or_else(|| "unknown bridge error".into());
+            Some(match json_u64(line, "index") {
+                Some(index) => Event::FrameError { index, message },
+                None => Event::Error(message),
+            })
+        }
         _ => None,
     }
 }
@@ -373,6 +423,11 @@ impl PixelReader {
     }
 }
 
+/// One request's outcome on a session that is still in sync: the frame, or why the bridge could
+/// not produce it (a protocol 2 per-frame error — the session stays usable). Failures that break
+/// the session are the outer `Err` of the request functions.
+pub type Reply = Result<FrameBytes, String>;
+
 /// A persistent decode session: the bridge process stays alive (`--persistent`), the SDK is
 /// initialised once, and frames are requested one `frame <index>` command at a time (or in
 /// batches — [`DecodeSession::request_batch`]). Events read past the reply being handled are
@@ -388,13 +443,19 @@ pub struct DecodeSession {
     /// event arrives (usually while the next reply is awaited — the stderr thread delivers it a
     /// moment after the pixels), so a desynchronised stream fails the next request at the latest.
     unverified: Option<(u64, u32, u32)>,
+    /// The start-up `metadata` event: this bridge's capabilities.
+    meta: Metadata,
+    /// Where the last reply's time went: waiting for its announcement (decode), then reading
+    /// its pixels (transport). Diagnostics only (`FILMCRAFT_RAWCAM_STATS`, the benches).
+    pub last_timing: (Duration, Duration),
 }
 
 impl DecodeSession {
     /// Spawn a persistent session at debayer tier `debayer` (the bridge's tier word:
-    /// `full`/`half`/`quarter`/`eighth`, `premium` for R3D full quality). Waits for the startup
-    /// `metadata` event so a broken bridge fails here, not at the first frame. On every failure
-    /// the bridge process is killed and reaped.
+    /// `full`/`half`/`quarter`/`eighth`, `premium` for R3D full quality; with [`Caps::scale`]
+    /// only the default for commands without a scale word). Waits for the startup `metadata`
+    /// event so a broken bridge fails here, not at the first frame. On every failure the bridge
+    /// process is killed and reaped.
     pub fn spawn(bridge: &Path, input: &Path, debayer: &str, timeout: Duration) -> Result<Self, String> {
         let mut cmd = Command::new(bridge);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -412,8 +473,17 @@ impl DecodeSession {
         let deadline = Instant::now() + timeout;
         loop {
             match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Event::Metadata(_)) => {
-                    return Ok(Self { child, stdin, pixels, events, pending: std::collections::VecDeque::new(), unverified: None });
+                Ok(Event::Metadata(meta)) => {
+                    return Ok(Self {
+                        child,
+                        stdin,
+                        pixels,
+                        events,
+                        pending: std::collections::VecDeque::new(),
+                        unverified: None,
+                        meta,
+                        last_timing: (Duration::ZERO, Duration::ZERO),
+                    });
                 }
                 Ok(Event::Error(e)) => {
                     reap(&mut child);
@@ -426,6 +496,11 @@ impl DecodeSession {
                 }
             }
         }
+    }
+
+    /// What this bridge supports (from its start-up `metadata` event).
+    pub fn caps(&self) -> Caps {
+        self.meta.caps
     }
 
     /// Whether the bridge process is still running (a pooled session whose bridge crashed while
@@ -453,52 +528,70 @@ impl DecodeSession {
         }
     }
 
-    /// Request one frame: sends `frame <index>`, waits for the `frame` event (its dimensions
-    /// size the read), reads the pixels and checks the trailing `verify` event. On any error the
-    /// byte stream can no longer be trusted — the caller must discard the session.
-    pub fn request_frame(&mut self, index: u64, timeout: Duration) -> Result<FrameBytes, String> {
-        let _ = writeln!(self.stdin, "frame {index}");
+    /// The command line for frame `index`: with the per-command `scale` word when the bridge
+    /// takes one (otherwise the session's own tier applies and the word is left out).
+    fn command(&self, index: u64, scale: Option<&str>) -> String {
+        match scale.filter(|_| self.meta.caps.scale) {
+            Some(word) => format!("frame {index} {word}\n"),
+            None => format!("frame {index}\n"),
+        }
+    }
+
+    /// Request one frame: sends `frame <index> [scale]`, waits for the `frame` event (its
+    /// dimensions size the read), reads the pixels and checks the trailing `verify` event. The
+    /// outer error means the byte stream can no longer be trusted — the caller must discard the
+    /// session; the inner one is a per-frame error (the session stays usable).
+    pub fn request_frame(&mut self, index: u64, scale: Option<&str>, timeout: Duration) -> Result<Reply, String> {
+        let cmd = self.command(index, scale);
+        self.stdin.write_all(cmd.as_bytes()).map_err(|e| format!("bridge command failed: {e}"))?;
         self.stdin.flush().map_err(|e| format!("bridge command failed: {e}"))?;
         let deadline = Instant::now() + timeout;
         self.receive_frame(index, deadline)
     }
 
-    /// Request several frames in one go: all commands are written before the first reply is
-    /// read, so a pipelined bridge can overlap their reads with the running decode. Replies
-    /// arrive (and are returned) in command order. On any error the stream is desynchronised —
-    /// the caller must discard the session.
-    pub fn request_batch(&mut self, indices: &[u64], timeout: Duration) -> Result<Vec<FrameBytes>, String> {
-        self.request_batch_steered(indices, indices.len().max(1), || true, timeout)
+    /// Request several frames in one go: the bridge pipelines them (reads overlap the running
+    /// decodes). Replies arrive (and are returned) in command order. On an outer error the
+    /// stream is desynchronised — the caller must discard the session.
+    pub fn request_batch(&mut self, indices: &[u64], scale: Option<&str>, timeout: Duration) -> Result<Vec<Reply>, String> {
+        self.request_batch_steered(indices, scale, indices.len().max(1), || true, timeout)
     }
 
-    /// [`Self::request_batch`] in chunks of `chunk` commands, consulting `steer_more` before
-    /// each further chunk: the frames already requested are committed (their replies must be
-    /// read), but no more are sent once the caller no longer wants them — an interactive
-    /// request thus waits at most one chunk behind the read-ahead, not a whole batch.
+    /// [`Self::request_batch`] through a sliding window: at most `window` commands are
+    /// outstanding, and each reply read makes room for the next command — the bridge's pipeline
+    /// stays full instead of draining between chunks. `steer_more` is consulted before every
+    /// further command: the frames already requested are committed (their replies must be
+    /// read), but no more are sent once the caller no longer wants them, so an interactive
+    /// request waits at most `window` replies behind the read-ahead. `timeout` bounds each reply.
     pub fn request_batch_steered(
         &mut self,
         indices: &[u64],
-        chunk: usize,
+        scale: Option<&str>,
+        window: usize,
         mut steer_more: impl FnMut() -> bool,
         timeout: Duration,
-    ) -> Result<Vec<FrameBytes>, String> {
+    ) -> Result<Vec<Reply>, String> {
+        let window = window.max(1);
         let mut out = Vec::with_capacity(indices.len());
-        for part in indices.chunks(chunk.max(1)) {
-            if !out.is_empty() && !steer_more() {
-                break;
-            }
+        let mut sent = 0;
+        let mut sending = true;
+        while out.len() < indices.len() {
             let mut cmd = String::new();
-            for &index in part {
-                cmd.push_str("frame ");
-                cmd.push_str(&index.to_string());
-                cmd.push('\n');
+            while sending && sent < indices.len() && sent - out.len() < window {
+                if sent > 0 && !steer_more() {
+                    sending = false;
+                    break;
+                }
+                if let Some(&index) = indices.get(sent) {
+                    cmd.push_str(&self.command(index, scale));
+                }
+                sent += 1;
             }
-            self.stdin.write_all(cmd.as_bytes()).map_err(|e| format!("bridge command failed: {e}"))?;
-            self.stdin.flush().map_err(|e| format!("bridge command failed: {e}"))?;
-            let deadline = Instant::now() + timeout;
-            for &index in part {
-                out.push(self.receive_frame(index, deadline)?);
+            if !cmd.is_empty() {
+                self.stdin.write_all(cmd.as_bytes()).map_err(|e| format!("bridge command failed: {e}"))?;
+                self.stdin.flush().map_err(|e| format!("bridge command failed: {e}"))?;
             }
+            let Some(&index) = indices.get(out.len()).filter(|_| out.len() < sent) else { break };
+            out.push(self.receive_frame(index, Instant::now() + timeout)?);
         }
         Ok(out)
     }
@@ -515,10 +608,11 @@ impl DecodeSession {
         Ok(())
     }
 
-    /// Wait for the `frame` event of `index` (its dimensions and layout size the read), read
-    /// the pixels (on the reader thread, until `deadline`), check the `verify` events. Events of
-    /// later replies are parked, not consumed.
-    fn receive_frame(&mut self, index: u64, deadline: Instant) -> Result<FrameBytes, String> {
+    /// Wait for the reply to `index` — its `frame` event (dimensions and layout size the read)
+    /// or its per-frame error — read the pixels (on the reader thread, until `deadline`), check
+    /// the `verify` events. Events of later replies are parked, not consumed.
+    fn receive_frame(&mut self, index: u64, deadline: Instant) -> Result<Reply, String> {
+        let waiting_since = Instant::now();
         let (width, height, format) = loop {
             match self.next_event(deadline) {
                 Some(Ok(Event::Frame { index: i, width, height, format })) => {
@@ -526,6 +620,14 @@ impl DecodeSession {
                         return Err(format!("bridge out of sync: answered frame {i} for {index}"));
                     }
                     break (width, height, format);
+                }
+                Some(Ok(Event::FrameError { index: i, message })) => {
+                    if i != index {
+                        return Err(format!("bridge out of sync: error for frame {i} while waiting for {index}"));
+                    }
+                    // The previous frame's `verify` came before this reply (or never will).
+                    self.unverified = None;
+                    return Ok(Err(message));
                 }
                 Some(Ok(Event::Verify { index: i, width: w, height: h })) => self.check_verify(i, w, h)?,
                 Some(Ok(Event::Error(e))) => return Err(e),
@@ -537,6 +639,7 @@ impl DecodeSession {
         // The previous frame's `verify` would have come before this announcement: a bridge that
         // sends none (an older one) is not held to it.
         self.unverified = None;
+        let announced = Instant::now();
         let bytes = frame_bytes(width, height, format)?;
         self.pixels.want.send(bytes).map_err(|_| "bridge frame stream closed".to_string())?;
         let data = match self.pixels.got.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -549,6 +652,7 @@ impl DecodeSession {
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("bridge frame stream closed".into()),
         };
         self.unverified = Some((index, width, height));
+        self.last_timing = (announced.duration_since(waiting_since), announced.elapsed());
         // The `verify` event trails its pixels; when it is already here, check it now and park
         // anything else — it belongs to a later reply, and draining past it would swallow that
         // reply's `frame` announcement and stall the whole batch. Otherwise the next reply checks it.
@@ -559,7 +663,7 @@ impl DecodeSession {
                 other => self.pending.push_back(other),
             }
         }
-        Ok(FrameBytes { data, width, height, format })
+        Ok(Ok(FrameBytes { data, width, height, format }))
     }
 }
 
@@ -580,7 +684,25 @@ mod tests {
         let meta = r#"{"type":"metadata","timecode":"13:37:12:34","fps_num":24000,"fps_den":1001,"width":8192,"height":4320,"frame_count":1200}"#;
         assert_eq!(
             parse_event(meta),
-            Some(Event::Metadata(Metadata { timecode: "13:37:12:34".into(), fps_num: 24000, fps_den: 1001, width: 8192, height: 4320, frame_count: 1200 }))
+            Some(Event::Metadata(Metadata {
+                timecode: "13:37:12:34".into(),
+                fps_num: 24000,
+                fps_den: 1001,
+                width: 8192,
+                height: 4320,
+                frame_count: 1200,
+                protocol: 1,
+                caps: Caps::default()
+            }))
+        );
+        // Protocol 2: version and capabilities (unknown words are ignored).
+        let v2 =
+            r#"{"type":"metadata","timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":2,"caps":"scale,frame-errors,warp"}"#;
+        let Some(Event::Metadata(m)) = parse_event(v2) else { panic!("metadata v2") };
+        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false }));
+        assert_eq!(
+            parse_event(r#"{"type":"error","index":12,"message":"frame index 12 beyond clip"}"#),
+            Some(Event::FrameError { index: 12, message: "frame index 12 beyond clip".into() })
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160}"#),
@@ -653,8 +775,8 @@ done
 "#,
         );
         let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
-        let r = session.request_frame(0, Duration::from_secs(5));
-        assert!(r.as_ref().is_err_and(|e| e.contains("4294967295")), "got {:?}", r.map(|f| f.data.len()));
+        let r = session.request_frame(0, None, Duration::from_secs(5));
+        assert!(r.as_ref().is_err_and(|e| e.contains("4294967295")), "got {:?}", r.map(|f| f.map(|f| f.data.len())));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -675,8 +797,8 @@ sleep 30
         );
         let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
         let t = Instant::now();
-        let r = session.request_frame(0, Duration::from_millis(300));
-        assert!(r.as_ref().is_err_and(|e| e.contains("timed out")), "got {:?}", r.map(|f| f.data.len()));
+        let r = session.request_frame(0, None, Duration::from_millis(300));
+        assert!(r.as_ref().is_err_and(|e| e.contains("timed out")), "got {:?}", r.map(|f| f.map(|f| f.data.len())));
         assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
         assert!(!session.is_alive(), "the stalled bridge is killed");
         std::fs::remove_dir_all(&dir).ok();
@@ -727,10 +849,10 @@ done
 "#,
         );
         let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
-        let first = session.request_frame(0, Duration::from_secs(5));
-        let second = session.request_frame(1, Duration::from_secs(5));
+        let first = session.request_frame(0, None, Duration::from_secs(5));
+        let second = session.request_frame(1, None, Duration::from_secs(5));
         let caught = [&first, &second].iter().any(|r| r.as_ref().is_err_and(|e| e.contains("disagree")));
-        assert!(caught, "mismatch not detected: {:?} / {:?}", first.map(|f| f.width), second.map(|f| f.width));
+        assert!(caught, "mismatch not detected: {:?} / {:?}", first.map(|f| f.map(|f| f.width)), second.map(|f| f.map(|f| f.width)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -766,11 +888,92 @@ while IFS= read -r l; do : ; done
         let input = dir.join("clip.braw");
         std::fs::write(&input, b"placeholder").ok();
         let mut session = DecodeSession::spawn(&bridge, &input, "full", Duration::from_secs(10)).ok().unwrap_or_else(|| panic!("session must start"));
-        let frames = session.request_batch(&[3, 4], Duration::from_secs(5)).unwrap_or_else(|e| panic!("a burst of replies must not stall the batch: {e}"));
+        let frames =
+            session.request_batch(&[3, 4], None, Duration::from_secs(5)).unwrap_or_else(|e| panic!("a burst of replies must not stall the batch: {e}"));
         assert_eq!(frames.len(), 2);
+        let frames: Vec<FrameBytes> = frames.into_iter().map(|r| r.unwrap_or_else(|e| panic!("frame: {e}"))).collect();
         assert_eq!(frames[0].width, 4, "width comes from the frame event");
         assert_eq!(frames[0].height, 2);
         assert_eq!(frames[0].format, FrameFormat::Rgb24);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A protocol 2 bridge answering odd frames with per-frame errors: a batch gets each reply
+    /// in its place, and the session stays usable afterwards. An error naming another frame is a
+    /// desynchronised stream.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_frame_errors_take_their_place_in_a_batch() {
+        let (dir, bridge, clip) = script_bridge(
+            "frameerr",
+            r#"#!/bin/sh
+echo '{"type":"metadata","timecode":"00:00:00:00","fps_num":24,"fps_den":1,"width":2,"height":1,"frame_count":8,"protocol":2,"caps":"scale,frame-errors"}' >&2
+while IFS= read -r line; do
+    set -- ${line#frame }
+    i=$1
+    echo "$line" >> "$0.log"
+    if [ "$i" = 9 ]; then
+        echo '{"type":"error","index":3,"message":"wrong one"}' >&2
+    elif [ $((i % 2)) = 1 ]; then
+        echo "{\"type\":\"error\",\"index\":$i,\"message\":\"frame $i is corrupt\"}" >&2
+    else
+        echo "{\"type\":\"frame\",\"index\":$i,\"width\":2,\"height\":1,\"format\":\"rgba8\"}" >&2
+        printf 'abcdefgh'
+        echo "{\"type\":\"verify\",\"index\":$i,\"width\":2,\"height\":1}" >&2
+    fi
+done
+"#,
+        );
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        assert!(session.caps().scale && session.caps().frame_errors);
+        let replies =
+            session.request_batch(&[0, 1, 2, 3, 4], Some("quarter"), Duration::from_secs(5)).unwrap_or_else(|e| panic!("the session must survive: {e}"));
+        let shape: Vec<bool> = replies.iter().map(|r| r.is_ok()).collect();
+        assert_eq!(shape, [true, false, true, false, true]);
+        assert!(replies.get(1).is_some_and(|r| r.as_ref().is_err_and(|e| e.contains("corrupt"))));
+        let log = std::fs::read_to_string(bridge.with_extension("log")).unwrap_or_default();
+        assert!(log.lines().all(|l| l.ends_with(" quarter")), "the scale word goes with every command: {log}");
+        // Still in sync: the next request works.
+        assert!(session.request_frame(6, None, Duration::from_secs(5)).is_ok_and(|r| r.is_ok()));
+        // An error for a frame nobody asked for breaks the session.
+        assert!(session.request_frame(9, None, Duration::from_secs(5)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read-ahead window: no further command once the caller stops wanting more, but the
+    /// commands already sent are all answered (at most `window` of them).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_steered_batch_stops_sending_but_reads_what_it_sent() {
+        let (dir, bridge, clip) = script_bridge(
+            "window",
+            r#"#!/bin/sh
+echo '{"type":"metadata","timecode":"00:00:00:00","fps_num":24,"fps_den":1,"width":2,"height":1,"frame_count":8}' >&2
+while IFS= read -r line; do
+    i=${line#frame }
+    echo "$i" >> "$0.log"
+    echo "{\"type\":\"frame\",\"index\":$i,\"width\":2,\"height\":1,\"format\":\"rgba8\"}" >&2
+    printf 'abcdefgh'
+done
+"#,
+        );
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        let mut asked = 0;
+        let replies = session
+            .request_batch_steered(
+                &[0, 1, 2, 3, 4, 5],
+                Some("half"),
+                3,
+                || {
+                    asked += 1;
+                    asked < 3
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap_or_else(|e| panic!("batch: {e}"));
+        assert_eq!(replies.len(), 3, "the first command plus two allowed by the steering");
+        let log = std::fs::read_to_string(bridge.with_extension("log")).unwrap_or_default();
+        assert_eq!(log.lines().collect::<Vec<_>>(), ["0", "1", "2"], "a bridge without the scale capability gets no scale word");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

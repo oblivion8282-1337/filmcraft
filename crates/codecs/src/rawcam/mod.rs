@@ -6,10 +6,12 @@
 //!
 //! Frames are full-range sRGB RGB (the SDKs' processed output); audio is extracted once per file
 //! into a cache WAV (`FILMCRAFT_RAWCAM_CACHE`, default `$XDG_CACHE_HOME/filmcraft/rawcam`) and
-//! served through [`filmcraft_media::wav::WavSource`]. Decoding runs on persistent bridge
-//! sessions (one per debayer tier — [`FrameRequest::scale`] picks the tier, so thumbnails
-//! debayer at quarter/eighth resolution), and a read-ahead thread decodes [`PREFETCH_FRAMES`]
-//! ahead of playback so showing a frame is normally a cache hit.
+//! served through [`filmcraft_media::wav::WavSource`]. Decoding runs on a persistent bridge
+//! session ([`FrameRequest::scale`] picks the debayer tier, so thumbnails debayer at
+//! quarter/eighth resolution): a protocol 2 bridge takes the tier with every command, so one
+//! session serves them all; an older one gets a session per tier (at most [`TIERS`]). A
+//! read-ahead thread decodes [`PREFETCH_FRAMES`] ahead of playback through the bridge's
+//! pipeline, so showing a frame is normally a cache hit.
 //!
 //! Scrubbing a paused monitor ([`filmcraft_media::cancel::with_scrub`]) is served at the
 //! [`SCRUB_TIER`] while the seeks come in a burst: a full-resolution 6K debayer takes ~50 ms, a
@@ -50,8 +52,12 @@ const MAX_SLOT_WAIT: Duration = Duration::from_secs(150);
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 /// Decoded frames kept around a seek point (scrubbing back and forth).
 const CACHE_FRAMES: usize = 24;
-/// Live decode sessions kept at once (one per debayer tier in use), most recently used last.
+/// Live decode sessions kept at once for a bridge without per-command scale (one per debayer
+/// tier in use), most recently used last. A protocol 2 bridge needs only one.
 const TIERS: usize = 2;
+/// Frames the read-ahead keeps outstanding in the bridge (its pipeline decodes up to 4 at once).
+/// An interactive request waits behind at most this many replies.
+const READ_AHEAD_WINDOW: usize = 4;
 /// How far a contended request may reach into the cache for a frame to show while it waits.
 const NEAREST_FRAME_TOLERANCE: u64 = 12;
 /// Frames the read-ahead thread decodes past the playhead (≈ 250 ms at 24 fps).
@@ -61,8 +67,11 @@ const IDLE_SESSIONS_AFTER: Duration = Duration::from_secs(20);
 /// Paused-monitor seeks this close together are a scrub burst; the burst ends (the playhead
 /// rests) after this long without a move.
 const SCRUB_REST: Duration = Duration::from_millis(150);
-/// The debayer tier a scrub burst is served at (quarter resolution: ~5× cheaper than full).
+/// The debayer tier a scrub burst is served at (quarter resolution: ~4× cheaper than full).
 const SCRUB_TIER: u32 = 4;
+/// Clips at least this wide scrub at eighth resolution where the bridge has it (an 8K quarter
+/// frame is still 2K).
+const EIGHTH_SCRUB_WIDTH: u32 = 7680;
 /// Longest a refining request waits for a scrub burst to end (another view may keep scrubbing).
 const MAX_REST_WAIT: Duration = Duration::from_millis(300);
 
@@ -111,17 +120,27 @@ impl Format {
             (Format::R3d, 1) => "premium",
             (Format::R3d, 2) => "half",
             (_, 4) => "quarter",
-            (Format::R3d, 8) => "eighth",
+            (_, 8) => "eighth",
             _ => "quarter",
         }
     }
 
-    /// Resolution factor for a scale request: full/half/quarter (BRAW), down to eighth (R3D).
-    /// `draft` steps down one tier: playback may debayer faster than the paused, exact view.
-    fn tier_factor(self, scale: f32, draft: bool) -> u32 {
+    /// Whether the eighth tier is used: R3D always; BRAW from protocol 2 bridges on (`per_command`
+    /// — older ones are not trusted with `--debayer eighth`).
+    fn has_eighth(self, per_command: bool) -> bool {
+        match self {
+            Format::Braw => per_command,
+            Format::R3d => true,
+        }
+    }
+
+    /// Resolution factor for a scale request: full/half/quarter, down to eighth where
+    /// [`Self::has_eighth`]. `draft` steps down one tier: playback may debayer faster than the
+    /// paused, exact view.
+    fn tier_factor(self, scale: f32, draft: bool, per_command: bool) -> u32 {
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         let (factor, smaller) = match self {
-            Format::Braw => {
+            Format::Braw if !self.has_eighth(per_command) => {
                 if scale >= 0.7 {
                     (1, 2)
                 } else if scale >= 0.35 {
@@ -130,7 +149,7 @@ impl Format {
                     (4, 4)
                 }
             }
-            Format::R3d => {
+            Format::Braw | Format::R3d => {
                 if scale >= 0.7 {
                     (1, 2)
                 } else if scale >= 0.35 {
@@ -146,11 +165,8 @@ impl Format {
     }
 
     /// `steps` tiers down from `tier` (a larger factor = cheaper), capped at the format's floor.
-    fn stepped_down(self, tier: u32, steps: u32) -> u32 {
-        let floor = match self {
-            Format::Braw => 4,
-            Format::R3d => 8,
-        };
+    fn stepped_down(self, tier: u32, steps: u32, per_command: bool) -> u32 {
+        let floor = if self.has_eighth(per_command) { 8 } else { 4 };
         let factor = 1_u32.checked_shl(steps.min(4)).unwrap_or(floor);
         tier.saturating_mul(factor).min(floor)
     }
@@ -369,15 +385,18 @@ fn open_audio(f: Format, bridge: &Path, input: &Path, dir: &Path) -> Option<film
     filmcraft_media::wav::WavSource::open(wav.file_name().and_then(|n| n.to_str()).unwrap_or("audio"), Arc::new(reader)).ok()
 }
 
-/// One live bridge run, at a single debayer tier.
+/// Pool key of a session that takes the tier with every command (protocol 2): it serves all.
+const ANY_TIER: u32 = 0;
+
+/// One live bridge run: at a single debayer tier, or at [`ANY_TIER`].
 struct SessionSlot {
     tier: u32,
     session: DecodeSession,
 }
 
-/// Idle decode sessions, at most [`TIERS`] (one per debayer tier in use — playback at full
-/// resolution, thumbnails at quarter — so the two never restart each other), most recently used
-/// last. While a request decodes, it owns its session *outside* this lock with [`VideoState::busy`]
+/// Idle decode sessions: one serving every tier ([`ANY_TIER`]), or for older bridges at most
+/// [`TIERS`] (one per debayer tier in use — playback at full resolution, thumbnails at quarter —
+/// so the two never restart each other), most recently used last. While a request decodes, it owns its session *outside* this lock with [`VideoState::busy`]
 /// set: concurrent requests then serve from the frame cache instead of queueing up behind the
 /// decode (a scrub burst must not restart the bridge once per queued jump).
 struct VideoState {
@@ -394,12 +413,12 @@ impl VideoState {
         VideoState { busy: false, sessions: Vec::new(), failures: 0, retry_at: None }
     }
 
-    /// The pooled session at `tier`, if its bridge still runs (a dead one is dropped: it crashed
-    /// while idle, and the request must not inherit that).
-    fn take_session(&mut self, tier: u32) -> Option<DecodeSession> {
-        let at = self.sessions.iter().position(|s| s.tier == tier)?;
-        let mut session = self.sessions.remove(at).session;
-        session.is_alive().then_some(session)
+    /// A pooled session serving `tier` and its pool key, if its bridge still runs (a dead one is
+    /// dropped: it crashed while idle, and the request must not inherit that).
+    fn take_session(&mut self, tier: u32) -> Option<(u32, DecodeSession)> {
+        let at = self.sessions.iter().position(|s| s.tier == ANY_TIER || s.tier == tier)?;
+        let SessionSlot { tier: key, mut session } = self.sessions.remove(at);
+        session.is_alive().then_some((key, session))
     }
 
     /// How long until a new bridge may be started (`None`: now).
@@ -446,13 +465,15 @@ impl<'a> Lease<'a> {
         Lease { video, held: true }
     }
 
-    fn release(mut self, outcome: Option<(u32, DecodeSession)>, ok: bool) {
+    /// `ok`: `Some(true)` the bridge works, `Some(false)` it failed, `None` no news (a per-frame
+    /// error on a session that is still fine).
+    fn release(mut self, outcome: Option<(u32, DecodeSession)>, ok: Option<bool>) {
         let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
         state.busy = false;
-        if ok {
-            state.note_success();
-        } else {
-            state.note_failure(Instant::now());
+        match ok {
+            Some(true) => state.note_success(),
+            Some(false) => state.note_failure(Instant::now()),
+            None => {}
         }
         if let Some((tier, session)) = outcome {
             state.put_back(tier, session);
@@ -461,13 +482,19 @@ impl<'a> Lease<'a> {
     }
 
     /// The session decoded: back into the pool.
-    fn succeed(self, tier: u32, session: DecodeSession) {
-        self.release(Some((tier, session)), true);
+    fn succeed(self, key: u32, session: DecodeSession) {
+        self.release(Some((key, session)), Some(true));
+    }
+
+    /// The session is in sync but the frame failed (a per-frame error): back into the pool,
+    /// without counting towards the respawn back-off — no bridge has to be restarted.
+    fn keep(self, key: u32, session: DecodeSession) {
+        self.release(Some((key, session)), None);
     }
 
     /// The bridge failed (the session, if any, was dropped by the caller — outside the lock).
     fn fail(self) {
-        self.release(None, false);
+        self.release(None, Some(false));
     }
 }
 
@@ -517,8 +544,11 @@ pub struct RawCamSource {
     /// Recent paused-monitor seeks, for the scrub tier.
     scrub: Mutex<Scrub>,
     /// Interactive requests waiting for the decode slot: the read-ahead starts no batch while
-    /// any wait, and stops a running one at its next chunk.
+    /// any wait, and sends no further command of a running one.
     waiting: AtomicU32,
+    /// The bridge takes the debayer tier with every command (protocol 2, from the probe): one
+    /// session serves every tier. Cleared if a session turns out not to (the binary changed).
+    per_command: AtomicBool,
 }
 
 /// Counts an interactive request in [`RawCamSource::waiting`] while it lives.
@@ -589,6 +619,7 @@ impl RawCamSource {
             shuttle: Mutex::new(Shuttle::default()),
             scrub: Mutex::new(Scrub::default()),
             waiting: AtomicU32::new(0),
+            per_command: AtomicBool::new(meta.caps.scale),
         });
         let _ = src.self_ref.set(Arc::downgrade(&src));
         Ok(src)
@@ -617,14 +648,47 @@ impl RawCamSource {
         }
     }
 
-    /// `pooled`, or a freshly started bridge session at `tier` (called without the lock held:
-    /// the SDK start-up can take seconds).
-    fn open_session(&self, pooled: Option<DecodeSession>, tier: u32) -> Result<DecodeSession, MediaError> {
-        match pooled {
-            Some(s) => Ok(s),
-            None => DecodeSession::spawn(&self.bridge, &self.path, self.format.tier_word(tier), PROBE_TIMEOUT)
-                .map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name()))),
+    /// Whether the bridge takes the tier per command (one session for every tier).
+    fn per_command(&self) -> bool {
+        self.per_command.load(Ordering::Relaxed)
+    }
+
+    /// `pooled`, or a freshly started bridge session serving `tier`, with its pool key (called
+    /// without the lock held: the SDK start-up can take seconds). A protocol 2 bridge starts at
+    /// full resolution and serves every tier ([`ANY_TIER`]); a session that turns out not to
+    /// take per-command tiers (the binary was replaced since the probe) is restarted at `tier`.
+    fn open_session(&self, pooled: Option<(u32, DecodeSession)>, tier: u32) -> Result<(u32, DecodeSession), MediaError> {
+        if let Some(pooled) = pooled {
+            return Ok(pooled);
         }
+        let start = |word: &str| {
+            DecodeSession::spawn(&self.bridge, &self.path, word, PROBE_TIMEOUT)
+                .map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())))
+        };
+        if self.per_command() {
+            let session = start(self.format.tier_word(1))?;
+            if session.caps().scale {
+                return Ok((ANY_TIER, session));
+            }
+            log::warn!("{}: {} no longer takes per-command tiers; one session per tier", self.path.display(), self.format.bridge_name());
+            self.per_command.store(false, Ordering::Relaxed);
+            if tier == 1 {
+                return Ok((1, session));
+            }
+        }
+        Ok((tier, start(self.format.tier_word(tier))?))
+    }
+
+    /// The per-command tier word for a session under pool key `key` (none for a session that
+    /// runs at one tier).
+    fn scale_word(&self, key: u32, tier: u32) -> Option<&'static str> {
+        (key == ANY_TIER).then(|| self.format.tier_word(tier))
+    }
+
+    /// The tier a scrub burst is served at: quarter, eighth for 8K and wider where available.
+    fn scrub_tier(&self) -> u32 {
+        let wide = self.info.video.as_ref().is_some_and(|v| v.width >= EIGHTH_SCRUB_WIDTH);
+        if wide && self.format.has_eighth(self.per_command()) { 8 } else { SCRUB_TIER }
     }
 
     /// The read-ahead loop: keep [`PREFETCH_FRAMES`] frames past the newest interactive request
@@ -686,7 +750,7 @@ impl RawCamSource {
         state.busy = true;
         let lease = Lease::new(&self.video);
         drop(state);
-        let mut session = match self.open_session(pooled, tier) {
+        let (key, mut session) = match self.open_session(pooled, tier) {
             Ok(s) => s,
             Err(e) => {
                 lease.fail();
@@ -694,33 +758,35 @@ impl RawCamSource {
             }
         };
 
-        // Small chunks: an interactive request waits at most one chunk behind this read-ahead,
-        // not a whole batch (the pipeline still fills: the bridge keeps decoding while it
-        // receives). Full and half tiers take one frame per chunk — a 6K full debayer alone is
-        // ~50 ms; the cheap tiers two.
-        let chunk = if tier <= 2 { 1 } else { 2 };
+        // A sliding window over the bridge's pipeline: it stays full (each reply read sends the
+        // next command), and an interactive request arriving meanwhile waits behind at most
+        // [`READ_AHEAD_WINDOW`] replies — no further command is sent once it waits.
         let start_demand = self.demand.load(Ordering::Relaxed);
         let outcome = session.request_batch_steered(
             indices,
-            chunk,
+            self.scale_word(key, tier),
+            READ_AHEAD_WINDOW,
             || self.demand.load(Ordering::Relaxed) == start_demand && self.waiting.load(Ordering::Relaxed) == 0,
             FRAME_TIMEOUT,
         );
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         if outcome.is_ok() {
-            lease.succeed(tier, session);
+            lease.succeed(key, session);
         } else {
             drop(session); // kills and reaps the bridge, outside the lock
             lease.fail();
         }
 
-        let frames = outcome.map_err(|e| {
+        let replies = outcome.map_err(|e| {
             log::warn!("{}: read-ahead batch failed ({e}) — restarting the bridge", self.path.display());
             MediaError::Decode(format!("{}: {e}", self.path.display()))
         })?;
-        for (idx, reply) in indices.iter().zip(frames) {
-            let frame = Arc::new(Self::into_frame(reply, *idx, rate));
-            self.cache_frame((*idx, tier), frame);
+        for (idx, reply) in indices.iter().zip(replies) {
+            match reply {
+                Ok(reply) => self.cache_frame((*idx, tier), Arc::new(Self::into_frame(reply, *idx, rate))),
+                // One bad frame: the interactive request for it reports the error.
+                Err(e) => log::debug!("{}: read-ahead of frame {idx} failed: {e}", self.path.display()),
+            }
         }
         Ok(())
     }
@@ -807,9 +873,9 @@ impl RawCamSource {
             let playing = filmcraft_media::cancel::catch_up().is_some() && !seek;
             let steps = if playing { shuttle_steps(shuttle.factor(rate)) } else { 0 };
             drop(shuttle);
-            let tier = self.format.stepped_down(tier, steps);
+            let tier = self.format.stepped_down(tier, steps, self.per_command());
             let burst = seek && self.scrub.lock().unwrap_or_else(|e| e.into_inner()).observe(Instant::now(), idx);
-            (tier, if burst { tier.max(SCRUB_TIER) } else { tier }, burst)
+            (tier, if burst { tier.max(self.scrub_tier()) } else { tier }, burst)
         } else {
             (tier, tier, false)
         };
@@ -915,10 +981,10 @@ impl RawCamSource {
             drop(waiting.take());
 
             // The session is owned locally while decoding (and started, if need be): the sessions
-            // lock is free, so the bookkeeping above stays responsive. A failed request
-            // desynchronises the byte stream — the session is then dropped (killing its bridge),
-            // and the next request starts a fresh one.
-            let mut session = match self.open_session(pooled, serve_tier) {
+            // lock is free, so the bookkeeping above stays responsive. A request that breaks the
+            // session desynchronises the byte stream — it is then dropped (killing its bridge),
+            // and the next request starts a fresh one. A per-frame error keeps it.
+            let (key, mut session) = match self.open_session(pooled, serve_tier) {
                 Ok(s) => s,
                 Err(e) => {
                     lease.fail();
@@ -927,27 +993,32 @@ impl RawCamSource {
             };
 
             let decode_started = Instant::now();
-            let outcome = session.request_frame(idx, FRAME_TIMEOUT);
+            let outcome = session.request_frame(idx, self.scale_word(key, serve_tier), FRAME_TIMEOUT);
             let decoded_in = decode_started.elapsed();
+            let (decode_wait, transport) = session.last_timing;
             *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-            if outcome.is_ok() {
-                lease.succeed(serve_tier, session);
-            } else {
-                drop(session); // kills and reaps the bridge, outside the lock
-                lease.fail();
+            match &outcome {
+                Ok(Ok(_)) => lease.succeed(key, session),
+                Ok(Err(_)) => lease.keep(key, session),
+                Err(_) => {
+                    drop(session); // kills and reaps the bridge, outside the lock
+                    lease.fail();
+                }
             }
 
             if stats {
                 eprintln!(
-                    "rawcam req idx={idx} tier={serve_tier} want={want:.3} seek={seek} decoded wait={waited:?} decode={decoded_in:?} total={:?}",
+                    "rawcam req idx={idx} tier={serve_tier} want={want:.3} seek={seek} decoded wait={waited:?} decode={decoded_in:?} (bridge {decode_wait:?}, pixels {transport:?}) total={:?}",
                     started.elapsed()
                 );
             }
 
-            let reply = outcome.map_err(|e| {
-                log::warn!("{}: frame {idx} failed ({e}) — restarting the bridge", self.path.display());
-                MediaError::Decode(format!("{}: {e}", self.path.display()))
-            })?;
+            let reply = outcome
+                .map_err(|e| {
+                    log::warn!("{}: frame {idx} failed ({e}) — restarting the bridge", self.path.display());
+                    MediaError::Decode(format!("{}: {e}", self.path.display()))
+                })?
+                .map_err(|e| MediaError::Decode(format!("{}: frame {idx}: {e}", self.path.display())))?;
             let frame = Arc::new(Self::into_frame(reply, idx, rate));
             self.cache_frame((idx, serve_tier), frame.clone());
             if provisional {
@@ -976,7 +1047,7 @@ impl MediaSource for RawCamSource {
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let Some(v) = self.info.video.as_ref() else { return Err(MediaError::NoStream("video")) };
         let idx = frame_index(v.frame_rate, req.time, self.frame_count);
-        let tier = self.format.tier_factor(req.scale, filmcraft_media::cancel::draft());
+        let tier = self.format.tier_factor(req.scale, filmcraft_media::cancel::draft(), self.per_command());
         self.serve(idx, tier, req.scale, !filmcraft_media::cancel::background())
     }
 
@@ -1030,17 +1101,22 @@ mod tests {
 
     #[test]
     fn tier_selection_and_dims() {
-        assert_eq!(Format::Braw.tier_factor(1.0, false), 1);
-        assert_eq!(Format::Braw.tier_factor(0.7, false), 1);
-        assert_eq!(Format::Braw.tier_factor(0.5, false), 2);
-        assert_eq!(Format::Braw.tier_factor(0.1, false), 4);
-        assert_eq!(Format::R3d.tier_factor(0.1, false), 8);
-        assert_eq!(Format::Braw.tier_factor(f32::NAN, false), 1);
+        assert_eq!(Format::Braw.tier_factor(1.0, false, false), 1);
+        assert_eq!(Format::Braw.tier_factor(0.7, false, false), 1);
+        assert_eq!(Format::Braw.tier_factor(0.5, false, false), 2);
+        assert_eq!(Format::Braw.tier_factor(0.1, false, false), 4);
+        assert_eq!(Format::R3d.tier_factor(0.1, false, false), 8);
+        assert_eq!(Format::Braw.tier_factor(f32::NAN, false, false), 1);
         // Draft playback steps one tier down; the floor stays the smallest tier.
-        assert_eq!(Format::Braw.tier_factor(1.0, true), 2);
-        assert_eq!(Format::R3d.tier_factor(1.0, true), 2);
-        assert_eq!(Format::Braw.tier_factor(0.1, true), 4);
+        assert_eq!(Format::Braw.tier_factor(1.0, true, false), 2);
+        assert_eq!(Format::R3d.tier_factor(1.0, true, false), 2);
+        assert_eq!(Format::Braw.tier_factor(0.1, true, false), 4);
+        // A protocol 2 BRAW bridge has the eighth tier too (an older one is not asked for it).
+        assert_eq!(Format::Braw.tier_factor(0.1, false, true), 8);
+        assert_eq!(Format::Braw.tier_factor(0.2, false, true), 4);
+        assert_eq!(Format::Braw.tier_factor(0.2, true, true), 8);
         assert_eq!(Format::Braw.tier_word(1), "full");
+        assert_eq!(Format::Braw.tier_word(8), "eighth");
         assert_eq!(Format::R3d.tier_word(1), "premium");
         assert_eq!(Format::R3d.tier_word(8), "eighth");
     }
@@ -1053,11 +1129,13 @@ mod tests {
         assert_eq!(shuttle_steps(3.0), 1);
         assert_eq!(shuttle_steps(3.2), 2, "high-speed shuttle two tiers");
         // Stepping is capped at the format floor.
-        assert_eq!(Format::Braw.stepped_down(1, 1), 2);
-        assert_eq!(Format::Braw.stepped_down(1, 2), 4);
-        assert_eq!(Format::Braw.stepped_down(4, 2), 4, "BRAW floors at quarter");
-        assert_eq!(Format::R3d.stepped_down(2, 2), 8);
-        assert_eq!(Format::R3d.stepped_down(4, 9), 8, "absurd step counts stay at the floor");
+        assert_eq!(Format::Braw.stepped_down(1, 1, false), 2);
+        assert_eq!(Format::Braw.stepped_down(1, 2, false), 4);
+        assert_eq!(Format::Braw.stepped_down(4, 2, false), 4, "BRAW floors at quarter");
+        assert_eq!(Format::Braw.stepped_down(8, 0, true), 8, "an eighth-tier request stays eighth");
+        assert_eq!(Format::Braw.stepped_down(2, 2, true), 8);
+        assert_eq!(Format::R3d.stepped_down(2, 2, false), 8);
+        assert_eq!(Format::R3d.stepped_down(4, 9, false), 8, "absurd step counts stay at the floor");
     }
 
     #[test]
@@ -1152,6 +1230,19 @@ mod tests {
     /// `u64::MAX` frames.
     #[cfg(target_os = "linux")]
     fn fake_bridge(dir: &Path) -> PathBuf {
+        fake_bridge_with(dir, false)
+    }
+
+    /// [`fake_bridge`] speaking protocol 2 (`v2`): capabilities in `metadata`, the debayer tier
+    /// per command (`frame <index> <scale>`), and per-frame errors for indices past the clip
+    /// (`{"type":"error","index":N}`, the session goes on).
+    #[cfg(target_os = "linux")]
+    fn fake_bridge_v2(dir: &Path) -> PathBuf {
+        fake_bridge_with(dir, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_bridge_with(dir: &Path, v2: bool) -> PathBuf {
         let script = r#"#!/bin/sh
 input= probe=0 persistent=0 start=0 debayer=full count=-1 audio=
 while [ $# -gt 0 ]; do
@@ -1182,7 +1273,7 @@ if [ "$persistent" = 1 ] && [ "$mode" = fail ]; then
     echo '{"type":"error","message":"no GPU"}' >&2
     exit 1
 fi
-echo "{\"type\":\"metadata\",\"timecode\":\"01:02:03:04\",\"fps_num\":24,\"fps_den\":1,\"width\":16,\"height\":8,\"frame_count\":$frames}" >&2
+echo "{\"type\":\"metadata\",\"timecode\":\"01:02:03:04\",\"fps_num\":24,\"fps_den\":1,\"width\":16,\"height\":8,\"frame_count\":$frames$CAPS}" >&2
 [ "$probe" = 1 ] && { echo '{"type":"done"}' >&2; exit 0; }
 if [ -n "$audio" ]; then
     printf 'RIFF$\000\000\000WAVEfmt \020\000\000\000\001\000\001\000\200\273\000\000\000\167\001\000\002\000\020\000data\004\000\000\000\000\000\000\000' > "$audio"
@@ -1191,10 +1282,18 @@ if [ -n "$audio" ]; then
 fi
 # Every decode session appends its PID: the tests assert that seeks reuse the process.
 echo $$ >> "$input.sessions" 2>/dev/null || :
-bytes=$((w * h * 4))
 emit_frame() {
     i=$1
-    b=$(printf "\\$(printf '%03o' $((i + 1)))")
+    w=$((16/factor)) h=$((8/factor))
+    case "$2" in
+        full) w=16 h=8;; half) w=8 h=4;; quarter) w=4 h=2;; eighth) w=2 h=1;;
+    esac
+    if [ -n "$CAPS" ] && { [ "$i" -ge "$frames" ] || { [ "$mode" = bad5 ] && [ "$i" = 5 ]; }; }; then
+        echo "{\"type\":\"error\",\"index\":$i,\"message\":\"frame $i cannot be decoded\"}" >&2
+        return
+    fi
+    bytes=$((w * h * 4))
+    b=$(printf "\\$(printf '%03o' $(((i + 1) % 256)))")
     a=$(printf '\377')
     out= j=0
     while [ $j -lt $bytes ]; do out="$out$b$b$b$a"; j=$((j + 4)); done
@@ -1206,7 +1305,7 @@ emit_frame() {
 if [ "$persistent" = 1 ]; then
     while IFS= read -r line; do
         case "$line" in
-            frame\ *) emit_frame "${line#frame }";;
+            frame\ *) set -- ${line#frame }; emit_frame "$1" "$2";;
             quit) break;;
             "") : ;;
             *) echo "{\"type\":\"error\",\"message\":\"unknown command\"}" >&2;;
@@ -1223,7 +1322,9 @@ while [ "$i" -lt "$end" ]; do
 done
 echo '{"type":"done"}' >&2
 "#;
-        let path = dir.join("fake-bridge");
+        let caps = if v2 { r#","protocol":2,"caps":"scale,frame-errors""# } else { "" };
+        let script = script.replacen("#!/bin/sh\n", &format!("#!/bin/sh\nCAPS='{caps}'\n"), 1);
+        let path = dir.join(if v2 { "fake-bridge-v2" } else { "fake-bridge" });
         std::fs::write(&path, script).ok();
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
@@ -1302,6 +1403,63 @@ echo '{"type":"done"}' >&2
         assert_eq!(audio.sample_rate, 48000);
         assert_eq!(audio.channels.len(), 1);
         assert!(audio.channels.iter().all(|c| c.iter().all(|s| *s == 0.0)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A protocol 2 bridge: one session serves every tier (the scale word goes with each
+    /// command), and BRAW gets the eighth tier.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protocol_2_bridge_serves_every_tier_from_one_session() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let clip = dir.join("clip.braw");
+        std::fs::write(&clip, b"placeholder").ok();
+        let src = RawCamSource::open(&clip, Format::Braw, fake_bridge_v2(&dir), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        assert!(src.per_command(), "the probe saw the capability");
+        src.prefetch_started.store(true, Ordering::Relaxed); // no read-ahead: deterministic tiers
+        let dims = |scale: f32, k: i64| {
+            src.video_frame(FrameRequest { time: Tick::from_rational(k, 1, 24), scale })
+                .map(|f| (f.width, f.height))
+                .unwrap_or_else(|e| panic!("{scale}: {e:?}"))
+        };
+        assert_eq!(dims(1.0, 0), (16, 8));
+        assert_eq!(dims(0.5, 1), (8, 4));
+        assert_eq!(dims(0.3, 2), (4, 2));
+        assert_eq!(dims(0.1, 3), (2, 1), "BRAW eighth tier on a protocol 2 bridge");
+        assert_eq!(dims(1.0, 4), (16, 8));
+        let sessions = std::fs::read_to_string(clip.with_extension("braw.sessions")).unwrap_or_default();
+        assert_eq!(sessions.lines().count(), 1, "one session for all four tiers: {sessions}");
+        let keys: Vec<u32> = src.video.lock().unwrap_or_else(|e| e.into_inner()).sessions.iter().map(|s| s.tier).collect();
+        assert_eq!(keys, vec![ANY_TIER]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A frame the bridge cannot decode fails that one request; the session survives (it was
+    /// killed and respawned for every such frame, and the respawn back-off then failed the
+    /// healthy frames around it too).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_per_frame_error_keeps_the_session() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-bad5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let clip = dir.join("bad5.braw");
+        std::fs::write(&clip, b"bad5 placeholder").ok();
+        let src = RawCamSource::open(&clip, Format::Braw, fake_bridge_v2(&dir), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+        for _ in 0..3 {
+            let bad = src.video_frame(at(5));
+            assert!(matches!(&bad, Err(MediaError::Decode(e)) if e.contains("frame 5")), "got {bad:?}");
+        }
+        for k in [4, 6, 7, 0] {
+            let f = src.video_frame(at(k)).unwrap_or_else(|e| panic!("frame {k} after the bad one: {e:?}"));
+            assert_eq!(f.pts, at(k).time);
+        }
+        let sessions = std::fs::read_to_string(clip.with_extension("braw.sessions")).unwrap_or_default();
+        assert_eq!(sessions.lines().count(), 1, "the bridge was not restarted: {sessions}");
+        let state = src.video.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!((state.failures, state.retry_at), (0, None), "no back-off for a bad frame");
+        drop(state);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1653,18 +1811,122 @@ exit 0
         let format = Format::from_path(&path).unwrap_or_else(|| panic!("{} is not braw/r3d", path.display()));
         let bridge = bridge_path(format).unwrap_or_else(|| panic!("no {} on PATH", format.bridge_name()));
         let src = RawCamSource::open(&path, format, bridge, None).unwrap_or_else(|e| panic!("open failed: {e}"));
-        let mut state = src.video.lock().unwrap_or_else(|e| e.into_inner());
-        let mut session = match state.sessions.iter().position(|s| s.tier == 2) {
-            Some(at) => state.sessions.remove(at).session,
-            None => DecodeSession::spawn(&src.bridge, &src.path, src.format.tier_word(2), PROBE_TIMEOUT).unwrap_or_else(|e| panic!("spawn: {e}")),
-        };
-        drop(state);
+        let pooled = src.video.lock().unwrap_or_else(|e| e.into_inner()).take_session(2);
+        let (key, mut session) = src.open_session(pooled, 2).unwrap_or_else(|e| panic!("spawn: {e}"));
+        let scale = src.scale_word(key, 2);
         let t0 = std::time::Instant::now();
-        let one = session.request_frame(30, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("single request failed: {e}"));
+        let one = session.request_frame(30, scale, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("single request failed: {e}"));
+        let one = one.unwrap_or_else(|e| panic!("frame 30: {e}"));
         eprintln!("single frame 30: {:?} ({}×{}, {:?})", t0.elapsed(), one.width, one.height, one.format);
         let t1 = std::time::Instant::now();
-        let batch = session.request_batch(&[31, 32, 33, 34, 35, 36], Duration::from_secs(10));
+        let batch = session.request_batch(&[31, 32, 33, 34, 35, 36], scale, Duration::from_secs(10));
         eprintln!("batch 31..36: {:?} ({} frames)", t1.elapsed(), batch.as_ref().map_or(0, |b| b.len()));
         let _ = batch.unwrap_or_else(|e| panic!("batch after single failed: {e}"));
+    }
+
+    /// Transport benchmark on real material (`cargo test --release -p filmcraft-codecs
+    /// real_clip_transport_bench -- --ignored --nocapture`): random seeks per tier through one
+    /// session (ms per frame, split into decode wait / pixel transport / conversion), then
+    /// sequential full-resolution throughput through a batch and through the app's serve path.
+    #[test]
+    #[ignore = "needs a real camera file (FILMCRAFT_RAWCAM_REAL) and the vendor bridge"]
+    fn real_clip_transport_bench() {
+        let Some(path) = std::env::var_os("FILMCRAFT_RAWCAM_REAL").map(PathBuf::from) else {
+            panic!("set FILMCRAFT_RAWCAM_REAL to a .braw/.R3D file");
+        };
+        let format = Format::from_path(&path).unwrap_or_else(|| panic!("{} is not braw/r3d", path.display()));
+        let bridge = bridge_path(format).unwrap_or_else(|| panic!("no {} on PATH", format.bridge_name()));
+        let meta = bridge::probe(&bridge, &path, PROBE_TIMEOUT).unwrap_or_else(|e| panic!("probe: {e}"));
+        let rate = FrameRate::new(i64::from(meta.fps_num), i64::from(meta.fps_den.max(1)));
+        let count = meta.frame_count;
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        let mut session = bench_session(&bridge, &path, format);
+        for tier in [8_u32, 4, 2, 1] {
+            if !format.has_eighth(session.src.per_command()) && tier == 8 {
+                continue;
+            }
+            let _ = bench_frame(&mut session, 0, tier, format, rate);
+            let (mut total, mut decode, mut pixels, mut convert) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut dims = (0, 0);
+            for k in 0..24_u64 {
+                let idx = (k * 7919 + 13) % count.max(1);
+                let (t, d, p, c, w, h) = bench_frame(&mut session, idx, tier, format, rate);
+                total.push(t);
+                decode.push(d);
+                pixels.push(p);
+                convert.push(c);
+                dims = (w, h);
+            }
+            eprintln!(
+                "random seek tier 1/{tier} ({}x{}): {:.1} ms/frame (decode wait {:.1}, pixels {:.1}, convert {:.1})",
+                dims.0,
+                dims.1,
+                mean(&total),
+                mean(&decode),
+                mean(&pixels),
+                mean(&convert)
+            );
+        }
+        // Sequential full resolution: back-to-back batches through the pipelined bridge.
+        let start = 100_u64.min(count.saturating_sub(1));
+        let frames: Vec<u64> = (start..(start + 96).min(count)).collect();
+        let t = Instant::now();
+        let mut got = 0;
+        for part in frames.chunks(PREFETCH_FRAMES as usize) {
+            got += bench_batch(&mut session, part, format, rate);
+        }
+        eprintln!("sequential full (window {READ_AHEAD_WINDOW}, batches of {PREFETCH_FRAMES}): {:.1} fps", got as f64 / t.elapsed().as_secs_f64());
+        drop(session);
+        // Sequential full resolution through the app path (read-ahead + cache).
+        let src = RawCamSource::open(&path, format, bridge, None).unwrap_or_else(|e| panic!("open failed: {e}"));
+        let req = |idx: u64| FrameRequest { time: Tick::from_rational(idx as i64, rate.den, rate.num), scale: 1.0 };
+        let _ = src.video_frame(req(start.saturating_sub(1)));
+        let t = Instant::now();
+        for &idx in &frames {
+            src.video_frame(req(idx)).unwrap_or_else(|e| panic!("frame {idx}: {e:?}"));
+        }
+        eprintln!("sequential full (app path, read-ahead): {:.1} fps", frames.len() as f64 / t.elapsed().as_secs_f64());
+    }
+
+    /// Bench helpers: the source's own session pool (one session for every tier on a protocol 2
+    /// bridge, one per tier otherwise).
+    struct BenchSessions {
+        src: Arc<RawCamSource>,
+    }
+
+    fn bench_session(bridge: &Path, path: &Path, format: Format) -> BenchSessions {
+        let src = RawCamSource::open(path, format, bridge.to_path_buf(), None).unwrap_or_else(|e| panic!("open failed: {e}"));
+        BenchSessions { src }
+    }
+
+    /// Run `f` on a session serving `tier` (with its scale word), then pool it again.
+    fn bench_with<R>(s: &mut BenchSessions, tier: u32, f: impl FnOnce(&mut DecodeSession, Option<&'static str>) -> R) -> R {
+        let pooled = s.src.video.lock().unwrap_or_else(|e| e.into_inner()).take_session(tier);
+        let (key, mut session) = s.src.open_session(pooled, tier).unwrap_or_else(|e| panic!("spawn: {e}"));
+        let r = f(&mut session, s.src.scale_word(key, tier));
+        s.src.video.lock().unwrap_or_else(|e| e.into_inner()).put_back(key, session);
+        r
+    }
+
+    fn bench_frame(s: &mut BenchSessions, idx: u64, tier: u32, format: Format, rate: FrameRate) -> (f64, f64, f64, f64, u32, u32) {
+        let _ = format;
+        bench_with(s, tier, |session, scale| {
+            let t = Instant::now();
+            let reply = session.request_frame(idx, scale, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("frame {idx}: {e}"));
+            let reply = reply.unwrap_or_else(|e| panic!("frame {idx}: {e}"));
+            let (d, p) = session.last_timing;
+            let c = Instant::now();
+            let f = RawCamSource::into_frame(reply, idx, rate);
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            (ms(t.elapsed()), ms(d), ms(p), ms(c.elapsed()), f.width, f.height)
+        })
+    }
+
+    fn bench_batch(s: &mut BenchSessions, part: &[u64], format: Format, rate: FrameRate) -> usize {
+        let _ = format;
+        bench_with(s, 1, |session, scale| {
+            let replies = session.request_batch_steered(part, scale, READ_AHEAD_WINDOW, || true, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("batch: {e}"));
+            replies.into_iter().zip(part).filter_map(|(r, &i)| r.ok().map(|r| RawCamSource::into_frame(r, i, rate))).count()
+        })
     }
 }
