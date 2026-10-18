@@ -21,8 +21,17 @@
 //! ([`filmcraft_media::pending::mark_provisional`]); the monitor asks again without the hint, and
 //! that request waits (cancellably) until the playhead has rested for [`SCRUB_REST`] before it
 //! decodes the exact tier — so the refinement never holds the decoder while the drag goes on.
+//!
+//! VRAM: each bridge process carries a CUDA context (~0.4 GB) and the SDK's GPU pools (another
+//! 0.3–2 GB while it decodes). A bridge with the `multi` capability therefore serves every clip
+//! of its format from one process ([`shared`]): each source holds a clip handle on it, not a
+//! process. Older bridges get a process per clip, at most [`max_processes`] per bridge binary
+//! (the least recently used idle one is retired to make room). Sessions idle for
+//! [`IDLE_SESSIONS_AFTER`] are retired by a janitor thread, whatever kind of request used them
+//! last; the shared process exits with its last session.
 
 pub mod bridge;
+mod shared;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +45,7 @@ use filmcraft_media::reader::FileReader;
 use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
 use filmcraft_time::{FrameRate, Tick};
 
-use crate::rawcam::bridge::DecodeSession;
+use crate::rawcam::bridge::{DecodeSession, Session};
 
 /// Longest we wait for a clip probe (the SDKs enumerate GPU backends on first run). Also the
 /// startup wait of a persistent decode session — the same one-off SDK initialisation.
@@ -64,8 +73,14 @@ const READ_AHEAD_WINDOW: usize = 4;
 const NEAREST_FRAME_TOLERANCE: u64 = 12;
 /// Frames the read-ahead thread decodes past the playhead (≈ 250 ms at 24 fps).
 const PREFETCH_FRAMES: u64 = 6;
-/// A quiet spell this long retires the bridge processes (hundreds of MB of SDK state each).
+/// A quiet spell this long retires a source's sessions (its own bridge process, or its handle on
+/// the shared one — which exits with the last handle).
 const IDLE_SESSIONS_AFTER: Duration = Duration::from_secs(20);
+/// How often the janitor looks for idle sessions.
+const JANITOR_PERIOD: Duration = Duration::from_millis(500);
+/// Persistent bridge processes per bridge binary unless `FILMCRAFT_RAWCAM_MAX_PROCESSES` says
+/// otherwise (single-clip bridges need one per clip; a shared multi-clip bridge is one).
+const DEFAULT_MAX_PROCESSES: usize = 4;
 /// Paused-monitor seeks this close together are a scrub burst; the burst ends (the playhead
 /// rests) after this long without a move.
 const SCRUB_REST: Duration = Duration::from_millis(150);
@@ -190,6 +205,17 @@ fn shuttle_steps(speed: f64) -> u32 {
 /// every frame on the pipe — comparisons, or a sandbox without `/dev/shm`).
 fn shm_wanted() -> bool {
     std::env::var_os("FILMCRAFT_RAWCAM_SHM").is_none_or(|v| v != "0")
+}
+
+/// Whether clips may share one multi-clip bridge process (`FILMCRAFT_RAWCAM_MULTI=0`: a process
+/// per clip, as with bridges that predate it — comparisons).
+fn multi_wanted() -> bool {
+    std::env::var_os("FILMCRAFT_RAWCAM_MULTI").is_none_or(|v| v != "0")
+}
+
+/// The cap on persistent processes per bridge binary (`FILMCRAFT_RAWCAM_MAX_PROCESSES`, 1..=64).
+fn max_processes() -> usize {
+    std::env::var("FILMCRAFT_RAWCAM_MAX_PROCESSES").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(DEFAULT_MAX_PROCESSES, |n| n.clamp(1, 64))
 }
 
 /// Whether per-request diagnostics are on (`FILMCRAFT_RAWCAM_STATS=1`): one line per
@@ -399,7 +425,7 @@ const ANY_TIER: u32 = 0;
 /// One live bridge run: at a single debayer tier, or at [`ANY_TIER`].
 struct SessionSlot {
     tier: u32,
-    session: DecodeSession,
+    session: Session,
 }
 
 /// Idle decode sessions: one serving every tier ([`ANY_TIER`]), or for older bridges at most
@@ -423,7 +449,7 @@ impl VideoState {
 
     /// A pooled session serving `tier` and its pool key, if its bridge still runs (a dead one is
     /// dropped: it crashed while idle, and the request must not inherit that).
-    fn take_session(&mut self, tier: u32) -> Option<(u32, DecodeSession)> {
+    fn take_session(&mut self, tier: u32) -> Option<(u32, Session)> {
         let at = self.sessions.iter().position(|s| s.tier == ANY_TIER || s.tier == tier)?;
         let SessionSlot { tier: key, mut session } = self.sessions.remove(at);
         session.is_alive().then_some((key, session))
@@ -451,7 +477,7 @@ impl VideoState {
     }
 
     /// Return a working session to the pool (most recently used last, at most [`TIERS`]).
-    fn put_back(&mut self, tier: u32, session: DecodeSession) {
+    fn put_back(&mut self, tier: u32, session: Session) {
         self.sessions.push(SessionSlot { tier, session });
         if self.sessions.len() > TIERS {
             self.sessions.remove(0);
@@ -475,7 +501,7 @@ impl<'a> Lease<'a> {
 
     /// `ok`: `Some(true)` the bridge works, `Some(false)` it failed, `None` no news (a per-frame
     /// error on a session that is still fine).
-    fn release(mut self, outcome: Option<(u32, DecodeSession)>, ok: Option<bool>) {
+    fn release(mut self, outcome: Option<(u32, Session)>, ok: Option<bool>) {
         let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
         state.busy = false;
         match ok {
@@ -490,13 +516,13 @@ impl<'a> Lease<'a> {
     }
 
     /// The session decoded: back into the pool.
-    fn succeed(self, key: u32, session: DecodeSession) {
+    fn succeed(self, key: u32, session: Session) {
         self.release(Some((key, session)), Some(true));
     }
 
     /// The session is in sync but the frame failed (a per-frame error): back into the pool,
     /// without counting towards the respawn back-off — no bridge has to be restarted.
-    fn keep(self, key: u32, session: DecodeSession) {
+    fn keep(self, key: u32, session: Session) {
         self.release(Some((key, session)), None);
     }
 
@@ -560,6 +586,10 @@ pub struct RawCamSource {
     /// Offer the bridge the shared-memory transport (its probe says it has it; off with
     /// `FILMCRAFT_RAWCAM_SHM=0`). Cleared when a bridge refuses to start with it.
     shm: AtomicBool,
+    /// Decode on the format's shared multi-clip bridge (its probe says it has it; off with
+    /// `FILMCRAFT_RAWCAM_MULTI=0`). Cleared when the shared bridge does not start but a process
+    /// of its own does.
+    multi: AtomicBool,
 }
 
 /// Counts an interactive request in [`RawCamSource::waiting`] while it lives.
@@ -632,8 +662,10 @@ impl RawCamSource {
             waiting: AtomicU32::new(0),
             per_command: AtomicBool::new(meta.caps.scale),
             shm: AtomicBool::new(meta.caps.shm && shm_wanted()),
+            multi: AtomicBool::new(meta.caps.multi && meta.caps.scale && multi_wanted()),
         });
         let _ = src.self_ref.set(Arc::downgrade(&src));
+        register(&src);
         Ok(src)
     }
 
@@ -665,14 +697,48 @@ impl RawCamSource {
         self.per_command.load(Ordering::Relaxed)
     }
 
-    /// `pooled`, or a freshly started bridge session serving `tier`, with its pool key (called
-    /// without the lock held: the SDK start-up can take seconds). A protocol 2 bridge starts at
-    /// full resolution and serves every tier ([`ANY_TIER`]); a session that turns out not to
-    /// take per-command tiers (the binary was replaced since the probe) is restarted at `tier`.
-    fn open_session(&self, pooled: Option<(u32, DecodeSession)>, tier: u32) -> Result<(u32, DecodeSession), MediaError> {
+    /// `pooled`, or a fresh session serving `tier`, with its pool key (called without the lock
+    /// held: starting a bridge can take seconds). A clip handle on the format's shared bridge
+    /// where it serves several clips (one session for every tier), else a process of its own.
+    fn open_session(&self, pooled: Option<(u32, Session)>, tier: u32) -> Result<(u32, Session), MediaError> {
         if let Some(pooled) = pooled {
             return Ok(pooled);
         }
+        if self.multi.load(Ordering::Relaxed) {
+            let manager = shared::manager(&self.bridge);
+            if !manager.isolated(&self.path) {
+                match manager.open(&self.path, self.frame_bytes(), self.shm.load(Ordering::Relaxed), PROBE_TIMEOUT) {
+                    Ok(session) => return Ok((ANY_TIER, Session::Shared(session))),
+                    Err(shared::SharedError::Spawn(e)) => {
+                        // Replaced by a binary without the mode since the probe, or it cannot
+                        // start that way: a process of its own, from now on if that works.
+                        let own = self.open_own(tier);
+                        if own.is_ok() {
+                            log::warn!("{}: shared {} did not start ({e}); one process per clip", self.path.display(), self.format.bridge_name());
+                            self.multi.store(false, Ordering::Relaxed);
+                        }
+                        return own;
+                    }
+                    Err(shared::SharedError::Clip(e) | shared::SharedError::Bridge(e)) => {
+                        return Err(MediaError::Decode(format!("{}: {}: {e}", self.path.display(), self.format.bridge_name())));
+                    }
+                }
+            }
+        }
+        self.open_own(tier)
+    }
+
+    /// The bytes of this clip's full-resolution RGBA frame (the shared bridge's slot size).
+    fn frame_bytes(&self) -> u64 {
+        self.info.video.as_ref().map_or(0, |v| u64::from(v.width).saturating_mul(u64::from(v.height)).saturating_mul(4))
+    }
+
+    /// A bridge process of this clip's own (single-clip `--persistent`), within the process cap.
+    /// A protocol 2 bridge starts at full resolution and serves every tier ([`ANY_TIER`]); a
+    /// session that turns out not to take per-command tiers (the binary was replaced since the
+    /// probe) is restarted at `tier`.
+    fn open_own(&self, tier: u32) -> Result<(u32, Session), MediaError> {
+        self.make_room()?;
         let start = |word: &str| {
             let shm = self.shm.load(Ordering::Relaxed);
             let mut started = DecodeSession::spawn(&self.bridge, &self.path, word, shm, PROBE_TIMEOUT);
@@ -686,7 +752,7 @@ impl RawCamSource {
                     started = plain;
                 }
             }
-            started.map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())))
+            started.map(Session::Own).map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())))
         };
         if self.per_command() {
             let session = start(self.format.tier_word(1))?;
@@ -700,6 +766,47 @@ impl RawCamSource {
             }
         }
         Ok((tier, start(self.format.tier_word(tier))?))
+    }
+
+    /// Below the process cap for this bridge binary, retiring the least recently used idle
+    /// process of another clip if need be; an error when every one is busy.
+    fn make_room(&self) -> Result<(), MediaError> {
+        let cap = max_processes();
+        for _ in 0..=cap {
+            if bridge::live_processes(&self.bridge) < cap {
+                return Ok(());
+            }
+            if !retire_lru_idle(&self.bridge, self) {
+                break;
+            }
+        }
+        if bridge::live_processes(&self.bridge) < cap {
+            return Ok(());
+        }
+        Err(MediaError::Decode(format!(
+            "{}: {cap} {} processes are busy already (FILMCRAFT_RAWCAM_MAX_PROCESSES)",
+            self.path.display(),
+            self.format.bridge_name()
+        )))
+    }
+
+    /// Retire this source's idle sessions (their processes, or handles) when nothing has been
+    /// decoded for `after`; whether there was anything to retire.
+    fn retire_idle(&self, after: Duration, own_only: bool) -> bool {
+        let idle_for = self.activity.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
+        if idle_for < after {
+            return false;
+        }
+        let retired = {
+            let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
+            if state.busy || (own_only && !state.sessions.iter().any(|s| !s.session.is_shared())) {
+                return false;
+            }
+            std::mem::take(&mut state.sessions)
+        };
+        let any = !retired.is_empty();
+        drop(retired); // kills and reaps, outside the lock
+        any
     }
 
     /// The per-command tier word for a session under pool key `key` (none for a session that
@@ -746,10 +853,7 @@ impl RawCamSource {
                 !missing.is_empty() && this.demand.load(Ordering::Relaxed) == start_demand && this.prefetch_batch(&missing, tier).is_ok()
             };
             if !decoded {
-                let idle_for = this.activity.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
-                if idle_for > IDLE_SESSIONS_AFTER {
-                    this.video.lock().unwrap_or_else(|e| e.into_inner()).sessions.clear();
-                }
+                drop(this);
                 std::thread::sleep(Duration::from_millis(20));
             } else {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1018,8 +1122,11 @@ impl RawCamSource {
             let decode_started = Instant::now();
             let outcome = session.request_frame(idx, self.scale_word(key, serve_tier), FRAME_TIMEOUT);
             let decoded_in = decode_started.elapsed();
-            let (decode_wait, transport) = session.last_timing;
+            let (decode_wait, transport) = session.last_timing();
             *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            if session.is_shared() && matches!(outcome, Ok(Ok(_))) {
+                shared::manager(&self.bridge).note_success();
+            }
             match &outcome {
                 Ok(Ok(_)) => lease.succeed(key, session),
                 Ok(Err(_)) => lease.keep(key, session),
@@ -1054,6 +1161,59 @@ impl RawCamSource {
             return Ok(frame);
         }
     }
+}
+
+/// Every open source (weakly): the janitor's and the process cap's view of them.
+fn registry() -> &'static Mutex<Vec<Weak<RawCamSource>>> {
+    static SOURCES: OnceLock<Mutex<Vec<Weak<RawCamSource>>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The live sources (dead entries are dropped on the way).
+fn live_sources() -> Vec<Arc<RawCamSource>> {
+    let mut all = registry().lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|w| w.strong_count() > 0);
+    all.iter().filter_map(Weak::upgrade).collect()
+}
+
+/// Track `src` and make sure the janitor runs.
+fn register(src: &Arc<RawCamSource>) {
+    static JANITOR: AtomicBool = AtomicBool::new(false);
+    registry().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(src));
+    if !JANITOR.swap(true, Ordering::Relaxed) {
+        let started = bridge::spawn_guarded("filmcraft-rawcam-janitor", || {
+            let run = std::panic::catch_unwind(|| {
+                loop {
+                    std::thread::sleep(JANITOR_PERIOD);
+                    for src in live_sources() {
+                        src.retire_idle(IDLE_SESSIONS_AFTER, false);
+                    }
+                }
+            });
+            if run.is_err() {
+                log::error!("camera-RAW janitor panicked; it restarts with the next clip opened");
+            }
+            JANITOR.store(false, Ordering::Relaxed);
+        });
+        if !started {
+            JANITOR.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Retire the idle process of the least recently used other source on `bridge`; whether one was
+/// found.
+fn retire_lru_idle(bridge: &Path, except: &RawCamSource) -> bool {
+    let mut candidates: Vec<(Instant, Arc<RawCamSource>)> = live_sources()
+        .into_iter()
+        .filter(|s| !std::ptr::eq(Arc::as_ptr(s), except) && s.bridge == bridge)
+        .map(|s| {
+            let at = *s.activity.lock().unwrap_or_else(|e| e.into_inner());
+            (at, s)
+        })
+        .collect();
+    candidates.sort_by_key(|c| c.0);
+    candidates.into_iter().any(|(_, s)| s.retire_idle(Duration::ZERO, true))
 }
 
 impl Drop for RawCamSource {
@@ -1253,7 +1413,7 @@ mod tests {
     /// `u64::MAX` frames.
     #[cfg(target_os = "linux")]
     fn fake_bridge(dir: &Path) -> PathBuf {
-        fake_bridge_with(dir, false)
+        fake_bridge_with(dir, 1)
     }
 
     /// [`fake_bridge`] speaking protocol 2 (`v2`): capabilities in `metadata`, the debayer tier
@@ -1261,11 +1421,72 @@ mod tests {
     /// (`{"type":"error","index":N}`, the session goes on).
     #[cfg(target_os = "linux")]
     fn fake_bridge_v2(dir: &Path) -> PathBuf {
-        fake_bridge_with(dir, true)
+        fake_bridge_with(dir, 2)
     }
 
+    /// [`fake_bridge_v2`] that also serves many clips from one process (`--persistent --multi`,
+    /// protocol 3; no shared memory). Every multi-clip process appends its PID to
+    /// `<bridge>.multi` and every command line to `<bridge>.cmds`. A clip file starting with
+    /// "nope" cannot be opened, one starting with "boom" crashes the process at its first frame
+    /// (in either mode), "slow" takes a second per frame. With `<bridge>.nostart` present the
+    /// multi-clip mode fails at start-up.
     #[cfg(target_os = "linux")]
-    fn fake_bridge_with(dir: &Path, v2: bool) -> PathBuf {
+    fn fake_bridge_v3(dir: &Path) -> PathBuf {
+        fake_bridge_with(dir, 3)
+    }
+
+    /// The protocol 3 command loop of [`fake_bridge_v3`].
+    #[cfg(target_os = "linux")]
+    const FAKE_MULTI: &str = r#"if [ "$multi" = 1 ]; then
+    echo $$ >> "$0.multi"
+    [ -f "$0.nostart" ] && { echo '{"type":"error","message":"no GPU"}' >&2; exit 1; }
+    echo '{"type":"ready","protocol":3,"caps":"scale,frame-errors,multi"}' >&2
+    while IFS= read -r line; do
+        echo "$line" >> "$0.cmds"
+        set -- $line
+        case "$1" in
+            open)
+                h=$2; p=${line#open $h }
+                m=$(head -c 4 "$p" 2>/dev/null) || m=
+                if [ ! -f "$p" ] || [ "$m" = nope ]; then
+                    echo "{\"type\":\"error\",\"handle\":$h,\"message\":\"cannot open clip $h\"}" >&2
+                else
+                    eval "clip_$h=x$m"
+                    echo "{\"type\":\"metadata\",\"handle\":$h,\"timecode\":\"01:02:03:04\",\"fps_num\":24,\"fps_den\":1,\"width\":16,\"height\":8,\"frame_count\":8,\"protocol\":3,\"caps\":\"scale,frame-errors,multi\"}" >&2
+                fi;;
+            frame)
+                h=$2 i=$3 s=$4
+                eval "m=\${clip_$h:-}"
+                if [ -z "$m" ]; then
+                    echo "{\"type\":\"error\",\"handle\":$h,\"index\":$i,\"message\":\"no such clip handle\"}" >&2
+                    continue
+                fi
+                [ "$m" = xboom ] && exit 3
+                if [ "$i" -ge 8 ]; then
+                    echo "{\"type\":\"error\",\"handle\":$h,\"index\":$i,\"message\":\"frame $i beyond clip\"}" >&2
+                    continue
+                fi
+                case "$s" in half) w=8 hh=4;; quarter) w=4 hh=2;; eighth) w=2 hh=1;; *) w=16 hh=8;; esac
+                [ "$m" = xslow ] && sleep 1
+                bytes=$((w * hh * 4))
+                b=$(printf "\\$(printf '%03o' $(((i + 1) % 256)))")
+                a=$(printf '\377')
+                out= j=0
+                while [ $j -lt $bytes ]; do out="$out$b$b$b$a"; j=$((j + 4)); done
+                echo "{\"type\":\"frame\",\"handle\":$h,\"index\":$i,\"width\":$w,\"height\":$hh,\"format\":\"rgba8\"}" >&2
+                printf '%s' "$out"
+                echo "{\"type\":\"verify\",\"handle\":$h,\"index\":$i,\"width\":$w,\"height\":$hh}" >&2;;
+            close) eval "clip_$2=";;
+            quit) exit 0;;
+            *) :;;
+        esac
+    done
+    exit 0
+fi
+"#;
+
+    #[cfg(target_os = "linux")]
+    fn fake_bridge_with(dir: &Path, level: u8) -> PathBuf {
         let script = r#"#!/bin/sh
 input= probe=0 persistent=0 start=0 debayer=full count=-1 audio=
 while [ $# -gt 0 ]; do
@@ -1328,7 +1549,7 @@ emit_frame() {
 if [ "$persistent" = 1 ]; then
     while IFS= read -r line; do
         case "$line" in
-            frame\ *) set -- ${line#frame }; emit_frame "$1" "$2";;
+            frame\ *) [ "$mode" = boom ] && exit 3; set -- ${line#frame }; emit_frame "$1" "$2";;
             quit) break;;
             "") : ;;
             *) echo "{\"type\":\"error\",\"message\":\"unknown command\"}" >&2;;
@@ -1345,9 +1566,25 @@ while [ "$i" -lt "$end" ]; do
 done
 echo '{"type":"done"}' >&2
 "#;
-        let caps = if v2 { r#","protocol":2,"caps":"scale,frame-errors""# } else { "" };
-        let script = script.replacen("#!/bin/sh\n", &format!("#!/bin/sh\nCAPS='{caps}'\n"), 1);
-        let path = dir.join(if v2 { "fake-bridge-v2" } else { "fake-bridge" });
+        let caps = match level {
+            1 => "",
+            2 => r#","protocol":2,"caps":"scale,frame-errors""#,
+            _ => r#","protocol":2,"caps":"scale,frame-errors,multi""#,
+        };
+        let mut script = script.replacen("#!/bin/sh\n", &format!("#!/bin/sh\nCAPS='{caps}'\nmulti=0\n"), 1);
+        if level >= 3 {
+            script = script.replacen(
+                "        --persistent) persistent=1; shift;;\n",
+                "        --persistent) persistent=1; shift;;\n        --multi) multi=1; shift;;\n",
+                1,
+            );
+            script = script.replacen("done\nfactor=1\n", &format!("done\n{FAKE_MULTI}factor=1\n"), 1);
+        }
+        let path = dir.join(match level {
+            1 => "fake-bridge",
+            2 => "fake-bridge-v2",
+            _ => "fake-bridge-v3",
+        });
         std::fs::write(&path, script).ok();
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
@@ -1911,6 +2148,92 @@ exit 0
         eprintln!("sequential full (app path, read-ahead): {:.1} fps", frames.len() as f64 / t.elapsed().as_secs_f64());
     }
 
+    /// Live bridge processes started by this test process (by `/proc` parentage and name).
+    fn bridge_children() -> Vec<u32> {
+        let me = std::process::id().to_string();
+        let mut out = Vec::new();
+        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // `pid (comm) state ppid …`
+            let Some((comm, rest)) = stat.split_once(") ").map(|(a, b)| (a.rsplit('(').next().unwrap_or(""), b)) else { continue };
+            let ppid = rest.split_whitespace().nth(1).unwrap_or("");
+            if ppid == me && comm.ends_with("-bridge") && !rest.starts_with('Z') {
+                out.push(pid);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// VRAM (MiB) of each pid per `nvidia-smi`, and the GPU's free MiB.
+    fn gpu_mem(pids: &[u32]) -> (Vec<(u32, u64)>, u64) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("nvidia-smi").args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
+        };
+        let apps = run(&["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]);
+        let used = |pid: u32| {
+            apps.lines().filter_map(|l| l.split_once(',')).find(|(p, _)| p.trim() == pid.to_string()).and_then(|(_, m)| m.trim().parse().ok()).unwrap_or(0)
+        };
+        let free = run(&["--query-gpu=memory.free", "--format=csv,noheader,nounits"]).trim().parse().unwrap_or(0);
+        (pids.iter().map(|&p| (p, used(p))).collect(), free)
+    }
+
+    /// VRAM scenarios on real material (`cargo test --release -p filmcraft-codecs
+    /// real_clips_vram_scenarios -- --ignored --nocapture`): `FILMCRAFT_RAWCAM_REAL_LIST` names
+    /// clips separated by `;` — each opened as its own source (a media item; timeline clips of one
+    /// item share its source), played for a moment at full resolution and scrubbed at quarter.
+    /// Reports bridge processes and their VRAM, then again after the idle retirement. Refuses to
+    /// start with less than 3 GB of VRAM free.
+    #[test]
+    #[ignore = "needs real camera files (FILMCRAFT_RAWCAM_REAL_LIST) and the vendor bridges"]
+    fn real_clips_vram_scenarios() {
+        let list = std::env::var("FILMCRAFT_RAWCAM_REAL_LIST").unwrap_or_else(|_| panic!("set FILMCRAFT_RAWCAM_REAL_LIST"));
+        let (_, free) = gpu_mem(&[]);
+        assert!(free >= 3072, "only {free} MiB VRAM free: not starting");
+        let mut sources = Vec::new();
+        for path in list.split(';').filter(|p| !p.is_empty()).map(PathBuf::from) {
+            let format = Format::from_path(&path).unwrap_or_else(|| panic!("{} is not braw/r3d", path.display()));
+            let bridge = bridge_path(format).unwrap_or_else(|| panic!("no {} on PATH", format.bridge_name()));
+            sources.push(RawCamSource::open(&path, format, bridge, None).unwrap_or_else(|e| panic!("open failed: {e}")));
+        }
+        let t = Instant::now();
+        for (k, src) in sources.iter().enumerate() {
+            let rate = src.info().video.as_ref().map_or(FrameRate::FPS_25, |v| v.frame_rate);
+            let req = |idx: u64, scale: f32| FrameRequest { time: Tick::from_rational(idx as i64, rate.den, rate.num), scale };
+            let base = 50 + 10 * k as u64;
+            for i in 0..12 {
+                src.video_frame(req(base + i, 1.0)).unwrap_or_else(|e| panic!("frame: {e:?}"));
+            }
+            for i in 0..3 {
+                src.video_frame(req(base + 40 * i, 0.2)).unwrap_or_else(|e| panic!("frame: {e:?}"));
+            }
+            let (_, free) = gpu_mem(&[]);
+            assert!(free >= 3072, "only {free} MiB VRAM free: stopping");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let pids = bridge_children();
+        let (mem, free) = gpu_mem(&pids);
+        let total: u64 = mem.iter().map(|m| m.1).sum();
+        eprintln!("{} sources, {} bridge processes, {total} MiB VRAM in all ({free} MiB free), {:?}: {mem:?}", sources.len(), pids.len(), t.elapsed());
+        std::thread::sleep(Duration::from_secs(7));
+        let pids = bridge_children();
+        let (mem, _) = gpu_mem(&pids);
+        eprintln!("after 7 s idle (bridge trim): {} bridge processes, {} MiB: {mem:?}", pids.len(), mem.iter().map(|m| m.1).sum::<u64>());
+        std::thread::sleep(IDLE_SESSIONS_AFTER.saturating_sub(Duration::from_secs(4)));
+        let pids = bridge_children();
+        let (mem, _) = gpu_mem(&pids);
+        eprintln!(
+            "after {:?} idle: {} bridge processes, {} MiB: {mem:?}",
+            IDLE_SESSIONS_AFTER + Duration::from_secs(3),
+            pids.len(),
+            mem.iter().map(|m| m.1).sum::<u64>()
+        );
+        drop(sources);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(bridge_children(), Vec::<u32>::new(), "every bridge is gone with its sources");
+    }
+
     /// Bench helpers: the source's own session pool (one session for every tier on a protocol 2
     /// bridge, one per tier otherwise).
     struct BenchSessions {
@@ -1923,7 +2246,7 @@ exit 0
     }
 
     /// Run `f` on a session serving `tier` (with its scale word), then pool it again.
-    fn bench_with<R>(s: &mut BenchSessions, tier: u32, f: impl FnOnce(&mut DecodeSession, Option<&'static str>) -> R) -> R {
+    fn bench_with<R>(s: &mut BenchSessions, tier: u32, f: impl FnOnce(&mut Session, Option<&'static str>) -> R) -> R {
         let pooled = s.src.video.lock().unwrap_or_else(|e| e.into_inner()).take_session(tier);
         let (key, mut session) = s.src.open_session(pooled, tier).unwrap_or_else(|e| panic!("spawn: {e}"));
         let r = f(&mut session, s.src.scale_word(key, tier));
@@ -1937,7 +2260,7 @@ exit 0
             let t = Instant::now();
             let reply = session.request_frame(idx, scale, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("frame {idx}: {e}"));
             let reply = reply.unwrap_or_else(|e| panic!("frame {idx}: {e}"));
-            let (d, p) = session.last_timing;
+            let (d, p) = session.last_timing();
             let c = Instant::now();
             let f = RawCamSource::into_frame(reply, idx, rate);
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
@@ -1951,5 +2274,200 @@ exit 0
             let replies = session.request_batch_steered(part, scale, READ_AHEAD_WINDOW, || true, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("batch: {e}"));
             replies.into_iter().zip(part).filter_map(|(r, &i)| r.ok().map(|r| RawCamSource::into_frame(r, i, rate))).count()
         })
+    }
+
+    /// `n` clip files in a fresh test dir (contents pick the fake bridge's behaviour).
+    #[cfg(target_os = "linux")]
+    fn clips(name: &str, contents: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let paths = contents
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                let p = dir.join(format!("clip{k}.braw"));
+                std::fs::write(&p, c).ok();
+                p
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_quiet(clip: &Path, bridge: &Path, dir: &Path) -> Arc<RawCamSource> {
+        let src = RawCamSource::open(clip, Format::Braw, bridge.to_path_buf(), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        src.prefetch_started.store(true, Ordering::Relaxed); // no read-ahead: deterministic traffic
+        src
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    /// Wait (at most 3 s) until `bridge` runs `n` persistent processes.
+    #[cfg(target_os = "linux")]
+    fn settle(bridge: &Path, n: usize) -> usize {
+        let t = Instant::now();
+        while bridge::live_processes(bridge) != n && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        bridge::live_processes(bridge)
+    }
+
+    /// Three clips of a multi-clip bridge, decoded at once from three threads: ONE bridge process
+    /// serves them all (each clip a handle on it), every frame holds its own pixels, and the
+    /// process exits with the last source.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_shared_process_serves_every_clip() {
+        let (dir, paths) = clips("shared", &["placeholder"; 3]);
+        let bridge = fake_bridge_v3(&dir);
+        let sources: Vec<_> = paths.iter().map(|p| open_quiet(p, &bridge, &dir)).collect();
+        let workers: Vec<_> = sources
+            .iter()
+            .cloned()
+            .map(|src| {
+                std::thread::spawn(move || {
+                    (0..4_i64)
+                        .map(|k| {
+                            let f = src.video_frame(FrameRequest { time: Tick::from_rational(k, 1, 24), scale: if k == 3 { 0.3 } else { 1.0 } });
+                            f.map(|f| {
+                                (
+                                    f.pts,
+                                    f.width,
+                                    match &f.data {
+                                        filmcraft_frame::PixelData::Rgba8(d) => d.first().copied(),
+                                        _ => None,
+                                    },
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for w in workers {
+            let got = w.join().unwrap_or_else(|_| panic!("worker"));
+            for (k, f) in got.into_iter().enumerate() {
+                let (pts, width, px) = f.unwrap_or_else(|e| panic!("frame {k}: {e:?}"));
+                assert_eq!(pts, Tick::from_rational(k as i64, 1, 24));
+                assert_eq!(px, Some(k as u8 + 1), "frame {k} holds its own pixels");
+                assert_eq!(width, if k == 3 { 4 } else { 16 }, "the tier goes with each command");
+            }
+        }
+        assert_eq!(lines(&bridge.with_extension("multi")).len(), 1, "one process for three clips");
+        assert_eq!(bridge::live_processes(&bridge), 1);
+        let cmds = lines(&bridge.with_extension("cmds"));
+        assert_eq!(cmds.iter().filter(|l| l.starts_with("open ")).count(), 3, "{cmds:?}");
+        assert!(cmds.iter().filter(|l| l.starts_with("frame ")).all(|l| l.split(' ').count() == 4), "frame <handle> <index> <scale>: {cmds:?}");
+        drop(sources);
+        assert_eq!(settle(&bridge, 0), 0, "the shared process exits with its last clip");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clip the shared bridge cannot open fails alone; the clips beside it keep their process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clip_the_shared_bridge_refuses_fails_alone() {
+        let (dir, paths) = clips("refused", &["placeholder", "nope", "placeholder"]);
+        let bridge = fake_bridge_v3(&dir);
+        let sources: Vec<_> = paths.iter().map(|p| open_quiet(p, &bridge, &dir)).collect();
+        let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+        for round in 0..2 {
+            assert!(sources[0].video_frame(at(round)).is_ok());
+            assert!(matches!(sources[1].video_frame(at(round)), Err(MediaError::Decode(_))));
+            assert!(sources[2].video_frame(at(round)).is_ok());
+        }
+        assert_eq!(lines(&bridge.with_extension("multi")).len(), 1, "never restarted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clip that crashes the shared bridge: the bridge is restarted at once and the other clip
+    /// re-opens its handle on the new one; after the clip's second crash it is isolated in a
+    /// process of its own, and its next crashes no longer touch the shared bridge.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_crashing_clip_is_isolated_from_the_shared_bridge() {
+        let (dir, paths) = clips("crash", &["placeholder", "boom"]);
+        let bridge = fake_bridge_v3(&dir);
+        let good = open_quiet(&paths[0], &bridge, &dir);
+        let bad = open_quiet(&paths[1], &bridge, &dir);
+        let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+        let multis = || lines(&bridge.with_extension("multi")).len();
+        assert!(good.video_frame(at(0)).is_ok());
+        assert!(bad.video_frame(at(0)).is_err(), "the crash fails the clip's request");
+        assert!(good.video_frame(at(1)).is_ok(), "the next request restarts the bridge and re-opens");
+        assert_eq!(multis(), 2);
+        std::thread::sleep(RESPAWN_BACKOFF * 2); // the bad clip's own back-off
+        assert!(bad.video_frame(at(1)).is_err(), "second crash");
+        assert!(good.video_frame(at(2)).is_ok());
+        assert_eq!(multis(), 3);
+        std::thread::sleep(RESPAWN_BACKOFF * 3);
+        assert!(bad.video_frame(at(2)).is_err(), "isolated: it crashes its own process now");
+        for k in 3..6 {
+            assert!(good.video_frame(at(k)).is_ok(), "frame {k}");
+        }
+        assert_eq!(multis(), 3, "the shared bridge survived the isolated crash");
+        let own = lines(&paths[1].with_extension("braw.sessions"));
+        assert_eq!(own.len(), 1, "one single-clip process for the isolated clip: {own:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A shared bridge that does not start (`.nostart`): the clip gets a process of its own and
+    /// stays with that mode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_bridge_that_does_not_start_falls_back_to_one_process_per_clip() {
+        let (dir, paths) = clips("nostart", &["placeholder"]);
+        let bridge = fake_bridge_v3(&dir);
+        std::fs::write(bridge.with_extension("nostart"), "").ok();
+        let src = open_quiet(&paths[0], &bridge, &dir);
+        let f = src.video_frame(FrameRequest { time: Tick::from_rational(2, 1, 24), scale: 1.0 }).unwrap_or_else(|e| panic!("frame: {e:?}"));
+        assert_eq!(f.pts, Tick::from_rational(2, 1, 24));
+        assert!(!src.multi.load(Ordering::Relaxed));
+        assert_eq!(lines(&paths[0].with_extension("braw.sessions")).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bridges without the multi-clip mode need a process per clip: at most the cap run at
+    /// once, the least recently used idle one is retired to make room for another clip.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_cap_retires_the_least_recently_used_idle_process() {
+        let cap = max_processes();
+        let (dir, paths) = clips("cap", &vec!["placeholder"; cap + 1]);
+        let bridge = fake_bridge_v2(&dir);
+        let sources: Vec<_> = paths.iter().map(|p| open_quiet(p, &bridge, &dir)).collect();
+        for (k, src) in sources.iter().enumerate() {
+            assert!(src.video_frame(FrameRequest { time: Tick::ZERO, scale: 1.0 }).is_ok(), "clip {k}");
+            assert!(bridge::live_processes(&bridge) <= cap, "clip {k}: {} processes", bridge::live_processes(&bridge));
+            std::thread::sleep(Duration::from_millis(5)); // distinct activity times
+        }
+        assert_eq!(bridge::live_processes(&bridge), cap);
+        let pooled = |s: &RawCamSource| s.video.lock().unwrap_or_else(|e| e.into_inner()).sessions.len();
+        assert_eq!(pooled(&sources[0]), 0, "the oldest idle process made room");
+        assert!(sources[1..].iter().all(|s| pooled(s) == 1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Idle sessions are retired whatever used them last: a source only ever asked for
+    /// thumbnails (background requests start no read-ahead) kept its bridge process forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_sessions_of_background_only_sources_are_retired() {
+        let (dir, paths) = clips("idle", &["placeholder"]);
+        let bridge = fake_bridge_v2(&dir);
+        let src = open_quiet(&paths[0], &bridge, &dir);
+        src.prefetch_started.store(false, Ordering::Relaxed);
+        let thumb = filmcraft_media::cancel::with_background(true, || src.video_frame(FrameRequest { time: Tick::ZERO, scale: 0.1 }));
+        assert!(thumb.is_ok());
+        assert!(!src.prefetch_started.load(Ordering::Relaxed), "no read-ahead (it used to be the only retirer)");
+        assert_eq!(bridge::live_processes(&bridge), 1);
+        assert!(!src.retire_idle(IDLE_SESSIONS_AFTER, false), "not idle yet");
+        assert!(live_sources().iter().any(|s| Arc::ptr_eq(s, &src)), "the janitor sees it");
+        assert!(src.retire_idle(Duration::ZERO, false));
+        assert_eq!(bridge::live_processes(&bridge), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

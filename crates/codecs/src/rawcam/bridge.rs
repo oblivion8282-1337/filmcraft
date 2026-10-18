@@ -27,16 +27,27 @@
 //! `k*S`, and handed back with `release k`; frames without `slot` still arrive on stdout. The
 //! layout and every announced slot are validated before anything is read or allocated.
 //!
+//! Multi-clip transport (`multi` capability, protocol 3): one bridge process — one CUDA context,
+//! one SDK instance and its GPU pools — serves every clip of a format ([`MultiBridge`]). It is
+//! started without `--input` (`--persistent --multi`), announces itself with a `ready` event, and
+//! clips are opened under client-chosen handles (`open <h> <path>`, answered by a `metadata` event
+//! naming the handle). `frame <h> <index> <scale>` / `close <h>` address one clip; every event names
+//! its handle, replies of one handle keep their command order and replies of different handles
+//! interleave. A reader thread demultiplexes the event stream to the waiting requests of each
+//! handle ([`ClipSession`]); one clip's per-frame errors or close never disturb another.
+//!
 //! Everything a bridge says is untrusted: dimensions are capped ([`MAX_FRAME_DIM`],
 //! [`MAX_FRAME_BYTES`]) before anything is allocated, pixel reads run on a reader thread so a
 //! stalled bridge times out instead of hanging its caller, and every child process is killed
 //! and reaped on every exit path.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 /// Largest frame side a bridge may announce (16K; the largest camera sensors are 12K).
@@ -47,6 +58,11 @@ pub const MAX_FRAME_BYTES: usize = 512 << 20;
 pub const MAX_SHM_SLOTS: u64 = 16;
 /// Largest shared-memory ring a bridge may claim, in bytes.
 pub const MAX_SHM_BYTES: u64 = 4 << 30;
+/// Most frame bytes requested from all bridges together and not yet received: read-ahead stops
+/// sending once it would pass this (an interactive request always goes).
+pub const MAX_INFLIGHT_BYTES: u64 = 1 << 30;
+/// Longest path a multi-clip `open` command carries (the bridges cap a command line at 64 KiB).
+const MAX_OPEN_PATH: usize = 16 << 10;
 
 /// What a bridge's persistent mode supports, from the `caps` list of its `metadata` event (all
 /// off for a bridge that predates the field).
@@ -58,6 +74,8 @@ pub struct Caps {
     pub frame_errors: bool,
     /// `--shm <path>`: frames through a shared-memory ring instead of stdout.
     pub shm: bool,
+    /// `--persistent --multi`: one process serves many clips under handles (protocol 3).
+    pub multi: bool,
 }
 
 impl Caps {
@@ -68,6 +86,7 @@ impl Caps {
                 "scale" => caps.scale = true,
                 "frame-errors" => caps.frame_errors = true,
                 "shm" => caps.shm = true,
+                "multi" => caps.multi = true,
                 _ => {}
             }
         }
@@ -154,6 +173,12 @@ pub struct FrameBytes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Metadata(Metadata),
+    /// A multi-clip bridge is up (`--multi`): its protocol, capabilities and shared-memory ring.
+    Ready {
+        protocol: u32,
+        caps: Caps,
+        shm: Option<(u64, u64)>,
+    },
     /// Before a frame's pixels: the frame the following bytes belong to, its dimensions and
     /// pixel layout.
     Frame {
@@ -263,6 +288,11 @@ pub fn parse_event(line: &str) -> Option<Event> {
             caps: Caps::parse(json_str(line, "caps").as_deref()),
             shm: json_u64(line, "shm_slots").zip(json_u64(line, "shm_slot_bytes")),
         })),
+        Some("ready") => Some(Event::Ready {
+            protocol: json_u32(line, "protocol").unwrap_or(1),
+            caps: Caps::parse(json_str(line, "caps").as_deref()),
+            shm: json_u64(line, "shm_slots").zip(json_u64(line, "shm_slot_bytes")),
+        }),
         Some(kind @ ("frame" | "verify")) => json_dims(line, kind),
         Some("progress") => Some(Event::Progress { frame: json_u64(line, "frame")?, total: json_u64(line, "total")? }),
         Some("done") => Some(Event::Done),
@@ -275,6 +305,94 @@ pub fn parse_event(line: &str) -> Option<Event> {
         }
         _ => None,
     }
+}
+
+/// Parse one multi-clip bridge line: the clip handle it names (if any) and the event.
+pub fn parse_tagged(line: &str) -> Option<(Option<u64>, Event)> {
+    let event = parse_event(line)?;
+    let handle = match after_key(line, "handle") {
+        // present but not a number: refused, never read as "no handle"
+        Some(_) => Some(json_u64(line, "handle")?),
+        None => None,
+    };
+    Some((handle, event))
+}
+
+/// Live persistent bridge processes per bridge binary ([`live_processes`]).
+fn live_table() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static LIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Persistent decode processes of `bridge` running right now (single-clip sessions and shared
+/// multi-clip bridges; the one-shot probes and audio extractions are not counted).
+pub fn live_processes(bridge: &Path) -> usize {
+    live_table().lock().unwrap_or_else(PoisonError::into_inner).get(bridge).copied().unwrap_or(0)
+}
+
+/// Counts one persistent process in [`live_processes`] while it lives.
+struct ProcessToken(PathBuf);
+
+impl ProcessToken {
+    fn new(bridge: &Path) -> Self {
+        let mut t = live_table().lock().unwrap_or_else(PoisonError::into_inner);
+        let n = t.entry(bridge.to_path_buf()).or_insert(0);
+        *n = n.saturating_add(1);
+        ProcessToken(bridge.to_path_buf())
+    }
+}
+
+impl Drop for ProcessToken {
+    fn drop(&mut self) {
+        let mut t = live_table().lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = t.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                t.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Frame bytes requested from any bridge and not yet received ([`MAX_INFLIGHT_BYTES`]).
+static INFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Frame bytes requested and not yet received, across every bridge.
+pub fn inflight_bytes() -> u64 {
+    INFLIGHT.load(Ordering::Relaxed)
+}
+
+/// A share of the in-flight frame budget, returned on drop.
+pub struct Inflight(u64);
+
+impl Inflight {
+    /// Reserve `bytes`: always when `force` (an interactive request), otherwise only while the
+    /// total stays within [`MAX_INFLIGHT_BYTES`].
+    pub fn reserve(bytes: u64, force: bool) -> Option<Self> {
+        let mut now = INFLIGHT.load(Ordering::Relaxed);
+        loop {
+            let next = now.saturating_add(bytes);
+            if !force && next > MAX_INFLIGHT_BYTES {
+                return None;
+            }
+            match INFLIGHT.compare_exchange_weak(now, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Inflight(bytes)),
+                Err(seen) => now = seen,
+            }
+        }
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        let _ = INFLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(self.0)));
+    }
+}
+
+/// The budget share of one requested frame of a `width`×`height` clip (RGBA at full size: the
+/// most any tier delivers).
+fn frame_budget(width: u32, height: u32) -> u64 {
+    u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4)
 }
 
 fn base_command(bridge: &Path) -> Command {
@@ -565,6 +683,7 @@ pub struct DecodeSession {
     /// Where the last reply's time went: waiting for its announcement (decode), then reading
     /// its pixels (transport). Diagnostics only (`FILMCRAFT_RAWCAM_STATS`, the benches).
     pub last_timing: (Duration, Duration),
+    _token: ProcessToken,
 }
 
 impl DecodeSession {
@@ -626,6 +745,7 @@ impl DecodeSession {
                         meta,
                         shm,
                         last_timing: (Duration::ZERO, Duration::ZERO),
+                        _token: ProcessToken::new(bridge),
                     });
                 }
                 Ok(Event::Error(e)) => {
@@ -722,6 +842,8 @@ impl DecodeSession {
         let mut out = Vec::with_capacity(indices.len());
         let mut sent = 0;
         let mut sending = true;
+        let budget = frame_budget(self.meta.width, self.meta.height);
+        let mut held = VecDeque::new();
         while out.len() < indices.len() {
             let mut cmd = String::new();
             while sending && sent < indices.len() && sent - out.len() < window {
@@ -729,6 +851,12 @@ impl DecodeSession {
                     sending = false;
                     break;
                 }
+                // The first frame always goes; more only while the global budget allows.
+                let Some(share) = Inflight::reserve(budget, sent == 0) else {
+                    sending = false;
+                    break;
+                };
+                held.push_back(share);
                 if let Some(&index) = indices.get(sent) {
                     cmd.push_str(&self.command(index, scale));
                 }
@@ -740,6 +868,7 @@ impl DecodeSession {
             }
             let Some(&index) = indices.get(out.len()).filter(|_| out.len() < sent) else { break };
             out.push(self.receive_frame(index, Instant::now() + timeout)?);
+            held.pop_front();
         }
         Ok(out)
     }
@@ -838,6 +967,656 @@ impl Drop for DecodeSession {
     }
 }
 
+/// A decode session as the sources pool it: a bridge process of its own (single-clip
+/// `--persistent`), or one clip handle on the format's shared multi-clip bridge.
+pub enum Session {
+    Own(DecodeSession),
+    Shared(ClipSession),
+}
+
+impl Session {
+    pub fn caps(&self) -> Caps {
+        match self {
+            Session::Own(s) => s.caps(),
+            Session::Shared(s) => s.caps(),
+        }
+    }
+
+    pub fn uses_shm(&self) -> bool {
+        match self {
+            Session::Own(s) => s.uses_shm(),
+            Session::Shared(s) => s.uses_shm(),
+        }
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        match self {
+            Session::Own(s) => s.is_alive(),
+            Session::Shared(s) => s.is_alive(),
+        }
+    }
+
+    /// Whether this is a handle on a shared bridge (dropping it closes the handle only).
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Session::Shared(_))
+    }
+
+    pub fn last_timing(&self) -> (Duration, Duration) {
+        match self {
+            Session::Own(s) => s.last_timing,
+            Session::Shared(s) => s.last_timing,
+        }
+    }
+
+    pub fn request_frame(&mut self, index: u64, scale: Option<&str>, timeout: Duration) -> Result<Reply, String> {
+        match self {
+            Session::Own(s) => s.request_frame(index, scale, timeout),
+            Session::Shared(s) => s.request_frame(index, scale, timeout),
+        }
+    }
+
+    pub fn request_batch(&mut self, indices: &[u64], scale: Option<&str>, timeout: Duration) -> Result<Vec<Reply>, String> {
+        self.request_batch_steered(indices, scale, indices.len().max(1), || true, timeout)
+    }
+
+    pub fn request_batch_steered(
+        &mut self,
+        indices: &[u64],
+        scale: Option<&str>,
+        window: usize,
+        steer_more: impl FnMut() -> bool,
+        timeout: Duration,
+    ) -> Result<Vec<Reply>, String> {
+        match self {
+            Session::Own(s) => s.request_batch_steered(indices, scale, window, steer_more, timeout),
+            Session::Shared(s) => s.request_batch_steered(indices, scale, window, steer_more, timeout),
+        }
+    }
+}
+
+/// How a multi-clip `open` failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenFail {
+    /// The bridge refused this clip (it stays up for the others).
+    Clip(String),
+    /// The bridge itself broke (exited, stalled, desynchronised).
+    Bridge(String),
+}
+
+/// What a request on a shared bridge gets back from the event reader.
+enum Arrived {
+    Pixels(FrameBytes),
+    /// The pixels wait in a shared-memory slot; the lease hands the slot back when dropped.
+    Slot {
+        lease: SlotLease,
+        bytes: usize,
+        width: u32,
+        height: u32,
+        format: FrameFormat,
+    },
+    /// The bridge could not produce this frame (the handle goes on).
+    Failed(String),
+}
+
+/// Outer `Err`: the bridge broke.
+type Delivery = Result<Arrived, String>;
+
+struct Pending {
+    index: u64,
+    tx: mpsc::Sender<Delivery>,
+}
+
+/// The reader thread's routing table.
+#[derive(Default)]
+struct Demux {
+    /// Unanswered frame requests per handle, in command order.
+    queues: HashMap<u64, VecDeque<Pending>>,
+    /// `open` commands waiting for their `metadata` (or error).
+    opens: HashMap<u64, mpsc::Sender<Result<Metadata, String>>>,
+    /// The clip behind each open handle (crash attribution).
+    paths: HashMap<u64, PathBuf>,
+    /// The last frame read whose `verify` has not arrived yet: (handle, index, width, height).
+    unverified: Option<(u64, u64, u32, u32)>,
+    /// Why the bridge is unusable, once it is.
+    dead: Option<String>,
+}
+
+/// What a dead shared bridge leaves behind for its manager: the clips that had requests
+/// outstanding when it died (crash suspects), and whether it ever delivered a frame.
+#[derive(Clone, Debug, Default)]
+pub struct DeathReport {
+    pub suspects: Vec<PathBuf>,
+    pub served: bool,
+    /// It died on its own (crash, desync, wedge), not because its last user let it go.
+    pub crashed: bool,
+}
+
+/// The shared ring file: the client's end of it (kept open so `/proc/self/fd/<n>` stays valid)
+/// and its validated layout. Each [`ClipSession`] reads through a description of its own.
+struct RingFile {
+    _file: File,
+    via: PathBuf,
+    layout: (u32, u64),
+}
+
+struct MultiShared {
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    demux: Mutex<Demux>,
+    ring: OnceLock<RingFile>,
+    caps: OnceLock<Caps>,
+    served: AtomicBool,
+    /// Its last user let it go: the exit that follows is no crash.
+    retired: AtomicBool,
+    report: Arc<Mutex<Option<DeathReport>>>,
+}
+
+impl MultiShared {
+    /// Write one command line (the bridge's stdin is shared by every handle).
+    fn send_line(&self, line: &str) -> Result<(), String> {
+        let mut stdin = self.stdin.lock().unwrap_or_else(PoisonError::into_inner);
+        stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()).map_err(|e| format!("bridge command failed: {e}"))
+    }
+
+    /// The bridge is unusable: every waiting request and `open` fails with `why`, the crash
+    /// suspects are recorded, and the process is killed (the reader thread then sees EOF).
+    fn fail(&self, why: &str) {
+        let (queues, opens) = {
+            let mut d = self.demux.lock().unwrap_or_else(PoisonError::into_inner);
+            if d.dead.is_some() {
+                (HashMap::new(), HashMap::new())
+            } else {
+                d.dead = Some(why.to_string());
+                let suspects: Vec<PathBuf> = d.queues.iter().filter(|(_, q)| !q.is_empty()).filter_map(|(h, _)| d.paths.get(h).cloned()).collect();
+                *self.report.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(DeathReport { suspects, served: self.served.load(Ordering::Relaxed), crashed: !self.retired.load(Ordering::Relaxed) });
+                (std::mem::take(&mut d.queues), std::mem::take(&mut d.opens))
+            }
+        };
+        // Outside the routing lock: a dropped delivery may write a `release`.
+        for p in queues.into_values().flatten() {
+            let _ = p.tx.send(Err(why.to_string()));
+        }
+        for tx in opens.into_values() {
+            let _ = tx.send(Err(why.to_string()));
+        }
+        let _ = self.child.lock().unwrap_or_else(PoisonError::into_inner).kill();
+    }
+}
+
+/// Hands a shared-memory slot back to the bridge when dropped (read, or never collected).
+struct SlotLease {
+    shared: Weak<MultiShared>,
+    slot: u32,
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            let _ = shared.send_line(&format!("release {}\n", self.slot));
+        }
+    }
+}
+
+/// One multi-clip bridge process (`--persistent --multi`) shared by every clip of its format:
+/// one CUDA context, one SDK instance, one set of GPU pools. A guarded reader thread routes the
+/// bridge's events to the requests waiting on each handle; dropping the last reference kills and
+/// reaps the process.
+pub struct MultiBridge {
+    shared: Arc<MultiShared>,
+    _token: ProcessToken,
+}
+
+impl MultiBridge {
+    /// Start a multi-clip bridge and wait for its `ready` event. `shm_slot_bytes`: offer a
+    /// shared-memory ring with slots of this size (the largest frame expected; a bridge without
+    /// [`Caps::shm`] must not be offered one). On every failure the process is killed and reaped.
+    pub fn spawn(bridge: &Path, shm_slot_bytes: Option<u64>, timeout: Duration) -> Result<Arc<Self>, String> {
+        let mut cmd = Command::new(bridge);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.arg("--persistent").arg("--multi");
+        let mut ring_file = None;
+        #[cfg(target_os = "linux")]
+        if let Some(bytes) = shm_slot_bytes {
+            match ShmRing::create() {
+                Ok((file, via)) => {
+                    cmd.arg("--shm").arg(&via).arg("--shm-slot-bytes").arg(bytes.to_string());
+                    ring_file = Some((file, via));
+                }
+                Err(e) => log::warn!("no shared-memory transport ({e}); frames come over the pipe"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = shm_slot_bytes;
+        let mut child = spawn_child(&mut cmd, bridge)?;
+        let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
+            reap(&mut child);
+            return Err("no stdin/stdout/stderr pipe".into());
+        };
+        let shared = Arc::new(MultiShared {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            demux: Mutex::new(Demux::default()),
+            ring: OnceLock::new(),
+            caps: OnceLock::new(),
+            served: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            report: Arc::new(Mutex::new(None)),
+        });
+        let this = Arc::new(MultiBridge { shared: shared.clone(), _token: ProcessToken::new(bridge) });
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader = shared.clone();
+        let started = spawn_guarded("filmcraft-rawcam-demux", move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| demux_loop(&reader, stderr, stdout, ready_tx)));
+            if run.is_err() {
+                // Nobody would route replies any more: every waiting clip must learn it now.
+                reader.fail("the bridge event reader failed");
+            }
+        });
+        if !started {
+            return Err("cannot start the bridge event reader".into());
+        }
+        let ready = match ready_rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(_) => Err(format!("{}: bridge did not start up (no ready event)", bridge.display())),
+        };
+        let (caps, shm) = ready?; // dropping `this` kills and reaps the bridge
+        if !caps.multi {
+            return Err(format!("{}: bridge does not serve multiple clips", bridge.display()));
+        }
+        if let (Some((file, via)), Some((slots, slot_bytes))) = (ring_file, shm) {
+            let len = file.metadata().map_err(|e| format!("shared-memory file: {e}"))?.len();
+            let layout = shm_layout(slots, slot_bytes, len)?;
+            let _ = shared.ring.set(RingFile { _file: file, via, layout });
+        }
+        let _ = shared.caps.set(caps);
+        Ok(this)
+    }
+
+    /// The capabilities from the `ready` event.
+    pub fn caps(&self) -> Caps {
+        self.shared.caps.get().copied().unwrap_or_default()
+    }
+
+    /// Whether the bridge still serves (not exited, not desynchronised).
+    pub fn is_alive(&self) -> bool {
+        self.shared.demux.lock().unwrap_or_else(PoisonError::into_inner).dead.is_none()
+    }
+
+    /// Filled in once the bridge died: what its manager needs to decide about respawning.
+    pub fn death_report(&self) -> Arc<Mutex<Option<DeathReport>>> {
+        self.shared.report.clone()
+    }
+
+    /// Mark the bridge unusable and kill it (a request timed out: it is wedged).
+    pub fn kill(&self, why: &str) {
+        self.shared.fail(why);
+    }
+
+    /// Open `path` under `handle` (fresh for this bridge, never reused) and wait for its metadata.
+    pub fn open(&self, handle: u64, path: &Path, timeout: Duration) -> Result<Metadata, OpenFail> {
+        let line = open_line(handle, path).map_err(OpenFail::Clip)?;
+        let (tx, rx) = mpsc::channel();
+        {
+            let _stdin = self.shared.stdin.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut d = self.shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(why) = &d.dead {
+                return Err(OpenFail::Bridge(why.clone()));
+            }
+            if d.paths.contains_key(&handle) || d.opens.contains_key(&handle) {
+                return Err(OpenFail::Clip(format!("clip handle {handle} is in use")));
+            }
+            d.opens.insert(handle, tx);
+            d.paths.insert(handle, path.to_path_buf());
+        }
+        if let Err(e) = self.shared.send_line(&line) {
+            self.shared.fail(&e);
+            return Err(OpenFail::Bridge(e));
+        }
+        let forget = || {
+            let mut d = self.shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+            d.opens.remove(&handle);
+            d.paths.remove(&handle);
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(meta)) if meta.frame_count > 0 && meta.width > 0 && meta.height > 0 => Ok(meta),
+            Ok(Ok(_)) => {
+                forget();
+                let _ = self.shared.send_line(&format!("close {handle}\n"));
+                Err(OpenFail::Clip(format!("{}: bridge reported an empty clip", path.display())))
+            }
+            Ok(Err(e)) => {
+                forget();
+                if self.is_alive() { Err(OpenFail::Clip(e)) } else { Err(OpenFail::Bridge(e)) }
+            }
+            Err(_) => {
+                let why = format!("{}: the bridge did not answer `open`", path.display());
+                self.shared.fail(&why);
+                Err(OpenFail::Bridge(why))
+            }
+        }
+    }
+
+    /// Close `handle`: its unanswered requests are dropped (no replies follow).
+    fn close(&self, handle: u64) {
+        let dropped = {
+            let mut d = self.shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+            d.paths.remove(&handle);
+            d.opens.remove(&handle);
+            let q = d.queues.remove(&handle);
+            if d.unverified.is_some_and(|u| u.0 == handle) {
+                d.unverified = None;
+            }
+            (q, d.dead.is_none())
+        };
+        if dropped.1 {
+            let _ = self.shared.send_line(&format!("close {handle}\n"));
+        }
+        drop(dropped.0);
+    }
+
+    /// Queue `frame <handle> <index> [scale]`; the reply arrives on the receiver.
+    fn send_frame(&self, handle: u64, index: u64, scale: Option<&str>) -> Result<mpsc::Receiver<Delivery>, String> {
+        let line = match scale {
+            Some(word) => format!("frame {handle} {index} {word}\n"),
+            None => format!("frame {handle} {index}\n"),
+        };
+        let (tx, rx) = mpsc::channel();
+        // stdin before the routing table (the order every writer takes them in): the queue order
+        // is the command order.
+        let mut stdin = self.shared.stdin.lock().unwrap_or_else(PoisonError::into_inner);
+        {
+            let mut d = self.shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(why) = &d.dead {
+                return Err(why.clone());
+            }
+            d.queues.entry(handle).or_default().push_back(Pending { index, tx });
+        }
+        let written = stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush());
+        drop(stdin);
+        if let Err(e) = written {
+            let why = format!("bridge command failed: {e}");
+            self.shared.fail(&why);
+            return Err(why);
+        }
+        Ok(rx)
+    }
+}
+
+impl Drop for MultiBridge {
+    fn drop(&mut self) {
+        self.shared.retired.store(true, Ordering::Relaxed);
+        let _ = self.shared.send_line("quit\n");
+        let mut child = self.shared.child.lock().unwrap_or_else(PoisonError::into_inner);
+        // A moment for an orderly exit (it has nothing left to do), then it is killed and reaped.
+        let _ = wait_with_timeout(&mut child, Duration::from_millis(100));
+        reap(&mut child);
+    }
+}
+
+/// The `open` command line for `path`, or why it cannot be sent (a newline would split it).
+fn open_line(handle: u64, path: &Path) -> Result<String, String> {
+    let Some(text) = path.to_str() else { return Err(format!("{}: path is not UTF-8", path.display())) };
+    if text.is_empty() || text.contains(['\n', '\r']) || text.len() > MAX_OPEN_PATH {
+        return Err(format!("{}: path cannot be sent to the bridge", path.display()));
+    }
+    Ok(format!("open {handle} {text}\n"))
+}
+
+/// The multi-clip event reader: startup (`ready` or an error) goes to `ready`, then every event
+/// is routed to its handle. Pixels on stdout are read right here, in announcement order (they
+/// must be, whoever waits for them); shared-memory frames are handed over as a slot lease.
+fn demux_loop(
+    shared: &Arc<MultiShared>,
+    stderr: std::process::ChildStderr,
+    mut stdout: ChildStdout,
+    ready: mpsc::Sender<Result<(Caps, Option<(u64, u64)>), String>>,
+) {
+    let mut ready = Some(ready);
+    let mut lines = BufReader::new(stderr).lines();
+    let why = loop {
+        let Some(Ok(line)) = lines.next() else { break "bridge exited".to_string() };
+        let Some((handle, event)) = parse_tagged(&line) else { continue };
+        if let Some(tx) = ready.take() {
+            match event {
+                Event::Ready { caps, shm, .. } => {
+                    let _ = tx.send(Ok((caps, shm)));
+                }
+                Event::Error(e) => {
+                    let _ = tx.send(Err(e));
+                    break "bridge failed at start-up".to_string();
+                }
+                _ => ready = Some(tx),
+            }
+            continue;
+        }
+        if let Err(why) = route(shared, &mut stdout, handle, event) {
+            break why;
+        }
+    };
+    if let Some(tx) = ready {
+        let _ = tx.send(Err(why.clone()));
+    }
+    shared.fail(&why);
+}
+
+/// The request queue of `h` while it is open (an open handle without requests has an empty
+/// one: a reply for it is unsolicited); `None` once it was closed (late replies are dropped).
+fn open_queue(d: &mut Demux, h: u64) -> Option<&mut VecDeque<Pending>> {
+    if d.paths.contains_key(&h) { Some(d.queues.entry(h).or_default()) } else { None }
+}
+
+/// Route one event; `Err` means the stream can no longer be trusted (the bridge is failed).
+fn route(shared: &Arc<MultiShared>, stdout: &mut ChildStdout, handle: Option<u64>, event: Event) -> Result<(), String> {
+    match (handle, event) {
+        (Some(h), Event::Frame { index, width, height, format, slot }) => {
+            let bytes = frame_bytes(width, height, format)?;
+            let arrived = match slot {
+                None => Arrived::Pixels(FrameBytes { data: read_pixels(stdout, bytes)?, width, height, format }),
+                Some(slot) => {
+                    let Some(ring) = shared.ring.get() else {
+                        return Err(format!("bridge announced shared-memory slot {slot} without a ring"));
+                    };
+                    shm_offset(ring.layout, slot, bytes)?;
+                    Arrived::Slot { lease: SlotLease { shared: Arc::downgrade(shared), slot }, bytes, width, height, format }
+                }
+            };
+            let pending = {
+                let mut d = shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+                d.unverified = Some((h, index, width, height));
+                match open_queue(&mut d, h) {
+                    // a closed handle: the frame (and its slot) is dropped below
+                    None => None,
+                    Some(q) => match q.pop_front() {
+                        Some(p) if p.index == index => Some(p),
+                        Some(p) => return Err(format!("bridge out of sync: clip {h} answered frame {index} for {}", p.index)),
+                        None => return Err(format!("bridge out of sync: clip {h} sent frame {index} nobody asked for")),
+                    },
+                }
+            };
+            shared.served.store(true, Ordering::Relaxed);
+            if let Some(p) = pending {
+                let _ = p.tx.send(Ok(arrived));
+            }
+        }
+        (Some(h), Event::Verify { index, width, height }) => {
+            let mut d = shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((uh, ui, uw, uhh)) = d.unverified.take()
+                && (uh, ui) == (h, index)
+                && (uw, uhh) != (width, height)
+            {
+                return Err(format!("bridge dimensions disagree: {width}×{height} after {uw}×{uhh}"));
+            }
+        }
+        (Some(h), Event::FrameError { index, message }) => {
+            let pending = {
+                let mut d = shared.demux.lock().unwrap_or_else(PoisonError::into_inner);
+                match open_queue(&mut d, h) {
+                    None => None,
+                    Some(q) => match q.pop_front() {
+                        Some(p) if p.index == index => Some(p),
+                        Some(p) => return Err(format!("bridge out of sync: error for clip {h} frame {index} while waiting for {}", p.index)),
+                        None => return Err(format!("bridge out of sync: clip {h} reported frame {index} nobody asked for")),
+                    },
+                }
+            };
+            if let Some(p) = pending {
+                let _ = p.tx.send(Ok(Arrived::Failed(message)));
+            }
+        }
+        (Some(h), Event::Metadata(meta)) => {
+            let tx = shared.demux.lock().unwrap_or_else(PoisonError::into_inner).opens.remove(&h);
+            if let Some(tx) = tx {
+                let _ = tx.send(Ok(meta));
+            }
+        }
+        (Some(h), Event::Error(message)) => {
+            let tx = shared.demux.lock().unwrap_or_else(PoisonError::into_inner).opens.remove(&h);
+            match tx {
+                Some(tx) => {
+                    let _ = tx.send(Err(message));
+                }
+                None => log::warn!("camera-RAW bridge, clip {h}: {message}"),
+            }
+        }
+        (None, Event::Error(message)) => log::warn!("camera-RAW bridge: {message}"),
+        // A frame or verify without a handle cannot be routed: the pixels after it would desync.
+        (None, Event::Frame { .. }) => return Err("bridge sent a frame without a clip handle".into()),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// One clip on a shared [`MultiBridge`]: what a single-clip [`DecodeSession`] is for its own
+/// process. Dropping it closes the handle; the bridge serves on for the other clips.
+pub struct ClipSession {
+    bridge: Arc<MultiBridge>,
+    handle: u64,
+    meta: Metadata,
+    /// This session's own description of the ring file (positional reads need no shared offset).
+    ring: Option<File>,
+    pub last_timing: (Duration, Duration),
+}
+
+impl ClipSession {
+    /// Open `path` on `bridge` under `handle`.
+    pub fn open(bridge: Arc<MultiBridge>, handle: u64, path: &Path, timeout: Duration) -> Result<Self, OpenFail> {
+        let mut meta = bridge.open(handle, path, timeout)?;
+        // The bridge-wide capabilities (the metadata repeats them; a missing field is no reason
+        // to lose the per-command scale).
+        meta.caps = bridge.caps();
+        Ok(ClipSession { bridge, handle, meta, ring: None, last_timing: (Duration::ZERO, Duration::ZERO) })
+    }
+
+    pub fn caps(&self) -> Caps {
+        self.meta.caps
+    }
+
+    /// The clip facts the bridge answered `open` with.
+    pub fn metadata(&self) -> &Metadata {
+        &self.meta
+    }
+
+    pub fn uses_shm(&self) -> bool {
+        self.bridge.shared.ring.get().is_some()
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        self.bridge.is_alive()
+    }
+
+    /// The shared bridge this clip is served by.
+    pub fn bridge(&self) -> &Arc<MultiBridge> {
+        &self.bridge
+    }
+
+    /// One frame: the outer error means this session (or the whole bridge) broke.
+    pub fn request_frame(&mut self, index: u64, scale: Option<&str>, timeout: Duration) -> Result<Reply, String> {
+        let rx = self.bridge.send_frame(self.handle, index, scale)?;
+        self.receive(&rx, Instant::now() + timeout)
+    }
+
+    /// [`DecodeSession::request_batch_steered`] on this handle: at most `window` requests
+    /// outstanding, no further one once `steer_more` says no or the in-flight budget is spent.
+    pub fn request_batch_steered(
+        &mut self,
+        indices: &[u64],
+        scale: Option<&str>,
+        window: usize,
+        mut steer_more: impl FnMut() -> bool,
+        timeout: Duration,
+    ) -> Result<Vec<Reply>, String> {
+        let window = window.max(1);
+        let budget = frame_budget(self.meta.width, self.meta.height);
+        let mut out = Vec::with_capacity(indices.len());
+        let mut waiting: VecDeque<(mpsc::Receiver<Delivery>, Inflight)> = VecDeque::new();
+        let mut sending = true;
+        let mut sent = 0;
+        while out.len() < indices.len() {
+            while sending && sent < indices.len() && waiting.len() < window {
+                if sent > 0 && !steer_more() {
+                    sending = false;
+                    break;
+                }
+                let Some(share) = Inflight::reserve(budget, sent == 0) else {
+                    sending = false;
+                    break;
+                };
+                let Some(&index) = indices.get(sent) else { break };
+                waiting.push_back((self.bridge.send_frame(self.handle, index, scale)?, share));
+                sent += 1;
+            }
+            let Some((rx, _share)) = waiting.pop_front() else { break };
+            out.push(self.receive(&rx, Instant::now() + timeout)?);
+        }
+        Ok(out)
+    }
+
+    /// Wait for one reply until `deadline` and collect its pixels.
+    fn receive(&mut self, rx: &mpsc::Receiver<Delivery>, deadline: Instant) -> Result<Reply, String> {
+        let waiting_since = Instant::now();
+        let delivery = match rx.recv_timeout(deadline.saturating_duration_since(waiting_since)) {
+            Ok(d) => d,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Silent for the whole frame timeout: wedged, for every clip it serves.
+                self.bridge.kill("bridge frame timed out");
+                return Err("bridge frame timed out".into());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("bridge exited".into()),
+        };
+        let announced = Instant::now();
+        let reply = match delivery? {
+            Arrived::Failed(message) => Ok(Err(message)),
+            Arrived::Pixels(f) => Ok(Ok(f)),
+            Arrived::Slot { lease, bytes, width, height, format } => {
+                let data = self.read_slot(lease.slot, bytes)?;
+                drop(lease); // `release`: the bridge may reuse the slot
+                Ok(Ok(FrameBytes { data, width, height, format }))
+            }
+        };
+        self.last_timing = (announced.duration_since(waiting_since), announced.elapsed());
+        reply
+    }
+
+    /// The `bytes` of a frame in shared-memory `slot` (already validated against the layout).
+    fn read_slot(&mut self, slot: u32, bytes: usize) -> Result<Vec<u8>, String> {
+        let Some(ring) = self.bridge.shared.ring.get() else { return Err("no shared-memory ring".into()) };
+        let at = shm_offset(ring.layout, slot, bytes)?;
+        if self.ring.is_none() {
+            self.ring = Some(File::open(&ring.via).map_err(|e| format!("shared memory: {e}"))?);
+        }
+        let Some(file) = self.ring.as_mut() else { return Err("no shared-memory ring".into()) };
+        file.seek(SeekFrom::Start(at)).map_err(|e| format!("shared-memory seek: {e}"))?;
+        read_pixels(file, bytes).map_err(|e| format!("shared memory: {e}"))
+    }
+}
+
+impl Drop for ClipSession {
+    fn drop(&mut self) {
+        self.bridge.close(self.handle);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,7 +1642,7 @@ mod tests {
         let v2 =
             r#"{"type":"metadata","timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":2,"caps":"scale,frame-errors,warp"}"#;
         let Some(Event::Metadata(m)) = parse_event(v2) else { panic!("metadata v2") };
-        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false }));
+        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false, multi: false }));
         assert_eq!(
             parse_event(r#"{"type":"error","index":12,"message":"frame index 12 beyond clip"}"#),
             Some(Event::FrameError { index: 12, message: "frame index 12 beyond clip".into() })
@@ -1279,6 +2058,224 @@ done
             let r = session.request_frame(1, None, Duration::from_secs(5));
             assert!(r.as_ref().is_err_and(|e| e.contains(expect)), "{mode}: got {:?}", r.map(|f| f.map(|f| f.data.len())));
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_multi_clip_events() {
+        let ready = r#"{"type":"ready","protocol":3,"caps":"scale,frame-errors,shm,multi","shm_slots":5,"shm_slot_bytes":2097152}"#;
+        let Some((None, Event::Ready { protocol, caps, shm })) = parse_tagged(ready) else { panic!("ready") };
+        assert_eq!((protocol, caps.multi, caps.shm, shm), (3, true, true, Some((5, 2_097_152))));
+        assert_eq!(
+            parse_tagged(r#"{"type":"frame","handle":7,"index":3,"width":4,"height":2,"format":"rgba8","slot":1}"#),
+            Some((Some(7), Event::Frame { index: 3, width: 4, height: 2, format: FrameFormat::Rgba8, slot: Some(1) }))
+        );
+        assert_eq!(
+            parse_tagged(r#"{"type":"error","handle":2,"index":9,"message":"bad"}"#),
+            Some((Some(2), Event::FrameError { index: 9, message: "bad".into() }))
+        );
+        assert_eq!(parse_tagged(r#"{"type":"error","handle":2,"message":"cannot open"}"#), Some((Some(2), Event::Error("cannot open".into()))));
+        let Some((Some(4), Event::Metadata(m))) = parse_tagged(
+            r#"{"type":"metadata","handle":4,"timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":3,"caps":"scale,multi"}"#,
+        ) else {
+            panic!("metadata")
+        };
+        assert!(m.caps.multi && m.caps.scale);
+        // A handle that is no number is refused, never read as "no handle" (that would misroute).
+        assert_eq!(parse_tagged(r#"{"type":"frame","handle":-1,"index":3,"width":4,"height":2}"#), None);
+        assert_eq!(parse_tagged(r#"{"type":"frame","handle":"x","index":3,"width":4,"height":2}"#), None);
+        // A key spelled inside an escaped message is no key.
+        assert_eq!(parse_tagged(r#"{"type":"error","message":"see \"handle\":5"}"#), Some((None, Event::Error("see \"handle\":5".into()))));
+    }
+
+    #[test]
+    fn open_lines_cannot_be_split() {
+        assert_eq!(open_line(3, Path::new("/m/A 001.braw")), Ok("open 3 /m/A 001.braw\n".into()));
+        assert!(open_line(3, Path::new("/m/evil\nframe 0 1.braw")).is_err(), "a newline would inject a command");
+        assert!(open_line(3, Path::new("/m/cr\r.braw")).is_err());
+        assert!(open_line(3, Path::new("")).is_err());
+        assert!(open_line(3, &PathBuf::from("/".repeat(MAX_OPEN_PATH + 1))).is_err());
+    }
+
+    #[test]
+    fn the_inflight_budget_bounds_background_requests() {
+        // Other tests reserve too: measure relative to what is held now.
+        let base = inflight_bytes();
+        let big = Inflight::reserve(MAX_INFLIGHT_BYTES, true);
+        assert!(big.is_some(), "an interactive request always goes");
+        assert!(Inflight::reserve(1, false).is_none(), "nothing more for read-ahead while the budget is spent");
+        let forced = Inflight::reserve(64, true);
+        assert!(forced.is_some());
+        drop((big, forced));
+        assert!(inflight_bytes() <= base.saturating_add(MAX_INFLIGHT_BYTES), "returned on drop");
+        assert_eq!(frame_budget(u32::MAX, u32::MAX), u64::MAX, "saturates");
+    }
+
+    /// A multi-clip bridge script: `ready`, then `open` answered with metadata, and the replies
+    /// for a pair of frame commands sent in the opposite clip order (handle 1 before handle 0).
+    /// The first clip byte selects a misbehaviour.
+    #[cfg(target_os = "linux")]
+    const MULTI_BRIDGE: &str = r#"#!/bin/sh
+shm= sb=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --shm) shm=$2; shift 2;;
+        --shm-slot-bytes) sb=$2; shift 2;;
+        *) shift;;
+    esac
+done
+ring=
+if [ -n "$shm" ]; then truncate -s $((2 * sb)) "$shm"; ring=",\"shm_slots\":2,\"shm_slot_bytes\":$sb"; fi
+[ -f "$0.noready" ] && { echo '{"type":"metadata","timecode":"00:00:00:00","fps_num":24,"width":4,"height":2,"frame_count":8}' >&2; sleep 30; }
+echo "{\"type\":\"ready\",\"protocol\":3,\"caps\":\"scale,frame-errors,shm,multi\"$ring}" >&2
+mode=
+px() { b=$(printf "\\$(printf '%03o' $(($1 + 1)))"); out= j=0; while [ $j -lt 32 ]; do out="$out$b"; j=$((j + 1)); done; }
+reply() { # handle index
+    px $2
+    if [ -n "$shm" ]; then
+        k=$(($2 % 2))
+        [ "$mode" = wild ] && k=5
+        printf '%s' "$out" | dd of="$shm" bs=$sb seek=$k conv=notrunc status=none
+        echo "{\"type\":\"frame\",\"handle\":$1,\"index\":$2,\"width\":4,\"height\":2,\"format\":\"rgba8\",\"slot\":$k}" >&2
+    else
+        echo "{\"type\":\"frame\",\"handle\":$1,\"index\":$2,\"width\":4,\"height\":2,\"format\":\"rgba8\"}" >&2
+        printf '%s' "$out"
+    fi
+    w=4; [ "$mode" = badv ] && w=8
+    echo "{\"type\":\"verify\",\"handle\":$1,\"index\":$2,\"width\":$w,\"height\":2}" >&2
+}
+pending=
+while IFS= read -r line; do
+    echo "$line" >> "$0.log"
+    set -- $line
+    case "$1" in
+        open)
+            p=${line#open $2 }
+            m=$(head -c 4 "$p")
+            if [ "$m" = nope ]; then
+                echo "{\"type\":\"error\",\"handle\":$2,\"message\":\"cannot open\"}" >&2
+            else
+                [ "$2" = 0 ] && mode=$m
+                echo "{\"type\":\"metadata\",\"handle\":$2,\"timecode\":\"00:00:00:00\",\"fps_num\":24,\"fps_den\":1,\"width\":4,\"height\":2,\"frame_count\":8,\"protocol\":3,\"caps\":\"scale,frame-errors,shm,multi\"}" >&2
+            fi;;
+        frame)
+            case "$mode" in
+                stry) echo '{"type":"frame","handle":0,"index":6,"width":4,"height":2,"format":"rgba8"}' >&2; printf '%32s' x; continue;;
+                nohd) echo '{"type":"frame","index":6,"width":4,"height":2,"format":"rgba8"}' >&2; continue;;
+                stal) sleep 30; continue;;
+            esac
+            [ "$3" -ge 8 ] && { echo "{\"type\":\"error\",\"handle\":$2,\"index\":$3,\"message\":\"beyond clip\"}" >&2; continue; }
+            if [ -z "$pending" ]; then
+                pending="$2 $3"
+            elif [ "${pending%% *}" = "$2" ]; then
+                reply $pending; reply $2 $3; pending=
+            else
+                reply $2 $3; reply $pending; pending=
+            fi;;
+        release|close) :;;
+        quit) exit 0;;
+    esac
+done
+"#;
+
+    /// Open clip `name` (its first bytes pick the script's mode) under `handle`.
+    #[cfg(target_os = "linux")]
+    fn clip_session(bridge: &Arc<MultiBridge>, dir: &Path, handle: u64, name: &str, mode: &str) -> ClipSession {
+        let clip = dir.join(name);
+        std::fs::write(&clip, mode).ok();
+        ClipSession::open(bridge.clone(), handle, &clip, Duration::from_secs(5)).unwrap_or_else(|e| panic!("open {name}: {e:?}"))
+    }
+
+    /// Two clips on one process: replies come back in the opposite clip order and each lands at
+    /// its own handle; per-frame errors stay with their clip; a clip the bridge cannot open fails
+    /// alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multi_clip_replies_reach_their_own_handle() {
+        let (dir, bridge, _) = script_bridge("multi-route", MULTI_BRIDGE);
+        for shm in [None, Some(32)] {
+            let multi = MultiBridge::spawn(&bridge, shm, Duration::from_secs(5)).unwrap_or_else(|e| panic!("spawn: {e}"));
+            assert!(multi.caps().multi);
+            assert_eq!(live_processes(&bridge), 1);
+            let mut a = clip_session(&multi, &dir, 0, "a.braw", "plain");
+            let mut b = clip_session(&multi, &dir, 1, "b.braw", "plain");
+            assert_eq!(a.uses_shm(), shm.is_some());
+            // a's request is held until b's arrives; b is answered first, then a.
+            let ta = std::thread::spawn(move || {
+                let r = a.request_frame(2, Some("full"), Duration::from_secs(5));
+                (a, r)
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            let rb = b.request_frame(5, Some("full"), Duration::from_secs(5)).unwrap_or_else(|e| panic!("b: {e}")).unwrap_or_else(|e| panic!("b: {e}"));
+            let (mut a, ra) = ta.join().unwrap_or_else(|_| panic!("thread"));
+            let ra = ra.unwrap_or_else(|e| panic!("a: {e}")).unwrap_or_else(|e| panic!("a: {e}"));
+            assert!(ra.data.iter().all(|&x| x == 3), "a got frame 2: {:?}", ra.data);
+            assert!(rb.data.iter().all(|&x| x == 6), "b got frame 5: {:?}", rb.data);
+            // A per-frame error is a's alone.
+            assert!(a.request_frame(9, Some("full"), Duration::from_secs(5)).is_ok_and(|r| r.is_err()));
+            // A clip the bridge refuses fails to open; the others go on.
+            let bad = dir.join("bad.braw");
+            std::fs::write(&bad, "nope").ok();
+            assert!(matches!(ClipSession::open(multi.clone(), 2, &bad, Duration::from_secs(5)), Err(OpenFail::Clip(_))));
+            assert!(multi.is_alive());
+            // A handle cannot be opened twice.
+            assert!(matches!(multi.open(1, &bad, Duration::from_secs(5)), Err(OpenFail::Clip(_))));
+            let batch = std::thread::spawn(move || {
+                let r = a.request_batch_steered(&[1, 4], Some("full"), 2, || true, Duration::from_secs(5));
+                (a, r)
+            });
+            let (a, r) = batch.join().unwrap_or_else(|_| panic!("thread"));
+            let r = r.unwrap_or_else(|e| panic!("batch: {e}"));
+            assert!(r.iter().zip([2_u8, 5]).all(|(f, v)| f.as_ref().is_ok_and(|f| f.data.iter().all(|&x| x == v))));
+            drop((a, b, multi));
+            assert_eq!(live_processes(&bridge), 0, "the process went with the last reference");
+        }
+        let log = std::fs::read_to_string(bridge.with_extension("log")).unwrap_or_default();
+        assert!(log.lines().any(|l| l == "release 1"), "slots are handed back: {log}");
+        assert!(log.lines().any(|l| l.starts_with("close ")), "dropped sessions close their handle: {log}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hostile multi-clip bridges fail cleanly, and every waiting clip learns it: an unsolicited
+    /// frame, a frame without a handle, a slot outside the ring, a disagreeing verify, a stall
+    /// (killed after the timeout), a `ready` that never comes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hostile_multi_clip_bridges_fail_cleanly() {
+        let (dir, bridge, _) = script_bridge("multi-hostile", MULTI_BRIDGE);
+        for (mode, shm, expect) in [
+            ("stry", None, "nobody asked"),
+            ("nohd", None, "without a clip handle"),
+            ("wild", Some(32), "slot 5"),
+            ("badv", None, "disagree"),
+            ("stal", None, "timed out"),
+        ] {
+            let multi = MultiBridge::spawn(&bridge, shm, Duration::from_secs(5)).unwrap_or_else(|e| panic!("{mode}: spawn: {e}"));
+            let mut a = clip_session(&multi, &dir, 0, "a.braw", mode);
+            let mut b = clip_session(&multi, &dir, 1, "b.braw", "plain");
+            let tb = std::thread::spawn(move || b.request_frame(1, Some("full"), Duration::from_secs(10)));
+            std::thread::sleep(Duration::from_millis(100));
+            let t = Instant::now();
+            let ra = a.request_frame(3, Some("full"), Duration::from_millis(700));
+            let rb = tb.join().unwrap_or_else(|_| panic!("thread"));
+            // The broken stream fails a's request (or, for a late verify, the next one).
+            let caught = match &ra {
+                Err(e) => e.contains(expect) || (mode == "badv" && e.contains("exited")),
+                Ok(_) => mode == "badv",
+            };
+            assert!(caught, "{mode}: a got {:?}", ra.as_ref().map(|r| r.as_ref().map(|f| f.data.len())));
+            assert!(rb.is_err(), "{mode}: b must learn the bridge broke");
+            if mode == "badv" {
+                let next = a.request_frame(4, Some("full"), Duration::from_secs(2));
+                assert!(next.is_err(), "the desynchronised bridge serves no more");
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "{mode}: took {:?}", t.elapsed());
+            assert!(!multi.is_alive(), "{mode}");
+        }
+        std::fs::write(bridge.with_extension("noready"), "").ok();
+        let r = MultiBridge::spawn(&bridge, None, Duration::from_millis(500));
+        assert!(r.as_ref().is_err_and(|e| e.contains("ready")), "got {:?}", r.as_ref().err());
+        assert_eq!(live_processes(&bridge), 0, "every bridge was reaped");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
