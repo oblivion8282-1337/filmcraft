@@ -32,6 +32,8 @@ pub mod mp4;
 pub mod mpeg;
 pub mod mxf;
 pub mod ogg;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rawcam;
 mod stream_color;
 pub mod video;
 mod webm_alpha;
