@@ -205,7 +205,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
                 app.playback.preroll_ready = app.frames.preroll_ready(key, app.playback.speed, rate.frame_at(duration) - 1);
             }
         } else {
-            app.frames.request(key, rate.tick_of(frame), scale, &project, 0);
+            // a seek: scrubbing may show provisional frames, refined once the playhead rests
+            app.frames.request_monitor(key, rate.tick_of(frame), scale, &project);
         }
         let asked = asked_before(app, prefix, key, playing);
         let tex_name = if channel { format!("monitor-{prefix}-{display:?}") } else { format!("monitor-{prefix}") };
@@ -217,7 +218,15 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
                 .or_else(|| app.frames.nearest_plan(key, 6))
                 .or_else(|| asked.iter().find_map(|k| app.frames.get_plan(k).map(|p| (*k, p))));
             match found {
-                Some((k, plan)) => (app.gpu_present(k, &plan).map(|(id, _)| id), Some(k)),
+                Some((k, plan)) => {
+                    // a refined plan under the key already on screen: composite it again
+                    if app.frames.take_refined(&k)
+                        && let Some(g) = app.gpu.as_mut()
+                    {
+                        g.last_key = None;
+                    }
+                    (app.gpu_present(k, &plan).map(|(id, _)| id), Some(k))
+                }
                 None => (app.gpu.as_ref().and_then(|g| g.texture), app.gpu.as_ref().and_then(|g| g.last_key)),
             }
         } else {
@@ -495,6 +504,10 @@ fn cpu_texture(
         .or_else(|| asked.iter().find_map(|k| app.frames.get(k).map(|img| (*k, img))));
     match found {
         Some((k, img)) => {
+            // a refined image under the key already uploaded: upload it again
+            if app.frames.take_refined(&k) {
+                app.textures.remove(name);
+            }
             let tex = if mode.is_channel() {
                 app.texture_for_mapped(ctx, name, k, &img, |i| monitor_view::channel_view(i, mode))
             } else {

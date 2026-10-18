@@ -10,6 +10,13 @@
 //! sessions (one per debayer tier — [`FrameRequest::scale`] picks the tier, so thumbnails
 //! debayer at quarter/eighth resolution), and a read-ahead thread decodes [`PREFETCH_FRAMES`]
 //! ahead of playback so showing a frame is normally a cache hit.
+//!
+//! Scrubbing a paused monitor ([`filmcraft_media::cancel::with_scrub`]) is served at the
+//! [`SCRUB_TIER`] while the seeks come in a burst: a full-resolution 6K debayer takes ~50 ms, a
+//! quarter one ~10 ms. Those frames are flagged provisional
+//! ([`filmcraft_media::pending::mark_provisional`]); the monitor asks again without the hint, and
+//! that request waits (cancellably) until the playhead has rested for [`SCRUB_REST`] before it
+//! decodes the exact tier — so the refinement never holds the decoder while the drag goes on.
 
 pub mod bridge;
 
@@ -44,6 +51,13 @@ const NEAREST_FRAME_TOLERANCE: u64 = 12;
 const PREFETCH_FRAMES: u64 = 6;
 /// A quiet spell this long retires the bridge processes (hundreds of MB of SDK state each).
 const IDLE_SESSIONS_AFTER: Duration = Duration::from_secs(20);
+/// Paused-monitor seeks this close together are a scrub burst; the burst ends (the playhead
+/// rests) after this long without a move.
+const SCRUB_REST: Duration = Duration::from_millis(150);
+/// The debayer tier a scrub burst is served at (quarter resolution: ~5× cheaper than full).
+const SCRUB_TIER: u32 = 4;
+/// Longest a refining request waits for a scrub burst to end (another view may keep scrubbing).
+const MAX_REST_WAIT: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -211,6 +225,61 @@ impl Shuttle {
     }
 }
 
+/// Paused-monitor seeks ([`filmcraft_media::cancel::scrub`]): whether they currently come in a
+/// burst. A single seek (a click on the ruler, a frame step) is no burst and gets its exact frame;
+/// from the second seek that follows within [`SCRUB_REST`], frames are served at [`SCRUB_TIER`].
+#[derive(Default)]
+struct Scrub {
+    /// The newest seek: when, and to which frame.
+    prev: Option<(Instant, u64)>,
+    /// When the newest seek that moved the playhead within [`SCRUB_REST`] of the previous one
+    /// arrived (the burst's pulse).
+    moved: Option<Instant>,
+}
+
+impl Scrub {
+    /// Record a seek to `idx` at `now`; whether it is part of a burst.
+    fn observe(&mut self, now: Instant, idx: u64) -> bool {
+        let moved = self.prev.is_some_and(|(t, i)| i != idx && now.saturating_duration_since(t) < SCRUB_REST);
+        if moved {
+            self.moved = Some(now);
+        }
+        self.prev = Some((now, idx));
+        self.active(now)
+    }
+
+    /// The seek to `idx` was answered at `now`: the gap to the next seek counts from here (a
+    /// seek that had to wait for the decoder must not end the burst it belongs to).
+    fn served(&mut self, now: Instant, idx: u64, burst: bool) {
+        if self.prev.is_some_and(|(_, i)| i == idx) {
+            self.prev = Some((now, idx));
+            if burst {
+                self.moved = Some(now);
+            }
+        }
+    }
+
+    /// Whether a burst is going on at `now`.
+    fn active(&self, now: Instant) -> bool {
+        !self.rest_left(now).is_zero()
+    }
+
+    /// How long until the playhead counts as resting (zero: it does).
+    fn rest_left(&self, now: Instant) -> Duration {
+        self.moved.map_or(Duration::ZERO, |t| SCRUB_REST.saturating_sub(now.saturating_duration_since(t)))
+    }
+}
+
+/// The frames the read-ahead wants after `last` in `direction` (negative: backwards), nearest
+/// first, inside a clip of `frame_count` frames — each at most once (no repeats at the clip's
+/// start or end).
+fn ahead_indices(last: u64, direction: i64, frame_count: u64) -> Vec<u64> {
+    (1..=PREFETCH_FRAMES)
+        .map_while(|ahead| if direction < 0 { last.checked_sub(ahead) } else { last.checked_add(ahead) })
+        .take_while(|&next| next < frame_count)
+        .collect()
+}
+
 fn bridge_path(f: Format) -> Option<PathBuf> {
     bridge_path_from(std::env::var_os(f.bridge_env()), std::env::var_os("PATH"), f)
 }
@@ -337,6 +406,27 @@ pub struct RawCamSource {
     activity: Mutex<Instant>,
     /// Recent interactive requests, for shuttle-speed-adaptive decode tiers.
     shuttle: Mutex<Shuttle>,
+    /// Recent paused-monitor seeks, for the scrub tier.
+    scrub: Mutex<Scrub>,
+    /// Interactive requests waiting for the decode slot: the read-ahead starts no batch while
+    /// any wait, and stops a running one at its next chunk.
+    waiting: AtomicU32,
+}
+
+/// Counts an interactive request in [`RawCamSource::waiting`] while it lives.
+struct Waiting<'a>(&'a AtomicU32);
+
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicU32) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Waiting(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl RawCamSource {
@@ -388,6 +478,8 @@ impl RawCamSource {
             prefetch_started: AtomicBool::new(false),
             activity: Mutex::new(Instant::now()),
             shuttle: Mutex::new(Shuttle::default()),
+            scrub: Mutex::new(Scrub::default()),
+            waiting: AtomicU32::new(0),
         });
         let _ = src.self_ref.set(Arc::downgrade(&src));
         Ok(src)
@@ -422,20 +514,17 @@ impl RawCamSource {
             // dragging playhead (forwards or backwards) meets cached frames instead of waiting
             // behind read-aheads it will never reach.
             let direction = this.shuttle.lock().unwrap_or_else(|e| e.into_inner()).direction();
+            // A scrub burst owns the decoder: each of its seeks must find the bridge idle, and
+            // frames around a moving playhead are wasted work.
+            let scrubbing = this.scrub.lock().unwrap_or_else(|e| e.into_inner()).active(Instant::now());
             // No steering yet (tier 0 = no interactive request ever): nothing to read ahead of.
-            let decoded = tier != 0 && {
+            let decoded = tier != 0 && !scrubbing && {
                 // What is missing ahead of the playhead, nearest first: one batch fills a
                 // pipelined bridge (reads overlap the running decode) and caches the frames as
                 // they stream back, in order — a waiting request picks each up as it lands.
                 let cache = this.cache.lock().unwrap_or_else(|e| e.into_inner());
-                let missing: Vec<u64> = (1..=PREFETCH_FRAMES)
-                    .map(|ahead| match direction {
-                        d if d < 0 => last.saturating_sub(ahead),
-                        _ => last.saturating_add(ahead),
-                    })
-                    .take_while(|&next| next < this.frame_count)
-                    .filter(|next| !cache.contains_key(&(*next, tier)))
-                    .collect();
+                let mut missing = ahead_indices(last, direction, this.frame_count);
+                missing.retain(|next| !cache.contains_key(&(*next, tier)));
                 drop(cache);
                 !missing.is_empty() && this.demand.load(Ordering::Relaxed) == start_demand && this.prefetch_batch(&missing, tier).is_ok()
             };
@@ -457,7 +546,7 @@ impl RawCamSource {
     fn prefetch_batch(&self, indices: &[u64], tier: u32) -> Result<(), MediaError> {
         let rate = self.info.video.as_ref().map_or(FrameRate::FPS_25, |v| v.frame_rate);
         let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-        if state.busy || indices.is_empty() {
+        if state.busy || indices.is_empty() || self.waiting.load(Ordering::Relaxed) > 0 {
             return Ok(());
         }
         state.busy = true;
@@ -473,11 +562,18 @@ impl RawCamSource {
         };
         drop(state);
 
-        // Two frames per chunk: a scrubbing interactive request waits at most one chunk
-        // behind this read-ahead, not a whole batch (the pipeline still fills: the bridge
-        // keeps decoding while it receives).
+        // Small chunks: an interactive request waits at most one chunk behind this read-ahead,
+        // not a whole batch (the pipeline still fills: the bridge keeps decoding while it
+        // receives). Full and half tiers take one frame per chunk — a 6K full debayer alone is
+        // ~50 ms; the cheap tiers two.
+        let chunk = if tier <= 2 { 1 } else { 2 };
         let start_demand = self.demand.load(Ordering::Relaxed);
-        let outcome = session.request_batch_steered(indices, 2, || self.demand.load(Ordering::Relaxed) == start_demand, FRAME_TIMEOUT);
+        let outcome = session.request_batch_steered(
+            indices,
+            chunk,
+            || self.demand.load(Ordering::Relaxed) == start_demand && self.waiting.load(Ordering::Relaxed) == 0,
+            FRAME_TIMEOUT,
+        );
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
 
         let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
@@ -537,6 +633,22 @@ impl RawCamSource {
             .map(|(_, f)| f.clone())
     }
 
+    /// Wait (cancellably, at most [`MAX_REST_WAIT`]) until a scrub burst has ended: a request that
+    /// refines a scrubbed frame must not hold the decoder while the playhead still moves.
+    fn wait_for_rest(&self) -> Result<(), MediaError> {
+        let started = Instant::now();
+        loop {
+            let left = self.scrub.lock().unwrap_or_else(|e| e.into_inner()).rest_left(Instant::now());
+            if left.is_zero() || started.elapsed() >= MAX_REST_WAIT {
+                return Ok(());
+            }
+            if filmcraft_media::cancel::cancelled() {
+                return Err(MediaError::Cancelled);
+            }
+            std::thread::sleep(left.min(Duration::from_millis(4)));
+        }
+    }
+
     /// Store a decoded frame in the cache, trimmed to a window around the current position.
     fn cache_frame(&self, key: (u64, u32), frame: Arc<VideoFrame>) {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -555,36 +667,77 @@ impl RawCamSource {
     /// frame (accepting a nearby one while the display waits would rock playback a frame back and
     /// forth); background work (thumbnails, read-ahead) yields to them immediately. Sustained
     /// fast *playback* (shuttling) decodes at reduced tiers — proxy-quality while fast-forwarding,
-    /// exactly like every NLE; only while playing (`catch_up` is set then), so a paused, exact
-    /// view never shows a reduced frame.
+    /// exactly like every NLE; only while playing (`catch_up` is set then, and the request is no
+    /// paused seek). A paused monitor's scrub burst is served at [`SCRUB_TIER`], flagged
+    /// provisional so the monitor asks again for the exact frame once the playhead rests.
     fn serve(&self, idx: u64, tier: u32, want: f32, steer: bool) -> Result<Arc<VideoFrame>, MediaError> {
         let rate = self.info.video.as_ref().map_or(FrameRate::FPS_25, |v| v.frame_rate);
-        let tier = if steer {
+        let seek = steer && filmcraft_media::cancel::scrub();
+        let (tier, serve_tier, burst) = if steer {
             let mut shuttle = self.shuttle.lock().unwrap_or_else(|e| e.into_inner());
             shuttle.observe(idx);
-            let playing = filmcraft_media::cancel::catch_up().is_some();
+            let playing = filmcraft_media::cancel::catch_up().is_some() && !seek;
             let steps = if playing { shuttle_steps(shuttle.factor(rate)) } else { 0 };
-            self.format.stepped_down(tier, steps)
+            drop(shuttle);
+            let tier = self.format.stepped_down(tier, steps);
+            let burst = seek && self.scrub.lock().unwrap_or_else(|e| e.into_inner()).observe(Instant::now(), idx);
+            (tier, if burst { tier.max(SCRUB_TIER) } else { tier }, burst)
         } else {
-            tier
+            (tier, tier, false)
         };
+        let answered = || {
+            if seek {
+                self.scrub.lock().unwrap_or_else(|e| e.into_inner()).served(Instant::now(), idx, burst);
+            }
+        };
+        // The frame served is a stand-in for the exact one (a scrub burst's cheaper tier).
+        let provisional = serve_tier != tier;
         // Frames are cached by (index, tier): the tier ladder is coarse (a quarter-tier 6K
         // frame is 1512 px), which downstream conversions handle proportionally.
         let stats = steer && stats_on();
         let started = Instant::now();
         let mut waited = Duration::ZERO;
+        // An interactive request that is no seek (refining a scrubbed frame, playback starting)
+        // waits for a running scrub burst to end before it decodes — once.
+        let mut rest_checked = !steer || seek;
+        // Set while this interactive request waits for the decode slot (the read-ahead yields).
+        let mut waiting = None;
 
         loop {
-            if let Some(hit) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&(idx, tier)) {
+            let hit = {
+                let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                // The exact frame beats a stand-in, even during a burst.
+                match cache.get(&(idx, tier)) {
+                    Some(f) => Some((f.clone(), tier)),
+                    None if provisional => cache.get(&(idx, serve_tier)).map(|f| (f.clone(), serve_tier)),
+                    None => None,
+                }
+            };
+            if let Some((hit, hit_tier)) = hit {
                 if steer {
                     self.last.store(idx, Ordering::Relaxed);
-                    self.last_tier.store(tier, Ordering::Relaxed);
+                    self.last_tier.store(hit_tier, Ordering::Relaxed);
                     self.ensure_prefetch();
                 }
-                if stats {
-                    eprintln!("rawcam req idx={idx} tier={tier} want={want:.3} hit total={:?}", started.elapsed());
+                if hit_tier != tier {
+                    filmcraft_media::pending::mark_provisional();
                 }
-                return Ok(hit.clone());
+                if stats {
+                    eprintln!("rawcam req idx={idx} tier={hit_tier} want={want:.3} seek={seek} hit total={:?}", started.elapsed());
+                }
+                answered();
+                return Ok(hit);
+            }
+            if !rest_checked {
+                rest_checked = true;
+                let before = Instant::now();
+                self.wait_for_rest()?;
+                waited += before.elapsed();
+                // the cache may hold it now (read-ahead, a concurrent request)
+                continue;
+            }
+            if steer && waiting.is_none() {
+                waiting = Some(Waiting::new(&self.waiting));
             }
             let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
             if state.busy {
@@ -611,17 +764,18 @@ impl RawCamSource {
             }
             if steer {
                 self.last.store(idx, Ordering::Relaxed);
-                self.last_tier.store(tier, Ordering::Relaxed);
+                self.last_tier.store(serve_tier, Ordering::Relaxed);
                 self.demand.fetch_add(1, Ordering::Relaxed);
             }
             state.busy = true;
+            drop(waiting.take());
 
             // The session is owned locally while decoding: the sessions lock is free, so the
             // bookkeeping above stays responsive. A failed request desynchronises the byte
             // stream — the slot is then not returned, and the next request starts a fresh bridge.
-            let mut session = match state.sessions.iter().position(|s| s.tier == tier) {
+            let mut session = match state.sessions.iter().position(|s| s.tier == serve_tier) {
                 Some(at) => state.sessions.remove(at).session,
-                None => match DecodeSession::spawn(&self.bridge, &self.path, self.format.tier_word(tier), PROBE_TIMEOUT) {
+                None => match DecodeSession::spawn(&self.bridge, &self.path, self.format.tier_word(serve_tier), PROBE_TIMEOUT) {
                     Ok(s) => s,
                     Err(e) => {
                         state.busy = false;
@@ -639,7 +793,7 @@ impl RawCamSource {
             let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
             state.busy = false;
             if outcome.is_ok() {
-                state.sessions.push(SessionSlot { tier, session });
+                state.sessions.push(SessionSlot { tier: serve_tier, session });
                 if state.sessions.len() > TIERS {
                     state.sessions.remove(0);
                 }
@@ -647,7 +801,10 @@ impl RawCamSource {
             drop(state);
 
             if stats {
-                eprintln!("rawcam req idx={idx} tier={tier} want={want:.3} decoded wait={waited:?} decode={decoded_in:?} total={:?}", started.elapsed());
+                eprintln!(
+                    "rawcam req idx={idx} tier={serve_tier} want={want:.3} seek={seek} decoded wait={waited:?} decode={decoded_in:?} total={:?}",
+                    started.elapsed()
+                );
             }
 
             let reply = outcome.map_err(|e| {
@@ -655,10 +812,14 @@ impl RawCamSource {
                 MediaError::Decode(format!("{}: {e}", self.path.display()))
             })?;
             let frame = Arc::new(Self::into_frame(reply, idx, rate));
-            self.cache_frame((idx, tier), frame.clone());
+            self.cache_frame((idx, serve_tier), frame.clone());
+            if provisional {
+                filmcraft_media::pending::mark_provisional();
+            }
             if steer {
                 self.ensure_prefetch();
             }
+            answered();
             return Ok(frame);
         }
     }
@@ -773,6 +934,37 @@ mod tests {
             burst.observe(100 * i);
         }
         assert_eq!(burst.factor(FrameRate::FPS_25), 1.0);
+    }
+
+    #[test]
+    fn scrub_bursts_start_with_the_second_quick_seek_and_end_at_rest() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut s = Scrub::default();
+        assert!(!s.observe(ms(0), 10), "a single seek (a click) is no burst");
+        assert!(s.observe(ms(40), 12), "a quick second seek elsewhere starts one");
+        assert!(s.observe(ms(80), 12), "the same frame inside the burst stays in it");
+        assert!(s.active(ms(100)));
+        assert_eq!(s.rest_left(ms(100)), SCRUB_REST - Duration::from_millis(60));
+        assert!(!s.active(ms(40) + SCRUB_REST), "rested");
+        assert_eq!(s.rest_left(ms(1000)), Duration::ZERO);
+        // a slow sequence of seeks (frame stepping) never becomes a burst
+        let mut slow = Scrub::default();
+        for k in 0..5_u64 {
+            assert!(!slow.observe(ms(k * 400), k));
+        }
+    }
+
+    #[test]
+    fn read_ahead_indices_never_repeat() {
+        // backwards at the clip start: frame 0 once, not five times (saturating_sub did that)
+        assert_eq!(ahead_indices(1, -1, 100), vec![0]);
+        assert_eq!(ahead_indices(2, -1, 100), vec![1, 0]);
+        assert_eq!(ahead_indices(0, -1, 100), Vec::<u64>::new());
+        // forwards stops at the clip end and at u64::MAX
+        assert_eq!(ahead_indices(97, 1, 100), vec![98, 99]);
+        assert_eq!(ahead_indices(u64::MAX - 1, 1, u64::MAX), Vec::<u64>::new());
+        assert_eq!(ahead_indices(10, 0, 100), vec![11, 12, 13, 14, 15, 16]);
     }
 
     #[test]
@@ -914,15 +1106,13 @@ echo '{"type":"done"}' >&2
 
         let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
         let pixel = |k: i64| -> u8 {
-            let f = src
-                .video_frame(at(k))
+            src.video_frame(at(k))
                 .ok()
                 .and_then(|f| match &f.data {
                     filmcraft_frame::PixelData::Rgba8(d) => d.first().copied(),
                     _ => None,
                 })
-                .unwrap_or(u8::MAX);
-            f
+                .unwrap_or(u8::MAX)
         };
         // Sequential playback.
         assert_eq!(pixel(0), 1);
@@ -969,8 +1159,8 @@ echo '{"type":"done"}' >&2
     }
 
     /// A bridge that answers its first `frame` command (metadata, `frame` event, pixels,
-    /// `verify` event) and then exits: the decode stream dies mid-session the way a crashed SDK
-    /// process does.
+    /// `verify` event), then dies in the middle of the second (its `frame` event, no pixels):
+    /// the decode stream breaks mid-session the way a crashed SDK process does.
     #[cfg(target_os = "linux")]
     fn dying_bridge(dir: &Path) -> PathBuf {
         let script = r#"#!/bin/sh
@@ -999,6 +1189,10 @@ j=0 out=
 while [ $j -lt 512 ]; do out="$out$b$b$b$a"; j=$((j + 4)); done
 printf '%s' "$out"
 echo "{\"type\":\"verify\",\"index\":$i,\"width\":16,\"height\":8}" >&2
+IFS= read -r line || exit 0
+i=${line#frame }
+echo "{\"type\":\"frame\",\"index\":$i,\"width\":16,\"height\":8,\"format\":\"rgba8\"}" >&2
+exit 0
 "#;
         let path = dir.join("dying-bridge");
         std::fs::write(&path, script).ok();
@@ -1019,7 +1213,9 @@ echo "{\"type\":\"verify\",\"index\":$i,\"width\":16,\"height\":8}" >&2
         let bridge = dying_bridge(&dir);
         let raw = RawCamSource::open(&clip, Format::Braw, bridge, Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
         let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
-        // The bridge serves frame 3, then exits; frame 4 fails on the dead pipe.
+        // No read-ahead: it would race the requests below for the dying session.
+        raw.prefetch_started.store(true, Ordering::Relaxed);
+        // The bridge serves frame 3, then dies while answering frame 4.
         assert!(raw.video_frame(at(3)).is_ok());
         let second = raw.video_frame(at(4));
         let Err(e) = &second else { panic!("frame 4 must fail, got Ok") };
@@ -1074,6 +1270,98 @@ echo "{\"type\":\"verify\",\"index\":$i,\"width\":16,\"height\":8}" >&2
         assert_eq!(frame.pts, Tick::from_rational(2, 1, 24), "frame 2 itself, not a neighbour");
         assert!(worker.join().is_ok_and(|r| r.is_ok()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A paused monitor's scrub burst is served at the quarter tier and flagged provisional; the
+    /// refining request (no scrub hint) waits for the playhead to rest, then decodes the exact
+    /// tier. A cancelled refinement gives up without decoding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scrub_burst_serves_quarter_then_refines_at_rest() {
+        use filmcraft_media::cancel::{with_cancel, with_scrub};
+        use filmcraft_media::pending::take_provisional;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let clip = dir.join("clip.braw");
+        std::fs::write(&clip, b"placeholder").ok();
+        let src = RawCamSource::open(&clip, Format::Braw, fake_bridge(&dir), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+        let live = Arc::new(AtomicBool::new(false));
+        let dims = |f: &Arc<VideoFrame>| (f.width, f.height);
+        let _ = take_provisional();
+
+        // A click: the exact frame (16×8), nothing provisional. The last frame, so the read-ahead
+        // it starts has nothing to decode that the drag (backwards) could hit.
+        let first = with_cancel(&live, || with_scrub(true, || src.video_frame(at(7)))).unwrap_or_else(|e| panic!("seek: {e:?}"));
+        assert_eq!(dims(&first), (16, 8));
+        assert!(!take_provisional());
+        // The drag goes on: quarter tier (4×2), flagged provisional.
+        for k in [5, 3] {
+            let f = with_cancel(&live, || with_scrub(true, || src.video_frame(at(k)))).unwrap_or_else(|e| panic!("scrub {k}: {e:?}"));
+            assert_eq!(dims(&f), (4, 2), "frame {k} during the burst");
+            assert!(take_provisional(), "frame {k} is a stand-in");
+        }
+        // A cancelled refinement (the playhead moved on) leaves without decoding.
+        let gone = with_cancel(&Arc::new(AtomicBool::new(true)), || src.video_frame(at(3)));
+        assert!(matches!(gone, Err(MediaError::Cancelled)), "got {gone:?}");
+        // The monitor asks again without the hint: it waits for the rest, then gets 16×8.
+        let t = Instant::now();
+        let exact = with_cancel(&live, || src.video_frame(at(3))).unwrap_or_else(|e| panic!("refine: {e:?}"));
+        assert_eq!(dims(&exact), (16, 8));
+        assert!(!take_provisional());
+        assert!(t.elapsed() >= Duration::from_millis(50), "the refinement waited for the rest: {:?}", t.elapsed());
+        // After the rest a seek is a single click again: exact.
+        std::thread::sleep(SCRUB_REST);
+        let click = with_cancel(&live, || with_scrub(true, || src.video_frame(at(0)))).unwrap_or_else(|e| panic!("click: {e:?}"));
+        assert_eq!(dims(&click), (16, 8));
+        assert!(!take_provisional());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Real-material scrub measurement (`cargo test -- --ignored --nocapture`): a paused-monitor
+    /// drag over a clip at full-resolution scale, through the app's serve path, reporting ms per
+    /// seek and the tier served; then the refinement at rest. Needs `FILMCRAFT_RAWCAM_REAL`.
+    #[test]
+    #[ignore = "needs a real camera file (FILMCRAFT_RAWCAM_REAL) and the vendor bridge"]
+    fn real_clip_scrub_timing() {
+        use filmcraft_media::cancel::{with_cancel, with_scrub};
+        use std::sync::atomic::AtomicBool;
+        let Some(path) = std::env::var_os("FILMCRAFT_RAWCAM_REAL").map(PathBuf::from) else {
+            panic!("set FILMCRAFT_RAWCAM_REAL to a .braw/.R3D file");
+        };
+        let format = Format::from_path(&path).unwrap_or_else(|| panic!("{} is not braw/r3d", path.display()));
+        let bridge = bridge_path(format).unwrap_or_else(|| panic!("no {} on PATH", format.bridge_name()));
+        let src = RawCamSource::open(&path, format, bridge, None).unwrap_or_else(|e| panic!("open failed: {e}"));
+        let rate = src.info().video.as_ref().map_or(FrameRate::FPS_25, |v| v.frame_rate);
+        let live = Arc::new(AtomicBool::new(false));
+        let req = |idx: u64| FrameRequest { time: Tick::from_rational(idx as i64, rate.den, rate.num), scale: 1.0 };
+        let last = src.frame_count.saturating_sub(1);
+        // warm both sessions (SDK start-up is not what is measured)
+        let _ = with_cancel(&live, || src.video_frame(req(0)));
+        let _ = with_cancel(&live, || with_scrub(true, || src.video_frame(req(1))));
+        let _ = with_cancel(&live, || with_scrub(true, || src.video_frame(req(2))));
+        std::thread::sleep(Duration::from_millis(400));
+        for (label, hint) in [("without scrub hint (before)", false), ("with scrub hint (after)", true)] {
+            let mut ms = Vec::new();
+            let t_all = Instant::now();
+            for k in 0..30_u64 {
+                let idx = (10 + k * 3).min(last);
+                let t = Instant::now();
+                let f = with_cancel(&live, || with_scrub(hint, || src.video_frame(req(idx)))).unwrap_or_else(|e| panic!("seek {idx}: {e:?}"));
+                ms.push((t.elapsed().as_secs_f64() * 1000.0, f.width));
+                std::thread::sleep(Duration::from_millis(16)); // one UI refresh between moves
+            }
+            let mean = ms.iter().map(|m| m.0).sum::<f64>() / ms.len() as f64;
+            let worst = ms.iter().map(|m| m.0).fold(0.0, f64::max);
+            eprintln!("{label}: mean {mean:.1} ms, worst {worst:.1} ms per seek, total {:?}", t_all.elapsed());
+            eprintln!("  per seek (ms@width): {}", ms.iter().map(|(t, w)| format!("{t:.0}@{w}")).collect::<Vec<_>>().join(" "));
+            let t = Instant::now();
+            let refined = with_cancel(&live, || src.video_frame(req((10 + 29 * 3).min(last)))).unwrap_or_else(|e| panic!("refine: {e:?}"));
+            eprintln!("  refine at rest: {:.1} ms ({} px wide)", t.elapsed().as_secs_f64() * 1000.0, refined.width);
+            std::thread::sleep(Duration::from_millis(600));
+        }
     }
 
     /// Real-material test (`cargo test -- --ignored`): plays a clip through the same

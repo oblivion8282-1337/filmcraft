@@ -8,7 +8,7 @@
 //! render (see `filmcraft_engine::previews`).
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -84,6 +84,9 @@ struct Job {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Queued by playback prefetch (dropped when playback stops).
     prefetch: bool,
+    /// A paused monitor's seek ([`FrameServer::request_monitor`]): sources may answer a scrub
+    /// burst with a provisional stand-in (`filmcraft_media::cancel::with_scrub`).
+    scrub: bool,
     /// While playing: how far before this frame the frames are late (the playhead's distance;
     /// zero for the frame due now), so a decoder catching up may skip pictures only late frames
     /// need (`filmcraft_media::cancel::with_catch_up`).
@@ -112,7 +115,28 @@ struct Shared {
     workers: usize,
     /// Always-on counters for `perf.stats`.
     stats: Mutex<FrameStats>,
+    /// Cached results built from a provisional source frame (a scrub stand-in,
+    /// `filmcraft_media::pending::mark_provisional`): shown, but asking for them again renders
+    /// them anew, without the scrub hint, for the exact frame.
+    provisional: Mutex<HashSet<FrameKey>>,
+    /// Keys whose provisional result was replaced by the exact one: a display that shows them
+    /// must upload again ([`FrameServer::take_refined`]) — the key alone did not change.
+    refined: Mutex<HashSet<FrameKey>>,
 }
+
+/// Why a job is queued (see [`FrameServer::request_job`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// A frame a view shows now.
+    Shown,
+    /// A paused monitor's seek: refinable (see [`Job::scrub`]).
+    Seek,
+    /// Playback prefetch.
+    Prefetch,
+}
+
+/// Bound on the provisional/refined key sets (entries of evicted frames are pruned past it).
+const REFINE_KEYS: usize = 256;
 
 /// Cumulative frame-job statistics (`perf.stats`): cheap enough to keep on all the time.
 #[derive(Clone, Debug, Default)]
@@ -422,6 +446,8 @@ impl FrameServer {
             render_cost: Mutex::new(0.0),
             workers: workers.max(1),
             stats: Mutex::new(FrameStats::default()),
+            provisional: Mutex::new(HashSet::new()),
+            refined: Mutex::new(HashSet::new()),
         });
         let repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
         #[cfg(not(target_arch = "wasm32"))]
@@ -518,17 +544,37 @@ impl FrameServer {
     /// non-reference pictures, while nearby frames stay decoded (and cached) for scrubbing back.
     pub fn request(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32) {
         let late = (prio == 0).then(|| Tick::from_seconds_f64(SCRUB_KEEP_S));
-        self.request_job(key, time, scale, project, prio, false, late);
+        self.request_job(key, time, scale, project, prio, Origin::Shown, late);
     }
 
-    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool, catch_up: Option<Tick>) {
+    /// The frame a paused monitor shows ([`Self::request`] at priority 0) as a seek: while the
+    /// seeks come in a burst (scrubbing), a source may serve a cheaper provisional stand-in
+    /// (camera RAW at a reduced debayer tier). Asking for the same key again — the monitor does
+    /// on every refresh — then renders the exact frame, and [`Self::take_refined`] tells the
+    /// monitor to upload it.
+    pub fn request_monitor(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>) {
+        self.request_job(key, time, scale, project, 0, Origin::Seek, Some(Tick::from_seconds_f64(SCRUB_KEEP_S)));
+    }
+
+    /// Whether `key`'s cached result was refined (a provisional one replaced by the exact one)
+    /// since the last call: the display showing it must upload it again. Clears the mark.
+    pub fn take_refined(&self, key: &FrameKey) -> bool {
+        self.shared.refined.lock().unwrap_or_else(|e| e.into_inner()).remove(key)
+    }
+
+    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, origin: Origin, catch_up: Option<Tick>) {
         let hit = || self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).request_hits += 1;
-        if self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
-            || self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
-        {
+        let prefetch = origin == Origin::Prefetch;
+        let cached = self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
+            || self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key);
+        // A cached provisional result asked for again: render it anew for the exact frame (as no
+        // seek, so the source cannot answer with a stand-in again). It stays on screen meanwhile.
+        let refine = cached && self.shared.provisional.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
+        if cached && !refine {
             hit();
             return;
         }
+        let scrub = origin == Origin::Seek && !refine;
         if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, _)| *k == key && !c.load(Ordering::Relaxed)) {
             hit();
             return;
@@ -537,6 +583,8 @@ impl FrameServer {
         if let Some(j) = q.iter_mut().find(|j| j.key == key) {
             j.prio = j.prio.min(prio);
             j.prefetch &= prefetch;
+            // one request for the exact frame makes the job exact
+            j.scrub &= scrub;
             // the playhead only moves on: the newest (smallest) margin
             j.catch_up = match (j.catch_up, catch_up) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -564,7 +612,7 @@ impl FrameServer {
                 }
             }
         }
-        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio });
+        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, scrub, catch_up, time, scale, project: project.clone(), prio });
         drop(q);
         self.shared.cv.notify_one();
     }
@@ -583,7 +631,7 @@ impl FrameServer {
         let (lead, stride) = if preroll { (1, 1) } else { playback_plan(self.render_cost(), fps, self.shared.workers) };
         if lead <= 1 {
             // the frame due now; once the clock runs, the frames before it are late
-            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, false, (!preroll && dir > 0).then_some(Tick::ZERO));
+            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, Origin::Shown, (!preroll && dir > 0).then_some(Tick::ZERO));
         }
         // During preroll the clock has not started: only the frames that gate start, not a
         // prefetch run that walks the rest of a LongGOP and evicts the playhead pictures.
@@ -593,7 +641,7 @@ impl FrameServer {
             if f >= 0 {
                 // forward play: frames before the playhead are late (reverse play skips nothing)
                 let late = (!preroll && dir > 0).then(|| rate.tick_of(f) - rate.tick_of(key.frame));
-                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true, late);
+                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, Origin::Prefetch, late);
             }
         }
         let (target, rev, cur) = (key.target, key.revision, key.frame);
@@ -823,28 +871,35 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
     // A job whose media bytes were still loading (web) rendered with missing layers: like a
     // cancelled one, its result is not cached (the caller retries it).
     let _ = filmcraft_media::pending::take();
+    let _ = filmcraft_media::pending::take_provisional();
     let mut loading = false;
     let preview = filmcraft_media::cancel::with_cancel(&job.cancel, || {
         filmcraft_media::cancel::with_catch_up(job.catch_up, || {
             filmcraft_media::cancel::with_draft(job.key.draft, || {
-                filmcraft_media::cancel::with_background(is_background(job), || {
-                    if let Target::SequencePlan(seq) = job.key.target {
-                        let (plan, pv) = plan_job(job, seq, pool, services, previews);
-                        loading = filmcraft_media::pending::take();
-                        if !job.cancel.load(Ordering::Relaxed) && !loading {
-                            // Convert texels for upload here, not on the UI thread when the frame is shown.
-                            let prepared = filmcraft_gpu::prepare(&plan);
-                            sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared });
+                filmcraft_media::cancel::with_scrub(job.scrub, || {
+                    filmcraft_media::cancel::with_background(is_background(job), || {
+                        if let Target::SequencePlan(seq) = job.key.target {
+                            let (plan, pv) = plan_job(job, seq, pool, services, previews);
+                            loading = filmcraft_media::pending::take();
+                            let provisional = filmcraft_media::pending::take_provisional();
+                            if !job.cancel.load(Ordering::Relaxed) && !loading {
+                                // Convert texels for upload here, not on the UI thread when the frame is shown.
+                                let prepared = filmcraft_gpu::prepare(&plan);
+                                sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared });
+                                note_refinement(sh, job.key, provisional);
+                            }
+                            pv
+                        } else {
+                            let (img, pv) = render_job(job, pool, services, previews);
+                            loading = filmcraft_media::pending::take();
+                            let provisional = filmcraft_media::pending::take_provisional();
+                            if !job.cancel.load(Ordering::Relaxed) && !loading {
+                                sh.done.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, Arc::new(img));
+                                note_refinement(sh, job.key, provisional);
+                            }
+                            pv
                         }
-                        pv
-                    } else {
-                        let (img, pv) = render_job(job, pool, services, previews);
-                        loading = filmcraft_media::pending::take();
-                        if !job.cancel.load(Ordering::Relaxed) && !loading {
-                            sh.done.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, Arc::new(img));
-                        }
-                        pv
-                    }
+                    })
                 })
             })
         })
@@ -895,6 +950,32 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
         sh.records.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
     }
     !loading
+}
+
+/// Track whether `key`'s freshly cached result is provisional (asked for again, it re-renders)
+/// or replaced a provisional one (the display must upload it again, [`FrameServer::take_refined`]).
+fn note_refinement(sh: &Shared, key: FrameKey, provisional: bool) {
+    let mut set = sh.provisional.lock().unwrap_or_else(|e| e.into_inner());
+    if provisional {
+        set.insert(key);
+        if set.len() > REFINE_KEYS {
+            // keep only keys whose results are still cached (no lock is held while checking)
+            let keys: Vec<FrameKey> = set.iter().copied().collect();
+            drop(set);
+            let done = sh.done.lock().unwrap_or_else(|e| e.into_inner()).map.keys().copied().collect::<HashSet<_>>();
+            let plans = sh.plans.lock().unwrap_or_else(|e| e.into_inner()).map.keys().copied().collect::<HashSet<_>>();
+            let live: HashSet<FrameKey> = keys.into_iter().filter(|k| done.contains(k) || plans.contains(k)).collect();
+            sh.provisional.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| live.contains(k));
+        }
+    } else if set.remove(&key) {
+        drop(set);
+        let mut refined = sh.refined.lock().unwrap_or_else(|e| e.into_inner());
+        if refined.len() >= REFINE_KEYS {
+            // marks nobody collected (views that moved on): their textures show other keys
+            refined.clear();
+        }
+        refined.insert(key);
+    }
 }
 
 /// The preview frame for a sequence job, when its segment has been rendered.
@@ -989,6 +1070,41 @@ mod tests {
         // the scopes ask for the program frame at 40 while playing: never background
         assert!(!background_work(40, Target::Sequence(ItemId(1))));
         assert!(!background_work(50, Target::SequencePlan(ItemId(1))));
+    }
+
+    /// A provisional result (a scrub stand-in) stays on screen, but asking for its key again
+    /// renders it anew; the exact result then marks the key refined exactly once, so the monitor
+    /// uploads it although the key did not change. Exact results are plain cache hits.
+    #[test]
+    fn provisional_results_are_refined_when_asked_again() {
+        use super::{FrameKey, FrameServer, Rgba, note_refinement};
+        use std::sync::Arc;
+        let s = filmcraft_engine::Session::default();
+        let server = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 1);
+        let project = Arc::new(filmcraft_project::Project::default());
+        let key = FrameKey { target: Target::Item(ItemId(424242)), frame: 3, size: 1000, revision: 1, draft: false };
+        let exact = FrameKey { frame: 4, ..key };
+        for k in [key, exact] {
+            server.shared.done.lock().unwrap_or_else(|e| e.into_inner()).insert(k, Arc::new(Rgba { w: 1, h: 1, px: vec![9, 9, 9, 255] }));
+        }
+        note_refinement(&server.shared, key, true);
+        // the exact one: a hit, nothing rendered
+        server.request_monitor(exact, filmcraft_time::Tick::ZERO, 1.0, &project);
+        assert_eq!(server.stats().request_misses, 0);
+        // the provisional one: rendered again (the missing item renders as a 1×1 black frame)
+        server.request_monitor(key, filmcraft_time::Tick::ZERO, 1.0, &project);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !server.shared.refined.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+            assert!(std::time::Instant::now() < deadline, "the provisional frame was never refined");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(server.get(&key).map(|img| img.px.clone()), Some(vec![0, 0, 0, 255]), "the refined result replaced the stand-in");
+        assert!(server.take_refined(&key), "the monitor learns to upload it");
+        assert!(!server.take_refined(&key), "once");
+        // refined: asking again is a plain hit
+        let misses = server.stats().request_misses;
+        server.request_monitor(key, filmcraft_time::Tick::ZERO, 1.0, &project);
+        assert_eq!(server.stats().request_misses, misses);
     }
 
     #[test]

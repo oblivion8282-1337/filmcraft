@@ -14,6 +14,19 @@ use std::cell::Cell;
 
 thread_local! {
     static PENDING: Cell<bool> = const { Cell::new(false) };
+    static PROVISIONAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record that a frame served on this thread is a provisional stand-in (a cheaper decode while a
+/// paused monitor scrubs, [`crate::cancel::with_scrub`]): fine to show, but the requester should
+/// ask again (without the scrub hint) once the view rests, for the exact frame.
+pub fn mark_provisional() {
+    PROVISIONAL.with(|p| p.set(true));
+}
+
+/// Return and clear the provisional flag (see [`mark_provisional`]).
+pub fn take_provisional() -> bool {
+    PROVISIONAL.with(|p| p.replace(false))
 }
 
 /// Record that a read on this thread could not be served yet (its data is being fetched).
@@ -49,5 +62,14 @@ mod tests {
         assert!(is_set());
         assert!(take());
         assert!(!is_set());
+    }
+
+    #[test]
+    fn provisional_flag_is_separate_and_taken_once() {
+        assert!(!take_provisional());
+        mark_provisional();
+        assert!(!is_set(), "provisional is not pending");
+        assert!(take_provisional());
+        assert!(!take_provisional());
     }
 }

@@ -17,6 +17,12 @@
 //! [`with_background`] marks work nobody waits on interactively (thumbnails of the Project panel,
 //! the Media Browser and the timeline): sources should not keep expensive state, such as a
 //! frame-threaded 4K decoder, for it once it is done.
+//!
+//! [`with_scrub`] marks the frame a paused monitor shows after a seek (scrubbing, stepping, a
+//! click on the ruler). While such seeks come in a rapid burst, a source whose exact frame is
+//! expensive (camera RAW debayering) may answer with a cheaper stand-in and flag it with
+//! [`crate::pending::mark_provisional`]; the monitor then asks for the frame again, without this
+//! hint, and shows the exact one once it is ready. Never set for playback, exports or renders.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -29,6 +35,26 @@ thread_local! {
     static CATCH_UP: Cell<Option<Tick>> = const { Cell::new(None) };
     static DRAFT: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    static SCRUB: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with the paused-monitor seek hint `on` (restoring the previous one however `f` ends):
+/// the source may serve a provisional stand-in while seeks arrive in a burst (see the module docs).
+pub fn with_scrub<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCRUB.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SCRUB.with(|c| c.replace(on)));
+    f()
+}
+
+/// Whether the work running on this thread is a paused monitor's seek (off unless inside
+/// [`with_scrub`]`(true, …)`).
+pub fn scrub() -> bool {
+    SCRUB.with(Cell::get)
 }
 
 /// Run `f` as background work when `on` (restoring the previous hint after): a thumbnail, not a
@@ -97,19 +123,21 @@ pub fn cancelled() -> bool {
 }
 
 /// The hints of the work running on this thread ([`with_cancel`], [`with_catch_up`],
-/// [`with_draft`], [`with_background`]), to carry them to another thread doing part of that work.
+/// [`with_draft`], [`with_background`], [`with_scrub`]), to carry them to another thread doing
+/// part of that work.
 #[derive(Clone, Default)]
 pub struct Context {
     cancel: Option<Arc<AtomicBool>>,
     catch_up: Option<Tick>,
     draft: bool,
     background: bool,
+    scrub: bool,
 }
 
 impl Context {
     /// This thread's hints.
     pub fn current() -> Self {
-        Context { cancel: CURRENT.with(|c| c.borrow().clone()), catch_up: catch_up(), draft: draft(), background: background() }
+        Context { cancel: CURRENT.with(|c| c.borrow().clone()), catch_up: catch_up(), draft: draft(), background: background(), scrub: scrub() }
     }
 
     /// Run `f` with these hints, restoring this thread's however `f` ends (a pool thread must
@@ -123,6 +151,7 @@ impl Context {
                 CATCH_UP.with(|c| c.set(prev.catch_up));
                 DRAFT.with(|c| c.set(prev.draft));
                 BACKGROUND.with(|c| c.set(prev.background));
+                SCRUB.with(|c| c.set(prev.scrub));
             }
         }
         let _restore = Restore(Context::current());
@@ -130,6 +159,7 @@ impl Context {
         CATCH_UP.with(|c| c.set(self.catch_up));
         DRAFT.with(|c| c.set(self.draft));
         BACKGROUND.with(|c| c.set(self.background));
+        SCRUB.with(|c| c.set(self.scrub));
         f()
     }
 }
@@ -141,15 +171,15 @@ mod tests {
     #[test]
     fn context_carries_the_hints_to_another_thread_and_restores_its_own() {
         let flag = Arc::new(AtomicBool::new(true));
-        let ctx = with_cancel(&flag, || with_draft(true, || with_background(true, || with_catch_up(Some(Tick(5)), Context::current))));
+        let ctx = with_cancel(&flag, || with_draft(true, || with_background(true, || with_scrub(true, || with_catch_up(Some(Tick(5)), Context::current)))));
         std::thread::scope(|s| {
             s.spawn(|| {
-                let seen = with_draft(false, || ctx.clone().run(|| (cancelled(), draft(), background(), catch_up())));
-                assert_eq!(seen, (true, true, true, Some(Tick(5))));
+                let seen = with_draft(false, || ctx.clone().run(|| (cancelled(), draft(), background(), catch_up(), scrub())));
+                assert_eq!(seen, (true, true, true, Some(Tick(5)), true));
                 // a panic inside leaves this thread's own hints in place
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.clone().run(|| panic!("job"))));
                 assert!(r.is_err());
-                assert_eq!((cancelled(), draft(), background(), catch_up()), (false, false, false, None));
+                assert_eq!((cancelled(), draft(), background(), catch_up(), scrub()), (false, false, false, None, false));
             });
         });
     }
@@ -193,6 +223,20 @@ mod tests {
         let r = std::panic::catch_unwind(|| with_background(true, || panic!("boom")));
         assert!(r.is_err());
         assert!(!background());
+    }
+
+    #[test]
+    fn scrub_is_off_by_default_scoped_and_panic_safe() {
+        assert!(!scrub());
+        with_scrub(true, || {
+            assert!(scrub());
+            with_scrub(false, || assert!(!scrub()));
+            assert!(scrub());
+        });
+        assert!(!scrub());
+        let r = std::panic::catch_unwind(|| with_scrub(true, || panic!("boom")));
+        assert!(r.is_err());
+        assert!(!scrub());
     }
 
     #[test]
