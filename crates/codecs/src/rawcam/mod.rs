@@ -39,8 +39,15 @@ use crate::rawcam::bridge::DecodeSession;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest audio extraction (whole-clip PCM to disk).
 const AUDIO_TIMEOUT: Duration = Duration::from_secs(600);
-/// Longest a single `frame` request may take (a full-quality 8K debayer is not instant).
-const FRAME_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longest a single `frame` request may take (a full-quality 8K CPU debayer takes seconds; a
+/// bridge silent for longer has stalled and is killed).
+const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest an interactive request without a cancellation context waits for the decode slot.
+/// The slot is bounded by the spawn and frame timeouts; waiting longer means it is wedged.
+const MAX_SLOT_WAIT: Duration = Duration::from_secs(150);
+/// First pause before a bridge that keeps failing is started again (doubling, see
+/// [`VideoState::note_failure`]).
+const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 /// Decoded frames kept around a seek point (scrubbing back and forth).
 const CACHE_FRAMES: usize = 24;
 /// Live decode sessions kept at once (one per debayer tier in use), most recently used last.
@@ -376,6 +383,107 @@ struct SessionSlot {
 struct VideoState {
     busy: bool,
     sessions: Vec<SessionSlot>,
+    /// Consecutive bridge failures (start-up or decode), reset by a decoded frame.
+    failures: u32,
+    /// From the second consecutive failure on: no new bridge is started before this.
+    retry_at: Option<Instant>,
+}
+
+impl VideoState {
+    fn new() -> Self {
+        VideoState { busy: false, sessions: Vec::new(), failures: 0, retry_at: None }
+    }
+
+    /// The pooled session at `tier`, if its bridge still runs (a dead one is dropped: it crashed
+    /// while idle, and the request must not inherit that).
+    fn take_session(&mut self, tier: u32) -> Option<DecodeSession> {
+        let at = self.sessions.iter().position(|s| s.tier == tier)?;
+        let mut session = self.sessions.remove(at).session;
+        session.is_alive().then_some(session)
+    }
+
+    /// How long until a new bridge may be started (`None`: now).
+    fn backoff_left(&self, now: Instant) -> Option<Duration> {
+        self.retry_at.and_then(|t| t.checked_duration_since(now)).filter(|d| !d.is_zero())
+    }
+
+    /// A bridge failed. One failure is retried at once (a crash mid-session recovers on the next
+    /// frame); from the second in a row, starting a new bridge waits 0.5 s, doubling up to 16 s —
+    /// a broken bridge must not be respawned for every frame a monitor asks for.
+    fn note_failure(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= 2 {
+            let doubling = (self.failures - 2).min(5);
+            self.retry_at = Some(now + RESPAWN_BACKOFF * (1_u32 << doubling));
+        }
+    }
+
+    fn note_success(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+    }
+
+    /// Return a working session to the pool (most recently used last, at most [`TIERS`]).
+    fn put_back(&mut self, tier: u32, session: DecodeSession) {
+        self.sessions.push(SessionSlot { tier, session });
+        if self.sessions.len() > TIERS {
+            self.sessions.remove(0);
+        }
+    }
+}
+
+/// The decode slot, held ([`VideoState::busy`] is set): [`Lease::succeed`] / [`Lease::fail`]
+/// release it with the outcome, and dropping it releases it too — a decode that panics must not
+/// leave every later request waiting for a slot that never frees.
+struct Lease<'a> {
+    video: &'a Mutex<VideoState>,
+    held: bool,
+}
+
+impl<'a> Lease<'a> {
+    /// Take the slot; the caller has just set `busy` under the lock.
+    fn new(video: &'a Mutex<VideoState>) -> Self {
+        Lease { video, held: true }
+    }
+
+    fn release(mut self, outcome: Option<(u32, DecodeSession)>, ok: bool) {
+        let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
+        state.busy = false;
+        if ok {
+            state.note_success();
+        } else {
+            state.note_failure(Instant::now());
+        }
+        if let Some((tier, session)) = outcome {
+            state.put_back(tier, session);
+        }
+        self.held = false;
+    }
+
+    /// The session decoded: back into the pool.
+    fn succeed(self, tier: u32, session: DecodeSession) {
+        self.release(Some((tier, session)), true);
+    }
+
+    /// The bridge failed (the session, if any, was dropped by the caller — outside the lock).
+    fn fail(self) {
+        self.release(None, false);
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.video.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+        }
+    }
+}
+
+/// The frame index `time` falls on, inside a clip of `frame_count` frames (the last frame past
+/// its end; any count, even beyond `i64`, is safe).
+fn frame_index(rate: FrameRate, time: Tick, frame_count: u64) -> u64 {
+    let last = i64::try_from(frame_count.saturating_sub(1)).unwrap_or(i64::MAX);
+    u64::try_from(rate.frame_at(time.max(Tick::ZERO)).clamp(0, last)).unwrap_or(0)
 }
 
 pub struct RawCamSource {
@@ -434,7 +542,9 @@ impl RawCamSource {
         let meta = bridge::probe(&bridge, path, PROBE_TIMEOUT).map_err(|e| format!("{}: {e}", path.display()))?;
         let rate = FrameRate::new(i64::from(meta.fps_num), i64::from(meta.fps_den.max(1)));
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let duration = Tick::from_rational(meta.frame_count as i64, rate.den, rate.num);
+        // A count past `i64` (a hostile bridge) is clamped: every index then converts safely.
+        let frame_count = meta.frame_count.min(i64::MAX.unsigned_abs());
+        let duration = Tick::from_rational(i64::try_from(frame_count).unwrap_or(i64::MAX), rate.den, rate.num);
         let bitrate = len.checked_mul(8).and_then(|b| b.checked_mul(u64::from(meta.fps_num))).map(|b| b / u64::from(meta.fps_den.max(1)));
         let cache = cache.unwrap_or_else(cache_dir);
         let audio = open_audio(format, &bridge, path, &cache);
@@ -460,7 +570,6 @@ impl RawCamSource {
             start_timecode: timecode_to_frames(&meta.timecode, rate),
             file_size: Some(len),
         };
-        let frame_count = meta.frame_count;
         let src = Arc::new(Self {
             info,
             path: path.to_path_buf(),
@@ -468,7 +577,7 @@ impl RawCamSource {
             format,
             frame_count,
             audio,
-            video: Mutex::new(VideoState { busy: false, sessions: Vec::new() }),
+            video: Mutex::new(VideoState::new()),
             cache: Mutex::new(BTreeMap::new()),
             self_ref: OnceLock::new(),
             last: AtomicU64::new(0),
@@ -493,7 +602,28 @@ impl RawCamSource {
         if !self.prefetch_started.swap(true, Ordering::Relaxed)
             && let Some(weak) = self.self_ref.get().cloned()
         {
-            std::thread::spawn(move || Self::read_ahead(weak));
+            let started = bridge::spawn_guarded("filmcraft-rawcam-readahead", move || {
+                let again = weak.clone();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::read_ahead(again))).is_err() {
+                    log::error!("camera-RAW read-ahead panicked; it restarts with the next request");
+                    if let Some(this) = weak.upgrade() {
+                        this.prefetch_started.store(false, Ordering::Relaxed);
+                    }
+                }
+            });
+            if !started {
+                self.prefetch_started.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `pooled`, or a freshly started bridge session at `tier` (called without the lock held:
+    /// the SDK start-up can take seconds).
+    fn open_session(&self, pooled: Option<DecodeSession>, tier: u32) -> Result<DecodeSession, MediaError> {
+        match pooled {
+            Some(s) => Ok(s),
+            None => DecodeSession::spawn(&self.bridge, &self.path, self.format.tier_word(tier), PROBE_TIMEOUT)
+                .map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name()))),
         }
     }
 
@@ -549,18 +679,20 @@ impl RawCamSource {
         if state.busy || indices.is_empty() || self.waiting.load(Ordering::Relaxed) > 0 {
             return Ok(());
         }
+        let pooled = state.take_session(tier);
+        if pooled.is_none() && state.backoff_left(Instant::now()).is_some() {
+            return Ok(()); // a failing bridge is not restarted for read-ahead
+        }
         state.busy = true;
-        let mut session = match state.sessions.iter().position(|s| s.tier == tier) {
-            Some(at) => state.sessions.remove(at).session,
-            None => match DecodeSession::spawn(&self.bridge, &self.path, self.format.tier_word(tier), PROBE_TIMEOUT) {
-                Ok(s) => s,
-                Err(e) => {
-                    state.busy = false;
-                    return Err(MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())));
-                }
-            },
-        };
+        let lease = Lease::new(&self.video);
         drop(state);
+        let mut session = match self.open_session(pooled, tier) {
+            Ok(s) => s,
+            Err(e) => {
+                lease.fail();
+                return Err(e);
+            }
+        };
 
         // Small chunks: an interactive request waits at most one chunk behind this read-ahead,
         // not a whole batch (the pipeline still fills: the bridge keeps decoding while it
@@ -575,16 +707,12 @@ impl RawCamSource {
             FRAME_TIMEOUT,
         );
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-
-        let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-        state.busy = false;
         if outcome.is_ok() {
-            state.sessions.push(SessionSlot { tier, session });
-            if state.sessions.len() > TIERS {
-                state.sessions.remove(0);
-            }
+            lease.succeed(tier, session);
+        } else {
+            drop(session); // kills and reaps the bridge, outside the lock
+            lease.fail();
         }
-        drop(state);
 
         let frames = outcome.map_err(|e| {
             log::warn!("{}: read-ahead batch failed ({e}) — restarting the bridge", self.path.display());
@@ -601,7 +729,7 @@ impl RawCamSource {
     /// through — only the layouts needing work are converted (a legacy `rgb24` bridge, or
     /// R3D's channel order).
     fn into_frame(reply: bridge::FrameBytes, idx: u64, rate: FrameRate) -> VideoFrame {
-        let pts = || Tick::from_rational(idx as i64, rate.den, rate.num);
+        let pts = || Tick::from_rational(i64::try_from(idx).unwrap_or(i64::MAX), rate.den, rate.num);
         match reply.format {
             bridge::FrameFormat::Rgba8 => VideoFrame::rgba8(reply.width, reply.height, reply.data).with_pts(pts()),
             bridge::FrameFormat::Bgra8 => {
@@ -754,6 +882,9 @@ impl RawCamSource {
                     }
                     return Err(MediaError::Cancelled);
                 }
+                if waited >= MAX_SLOT_WAIT {
+                    return Err(MediaError::Decode(format!("{}: the {} decoder is not answering", self.path.display(), self.format.bridge_name())));
+                }
                 let nap = Duration::from_millis(2);
                 std::thread::sleep(nap);
                 waited += nap;
@@ -762,43 +893,49 @@ impl RawCamSource {
             if filmcraft_media::cancel::cancelled() {
                 return Err(MediaError::Cancelled);
             }
+            let pooled = state.take_session(serve_tier);
+            if pooled.is_none()
+                && let Some(left) = state.backoff_left(Instant::now())
+            {
+                return Err(MediaError::Decode(format!(
+                    "{}: {} keeps failing; trying again in {:.1} s",
+                    self.path.display(),
+                    self.format.bridge_name(),
+                    left.as_secs_f64()
+                )));
+            }
             if steer {
                 self.last.store(idx, Ordering::Relaxed);
                 self.last_tier.store(serve_tier, Ordering::Relaxed);
                 self.demand.fetch_add(1, Ordering::Relaxed);
             }
             state.busy = true;
+            let lease = Lease::new(&self.video);
+            drop(state);
             drop(waiting.take());
 
-            // The session is owned locally while decoding: the sessions lock is free, so the
-            // bookkeeping above stays responsive. A failed request desynchronises the byte
-            // stream — the slot is then not returned, and the next request starts a fresh bridge.
-            let mut session = match state.sessions.iter().position(|s| s.tier == serve_tier) {
-                Some(at) => state.sessions.remove(at).session,
-                None => match DecodeSession::spawn(&self.bridge, &self.path, self.format.tier_word(serve_tier), PROBE_TIMEOUT) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        state.busy = false;
-                        return Err(MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())));
-                    }
-                },
+            // The session is owned locally while decoding (and started, if need be): the sessions
+            // lock is free, so the bookkeeping above stays responsive. A failed request
+            // desynchronises the byte stream — the session is then dropped (killing its bridge),
+            // and the next request starts a fresh one.
+            let mut session = match self.open_session(pooled, serve_tier) {
+                Ok(s) => s,
+                Err(e) => {
+                    lease.fail();
+                    return Err(e);
+                }
             };
-            drop(state);
 
             let decode_started = Instant::now();
             let outcome = session.request_frame(idx, FRAME_TIMEOUT);
             let decoded_in = decode_started.elapsed();
             *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-
-            let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-            state.busy = false;
             if outcome.is_ok() {
-                state.sessions.push(SessionSlot { tier: serve_tier, session });
-                if state.sessions.len() > TIERS {
-                    state.sessions.remove(0);
-                }
+                lease.succeed(serve_tier, session);
+            } else {
+                drop(session); // kills and reaps the bridge, outside the lock
+                lease.fail();
             }
-            drop(state);
 
             if stats {
                 eprintln!(
@@ -838,8 +975,7 @@ impl MediaSource for RawCamSource {
 
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let Some(v) = self.info.video.as_ref() else { return Err(MediaError::NoStream("video")) };
-        let last = self.frame_count.saturating_sub(1);
-        let idx = v.frame_rate.frame_at(req.time.max(Tick::ZERO)).clamp(0, last as i64) as u64;
+        let idx = frame_index(v.frame_rate, req.time, self.frame_count);
         let tier = self.format.tier_factor(req.scale, filmcraft_media::cancel::draft());
         self.serve(idx, tier, req.scale, !filmcraft_media::cancel::background())
     }
@@ -1010,8 +1146,10 @@ mod tests {
     /// A `/bin/sh` stand-in for a real bridge: an 8-frame 16×8 clip whose frame `i` is filled
     /// with byte `i+1`, honouring `--probe-only`, `--debayer` (dimension factor), the persistent
     /// `frame <index>` / `quit` stdin protocol (`--persistent`), and `--extract-audio`
-    /// (a 48 kHz mono 16-bit WAV with two silent samples). A clip whose file starts with "slow"
-    /// takes a second per frame (the contention test).
+    /// (a 48 kHz mono 16-bit WAV with two silent samples). The clip file's first four bytes pick
+    /// a misbehaviour: "slow" takes a second per frame (the contention test), "lazy" a second to
+    /// start a decode session, "fail" fails every decode session at start-up, "huge" reports
+    /// `u64::MAX` frames.
     #[cfg(target_os = "linux")]
     fn fake_bridge(dir: &Path) -> PathBuf {
         let script = r#"#!/bin/sh
@@ -1033,9 +1171,18 @@ factor=1
 [ "$debayer" = quarter ] && factor=4
 [ "$debayer" = eighth ] && factor=8
 w=$((16/factor)) h=$((8/factor))
-slow=0
-if [ -f "$input" ] && [ "$(head -c 4 "$input" 2>/dev/null)" = "slow" ]; then slow=1; fi
-echo "{\"type\":\"metadata\",\"timecode\":\"01:02:03:04\",\"fps_num\":24,\"fps_den\":1,\"width\":16,\"height\":8,\"frame_count\":8}" >&2
+slow=0 mode=
+[ -f "$input" ] && mode=$(head -c 4 "$input" 2>/dev/null)
+[ "$mode" = slow ] && slow=1
+frames=8
+[ "$mode" = huge ] && frames=18446744073709551615
+[ "$persistent" = 1 ] && [ "$mode" = lazy ] && sleep 1
+if [ "$persistent" = 1 ] && [ "$mode" = fail ]; then
+    echo $$ >> "$input.sessions" 2>/dev/null || :
+    echo '{"type":"error","message":"no GPU"}' >&2
+    exit 1
+fi
+echo "{\"type\":\"metadata\",\"timecode\":\"01:02:03:04\",\"fps_num\":24,\"fps_den\":1,\"width\":16,\"height\":8,\"frame_count\":$frames}" >&2
 [ "$probe" = 1 ] && { echo '{"type":"done"}' >&2; exit 0; }
 if [ -n "$audio" ]; then
     printf 'RIFF$\000\000\000WAVEfmt \020\000\000\000\001\000\001\000\200\273\000\000\000\167\001\000\002\000\020\000data\004\000\000\000\000\000\000\000' > "$audio"
@@ -1362,6 +1509,113 @@ exit 0
             eprintln!("  refine at rest: {:.1} ms ({} px wide)", t.elapsed().as_secs_f64() * 1000.0, refined.width);
             std::thread::sleep(Duration::from_millis(600));
         }
+    }
+
+    #[test]
+    fn frame_index_survives_any_frame_count() {
+        let rate = FrameRate::FPS_25;
+        let at = |k: i64| rate.tick_of(k);
+        // `last as i64` turned u64::MAX frames into -1, and clamp(0, -1) panicked
+        assert_eq!(frame_index(rate, at(3), u64::MAX), 3);
+        assert_eq!(frame_index(rate, Tick(i64::MAX), u64::MAX), u64::try_from(rate.frame_at(Tick(i64::MAX))).unwrap_or(0));
+        assert_eq!(frame_index(rate, at(100), 8), 7, "past the end: the last frame");
+        assert_eq!(frame_index(rate, Tick(-5), 8), 0, "before the start: the first frame");
+        assert_eq!(frame_index(rate, at(3), 0), 0, "an empty clip has nothing but 0");
+    }
+
+    #[test]
+    fn failing_bridges_back_off() {
+        let t0 = Instant::now();
+        let mut v = VideoState::new();
+        v.note_failure(t0);
+        assert_eq!(v.backoff_left(t0), None, "one failure retries at once");
+        v.note_failure(t0);
+        assert_eq!(v.backoff_left(t0), Some(RESPAWN_BACKOFF));
+        v.note_failure(t0);
+        assert_eq!(v.backoff_left(t0), Some(RESPAWN_BACKOFF * 2), "doubling");
+        for _ in 0..100 {
+            v.note_failure(t0);
+        }
+        assert_eq!(v.backoff_left(t0), Some(RESPAWN_BACKOFF * 32), "capped at 16 s");
+        assert_eq!(v.backoff_left(t0 + Duration::from_secs(17)), None);
+        v.note_success();
+        assert_eq!((v.failures, v.backoff_left(t0)), (0, None));
+    }
+
+    /// A decode that panics while holding the slot must not leave it taken: every later request
+    /// would wait for it forever.
+    #[test]
+    fn a_panicking_decode_releases_the_slot() {
+        let video = Mutex::new(VideoState::new());
+        video.lock().unwrap_or_else(|e| e.into_inner()).busy = true;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = Lease::new(&video);
+            panic!("decoder bug");
+        }));
+        assert!(r.is_err());
+        assert!(!video.lock().unwrap_or_else(|e| e.into_inner()).busy);
+    }
+
+    /// A bridge reporting `u64::MAX` frames: the duration stays positive and requests do not
+    /// panic (they did: `frame_count as i64` was -1).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absurd_frame_counts_are_clamped() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-huge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let clip = dir.join("huge.braw");
+        std::fs::write(&clip, b"huge placeholder").ok();
+        let src = RawCamSource::open(&clip, Format::Braw, fake_bridge(&dir), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        assert!(src.info().duration > Tick::ZERO, "duration {:?}", src.info().duration);
+        let f = src.video_frame(FrameRequest { time: Tick::from_rational(3, 1, 24), scale: 1.0 }).unwrap_or_else(|e| panic!("frame 3: {e:?}"));
+        assert_eq!(f.pts, Tick::from_rational(3, 1, 24));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bridge that fails at start-up is retried once at once, then backed off: requests in the
+    /// back-off fail fast without starting another process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_bridge_is_not_respawned_per_request() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let clip = dir.join("fail.braw");
+        std::fs::write(&clip, b"fail placeholder").ok();
+        let src = RawCamSource::open(&clip, Format::Braw, fake_bridge(&dir), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+        let spawns = || std::fs::read_to_string(clip.with_extension("braw.sessions")).unwrap_or_default().lines().count();
+        for k in 0..6 {
+            assert!(matches!(src.video_frame(at(k)), Err(MediaError::Decode(_))), "frame {k}");
+        }
+        assert_eq!(spawns(), 2, "two attempts, then the back-off");
+        std::thread::sleep(RESPAWN_BACKOFF + Duration::from_millis(100));
+        assert!(src.video_frame(at(0)).is_err());
+        assert_eq!(spawns(), 3, "tried again after the back-off");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Starting a bridge (seconds of SDK start-up) must not hold the sessions lock: a thumbnail
+    /// asking meanwhile answers at once instead of blocking behind the start-up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_starting_bridge_does_not_block_other_requests() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-lazy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let clip = dir.join("lazy.braw");
+        std::fs::write(&clip, b"lazy placeholder").ok();
+        let src = RawCamSource::open(&clip, Format::Braw, fake_bridge(&dir), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("clip must open: {e}"));
+        let at = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+        let worker = std::thread::spawn({
+            let src = Arc::clone(&src);
+            move || src.video_frame(at(0))
+        });
+        std::thread::sleep(Duration::from_millis(200)); // the worker is starting the bridge
+        let t = Instant::now();
+        let thumb = filmcraft_media::cancel::with_background(true, || src.video_frame(at(0)));
+        assert!(matches!(thumb, Err(MediaError::Cancelled)), "nothing cached yet: {thumb:?}");
+        assert!(t.elapsed() < Duration::from_millis(400), "blocked {:?} behind the start-up", t.elapsed());
+        assert!(worker.join().is_ok_and(|r| r.is_ok()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Real-material test (`cargo test -- --ignored`): plays a clip through the same
