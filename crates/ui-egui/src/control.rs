@@ -354,8 +354,12 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 let f = i as f32 / steps as f32;
                 app.synthetic.push(egui::Event::PointerMoved(a + (b - a) * f));
             }
-            app.synthetic.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
-            app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            // `release: false` keeps the button (and modifiers) held, so a screenshot shows the drag in
+            // progress (a drop preview); the next `ui.click` or `ui.drag` releases it
+            if p.get("release").and_then(Value::as_bool).unwrap_or(true) {
+                app.synthetic.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+                app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            }
             Outcome::AfterInput
         }
         "ui.scroll" => {

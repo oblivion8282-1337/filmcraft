@@ -214,6 +214,64 @@ impl Layout {
     }
 }
 
+/// The rows a drop preview's bar takes: the track's row, or for a track the drop adds the band it
+/// will take, above the top video track (V-numbers count up) or below the last audio track.
+fn ghost_band(seq: &Sequence, layout: &Layout, g: &filmcraft_engine::place_preview::PlaceGhost, vh: f32, ah: f32) -> Option<(f32, f32)> {
+    if let Some(r) = layout.rows.iter().find(|r| r.kind == g.kind && r.index == g.track) {
+        return Some((r.rect.min.y, r.rect.max.y));
+    }
+    let have = seq.tracks(g.kind).len();
+    let beyond = g.track.checked_sub(have)? as f32;
+    let last = |kind: TrackKind| layout.rows.iter().filter(|r| r.kind == kind).max_by_key(|r| r.index);
+    match g.kind {
+        TrackKind::Video => {
+            let top = last(TrackKind::Video).map_or(layout.split_y, |r| r.rect.min.y) - beyond * vh;
+            Some((top - vh, top))
+        }
+        TrackKind::Audio => {
+            let top = last(TrackKind::Audio).map_or(layout.split_y + DIVIDER_H, |r| r.rect.max.y) + beyond * ah;
+            Some((top, top + ah))
+        }
+    }
+}
+
+/// Draw the clips a drop will make: the picture and every audio clip (one per audio stream or
+/// channel clip), each on the track it lands on; on a track the drop adds, hatched.
+fn paint_drop_ghosts(
+    app: &mut FilmcraftApp,
+    ui: &egui::Ui,
+    seq: &Sequence,
+    layout: &Layout,
+    ghosts: &[filmcraft_engine::place_preview::PlaceGhost],
+    insert: bool,
+) {
+    let (vh, ah) = (app.ui.timeline.video_track_h, app.ui.timeline.audio_track_h);
+    let video_area = Rect::from_min_max(layout.content.min, pos2(layout.content.max.x, layout.split_y));
+    let audio_area = Rect::from_min_max(pos2(layout.content.min.x, layout.split_y + DIVIDER_H), pos2(layout.content.max.x, layout.content.max.y - MASTER_H));
+    let mut labelled = false;
+    for g in ghosts {
+        let Some((y0, y1)) = ghost_band(seq, layout, g, vh, ah) else { continue };
+        let area = if g.kind == TrackKind::Video { video_area } else { audio_area };
+        let r = Rect::from_min_max(pos2(layout.x_of(g.start), y0 + 1.0), pos2(layout.x_of(g.end()), y1 - 1.0));
+        let shown = r.intersect(area);
+        if !shown.is_positive() {
+            continue;
+        }
+        let painter = ui.painter().with_clip_rect(area);
+        painter.rect_filled(r, 3.0, Color32::from_white_alpha(if g.new_track { 24 } else { 40 }));
+        if g.new_track {
+            paint_hatch(&painter, shown);
+        }
+        painter.rect_stroke(r, 3.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+        let name = format!("{}{}", if g.kind == TrackKind::Video { 'V' } else { 'A' }, g.track.saturating_add(1));
+        app.auto.add(&format!("timeline.dropGhost.{name}"), shown, if g.new_track { "new" } else { "" });
+        if insert && !labelled {
+            labelled = true;
+            ui.painter().text(r.left_top() + vec2(4.0, -2.0), Align2::LEFT_BOTTOM, tl!("Insert"), Tokens::ui(10.0), Color32::WHITE);
+        }
+    }
+}
+
 /// #483: where a drop at `y` adds a track: the empty space above the top video track (a video
 /// track) or below the last audio track (an audio track), never over a track, the caption tracks
 /// or the Mix row. Gives the kind and the band the new track would take (`vh` / `ah` high).
@@ -2908,11 +2966,6 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             })
         });
         let t = snap(app, seq, layout, rate.snap_nearest(layout.tick_at(p.x).max(Tick::ZERO)), &[]);
-        let still = app.session.prefs.timeline.still_duration(rate);
-        let is_still = app.session.project.item(item).and_then(|i| i.as_media()).is_some_and(|m| m.info.kind == filmcraft_media::MediaKind::Still);
-        let dur = source
-            .map(|s| s.range.duration)
-            .unwrap_or_else(|| app.session.project.item(item).map(|i| i.duration()).filter(|d| d.0 > 0 && !is_still).unwrap_or(still));
         // #483: in the empty space above the top video track or below the last audio track, a new track
         let new_track = if row.is_some() { None } else { new_track_at(seq, layout, p.y, app.ui.timeline.video_track_h, app.ui.timeline.audio_track_h) }.filter(
             |(kind, _)| {
@@ -2920,14 +2973,6 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 carries && source.is_none_or(|s| if *kind == TrackKind::Video { s.video } else { s.audio })
             },
         );
-        if let Some(band) = row.as_ref().map(|r| r.rect).or(new_track.map(|(_, band)| band)) {
-            let r = Rect::from_min_max(pos2(layout.x_of(t), band.min.y + 1.0), pos2(layout.x_of(t + dur), band.max.y - 1.0));
-            ui.painter().rect_filled(r, 3.0, Color32::from_white_alpha(40));
-            ui.painter().rect_stroke(r, 3.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
-            if mods.command {
-                ui.painter().text(r.left_top() + vec2(4.0, -2.0), Align2::LEFT_BOTTOM, tl!("Insert"), Tokens::ui(10.0), Color32::WHITE);
-            }
-        }
         let target = match (&row, new_track) {
             (Some(row), _) => Some(match row.kind {
                 TrackKind::Video => (json!(row.track.0), json!(seq.audio_tracks.get(row.index).or(seq.audio_tracks.first()).map(|t| t.id.0))),
@@ -2938,9 +2983,8 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             (None, Some((TrackKind::Audio, _))) => Some((seq.video_tracks.get(seq.audio_tracks.len()).map_or(json!("new"), |t| json!(t.id.0)), json!("new"))),
             (None, None) => None,
         };
-        if ctx.input(|i| i.pointer.any_released())
-            && let Some((vt, at)) = target
-        {
+        // the drop's `timeline.place` call; the preview draws the clips this very call makes
+        let params = target.map(|(vt, at)| {
             // dragging one of several selected project items places them all, back to back, as one edit
             let items = match source {
                 None => crate::panels::dragged_selection(app, item),
@@ -2957,6 +3001,20 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 params["video"] = json!(source.video);
                 params["audio"] = json!(source.audio);
             }
+            params
+        });
+        if let Some(params) = &params {
+            match filmcraft_engine::place_preview::preview_place(&app.session, params) {
+                Ok(ghosts) => paint_drop_ghosts(app, ui, seq, layout, &ghosts, mods.command),
+                // the drop would be refused (a locked track, no destination…): say why instead
+                Err(e) => {
+                    ui.painter().text(p + vec2(12.0, -4.0), Align2::LEFT_BOTTOM, e.to_string(), Tokens::ui(10.0), Color32::from_rgb(240, 170, 60));
+                }
+            }
+        }
+        if ctx.input(|i| i.pointer.any_released())
+            && let Some(params) = params
+        {
             if let Err(e) = app.session.execute("timeline.place", params) {
                 app.ui.status = e.to_string();
             }
