@@ -18,12 +18,22 @@
 //! `{"type":"error","index":N,…}` in its place in the reply order — that one request fails, the
 //! session goes on ([`Reply`]). Bridges without the fields are spoken to as before.
 //!
+//! Shared-memory transport (`shm` capability, Linux): instead of pushing ~85 MB per 6K frame
+//! through the stdout pipe, the bridge writes frames into a ring of slots over a tmpfs file the
+//! client created ([`ShmRing`]). The client creates the file in `/dev/shm`, unlinks it at once
+//! (nothing is left behind, whatever happens later) and passes it as `--shm /proc/<pid>/fd/<n>`;
+//! the bridge's `metadata` answers `"shm_slots":N,"shm_slot_bytes":S` when it took it. A frame
+//! in slot k is announced with `"slot":k` (no stdout bytes), read with one positional read at
+//! `k*S`, and handed back with `release k`; frames without `slot` still arrive on stdout. The
+//! layout and every announced slot are validated before anything is read or allocated.
+//!
 //! Everything a bridge says is untrusted: dimensions are capped ([`MAX_FRAME_DIM`],
 //! [`MAX_FRAME_BYTES`]) before anything is allocated, pixel reads run on a reader thread so a
 //! stalled bridge times out instead of hanging its caller, and every child process is killed
 //! and reaped on every exit path.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
@@ -33,6 +43,10 @@ use std::time::{Duration, Instant};
 pub const MAX_FRAME_DIM: u32 = 16384;
 /// Largest frame a bridge may send, in bytes (a 12K RGBA frame is ~320 MB).
 pub const MAX_FRAME_BYTES: usize = 512 << 20;
+/// Most shared-memory slots a bridge may lay over the ring file.
+pub const MAX_SHM_SLOTS: u64 = 16;
+/// Largest shared-memory ring a bridge may claim, in bytes.
+pub const MAX_SHM_BYTES: u64 = 4 << 30;
 
 /// What a bridge's persistent mode supports, from the `caps` list of its `metadata` event (all
 /// off for a bridge that predates the field).
@@ -73,6 +87,9 @@ pub struct Metadata {
     /// Protocol version (1 when absent).
     pub protocol: u32,
     pub caps: Caps,
+    /// The shared-memory ring the bridge laid out (`shm_slots`, `shm_slot_bytes`): only in a
+    /// persistent session started with `--shm` that the bridge could use. Unvalidated.
+    pub shm: Option<(u64, u64)>,
 }
 
 /// The pixel layout of the bytes a bridge sends after a `frame` event (`format` field; absent
@@ -144,6 +161,8 @@ pub enum Event {
         width: u32,
         height: u32,
         format: FrameFormat,
+        /// The shared-memory slot holding the pixels (none: they follow on stdout).
+        slot: Option<u32>,
     },
     /// One requested frame could not be produced (protocol 2): it takes that request's place in
     /// the reply order, no pixels follow, the session goes on.
@@ -211,7 +230,17 @@ fn json_dims(line: &str, kind: &str) -> Option<Event> {
     let width = json_u32(line, "width")?;
     let height = json_u32(line, "height")?;
     match kind {
-        "frame" => Some(Event::Frame { index, width, height, format: FrameFormat::parse(json_str(line, "format").as_deref())? }),
+        "frame" => Some(Event::Frame {
+            index,
+            width,
+            height,
+            format: FrameFormat::parse(json_str(line, "format").as_deref())?,
+            slot: match after_key(line, "slot") {
+                // present but not a u32: refused, never read as "on stdout"
+                Some(_) => Some(json_u32(line, "slot")?),
+                None => None,
+            },
+        }),
         "verify" => Some(Event::Verify { index, width, height }),
         _ => None,
     }
@@ -232,6 +261,7 @@ pub fn parse_event(line: &str) -> Option<Event> {
             frame_count: json_u64(line, "frame_count")?,
             protocol: json_u32(line, "protocol").unwrap_or(1),
             caps: Caps::parse(json_str(line, "caps").as_deref()),
+            shm: json_u64(line, "shm_slots").zip(json_u64(line, "shm_slot_bytes")),
         })),
         Some(kind @ ("frame" | "verify")) => json_dims(line, kind),
         Some("progress") => Some(Event::Progress { frame: json_u64(line, "frame")?, total: json_u64(line, "total")? }),
@@ -398,6 +428,91 @@ fn read_pixels(from: &mut impl Read, n: usize) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// The shared-memory ring a bridge announced, validated: `slots` slots of `slot_bytes` bytes,
+/// all inside a file of `file_len` bytes, within [`MAX_SHM_SLOTS`] / [`MAX_SHM_BYTES`].
+pub fn shm_layout(slots: u64, slot_bytes: u64, file_len: u64) -> Result<(u32, u64), String> {
+    if slots == 0 || slots > MAX_SHM_SLOTS {
+        return Err(format!("bridge announced {slots} shared-memory slots (1..={MAX_SHM_SLOTS})"));
+    }
+    if slot_bytes == 0 || slot_bytes > MAX_SHM_BYTES {
+        return Err(format!("bridge announced {slot_bytes}-byte shared-memory slots"));
+    }
+    let total = slots
+        .checked_mul(slot_bytes)
+        .filter(|&t| t <= MAX_SHM_BYTES)
+        .ok_or_else(|| format!("bridge announced a {slots}×{slot_bytes}-byte ring (over {} GB)", MAX_SHM_BYTES >> 30))?;
+    if total > file_len {
+        return Err(format!("bridge announced a {total}-byte ring in a {file_len}-byte file"));
+    }
+    let slots = u32::try_from(slots).map_err(|_| "too many shared-memory slots".to_string())?;
+    Ok((slots, slot_bytes))
+}
+
+/// Where a `bytes`-long frame announced in `slot` starts, or why it is not believed (no such
+/// slot, more bytes than a slot holds).
+pub fn shm_offset(layout: (u32, u64), slot: u32, bytes: usize) -> Result<u64, String> {
+    let (slots, slot_bytes) = layout;
+    if slot >= slots {
+        return Err(format!("bridge announced shared-memory slot {slot} of {slots}"));
+    }
+    let len = u64::try_from(bytes).map_err(|_| "frame too large".to_string())?;
+    if len > slot_bytes {
+        return Err(format!("bridge announced a {len}-byte frame in a {slot_bytes}-byte slot"));
+    }
+    u64::from(slot).checked_mul(slot_bytes).ok_or_else(|| "shared-memory offset overflows".to_string())
+}
+
+/// The client side of the shared-memory transport: the (already unlinked) ring file and its
+/// validated layout. Reads are positional `read`s into a fresh buffer — one kernel copy per
+/// frame, no mapping (and no `unsafe`) needed.
+pub struct ShmRing {
+    file: File,
+    layout: (u32, u64),
+}
+
+impl ShmRing {
+    /// A fresh, empty ring file for a bridge to lay out, and the path the bridge opens it by.
+    /// It lives on tmpfs (`/dev/shm`, else the temp dir) and is unlinked before this returns:
+    /// both processes hold it open, and it disappears with the last of them — even after a
+    /// crash. Linux only (the path is `/proc/<pid>/fd/<n>`).
+    #[cfg(target_os = "linux")]
+    pub fn create() -> Result<(File, std::path::PathBuf), String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let shm = Path::new("/dev/shm");
+        let dir = if shm.is_dir() { shm.to_path_buf() } else { std::env::temp_dir() };
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let name = format!("filmcraft-rawcam-{}-{nanos}-{}", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed));
+        let path = dir.join(name);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        std::fs::remove_file(&path).map_err(|e| format!("cannot unlink {}: {e}", path.display()))?;
+        let via = std::path::PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd()));
+        Ok((file, via))
+    }
+
+    /// The ring a bridge announced over `file`, once its layout checks out.
+    pub fn open(file: File, slots: u64, slot_bytes: u64) -> Result<Self, String> {
+        let len = file.metadata().map_err(|e| format!("shared-memory file: {e}"))?.len();
+        Ok(ShmRing { file, layout: shm_layout(slots, slot_bytes, len)? })
+    }
+
+    /// The `bytes` of a frame announced in `slot` (`bytes` already capped by [`frame_bytes`]);
+    /// a file the bridge cut short is an error, never a short frame.
+    pub fn read(&mut self, slot: u32, bytes: usize) -> Result<Vec<u8>, String> {
+        let at = shm_offset(self.layout, slot, bytes)?;
+        self.file.seek(SeekFrom::Start(at)).map_err(|e| format!("shared-memory seek: {e}"))?;
+        read_pixels(&mut self.file, bytes).map_err(|e| format!("shared memory: {e}"))
+    }
+}
+
 /// The pixel side of a session: a guarded thread owns the bridge's stdout and reads one frame
 /// per request, so the caller waits with a deadline instead of blocking in `read` on a bridge
 /// that stalled mid-frame.
@@ -445,6 +560,8 @@ pub struct DecodeSession {
     unverified: Option<(u64, u32, u32)>,
     /// The start-up `metadata` event: this bridge's capabilities.
     meta: Metadata,
+    /// The shared-memory transport, when the bridge took it.
+    shm: Option<ShmRing>,
     /// Where the last reply's time went: waiting for its announcement (decode), then reading
     /// its pixels (transport). Diagnostics only (`FILMCRAFT_RAWCAM_STATS`, the benches).
     pub last_timing: (Duration, Duration),
@@ -455,11 +572,26 @@ impl DecodeSession {
     /// `full`/`half`/`quarter`/`eighth`, `premium` for R3D full quality; with [`Caps::scale`]
     /// only the default for commands without a scale word). Waits for the startup `metadata`
     /// event so a broken bridge fails here, not at the first frame. On every failure the bridge
-    /// process is killed and reaped.
-    pub fn spawn(bridge: &Path, input: &Path, debayer: &str, timeout: Duration) -> Result<Self, String> {
+    /// process is killed and reaped. `shm` offers the shared-memory transport (only to a bridge
+    /// with [`Caps::shm`] — an older one refuses the argument); the session uses it when the
+    /// bridge accepts, stdout otherwise.
+    pub fn spawn(bridge: &Path, input: &Path, debayer: &str, shm: bool, timeout: Duration) -> Result<Self, String> {
         let mut cmd = Command::new(bridge);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.arg("--input").arg(input).arg("--debayer").arg(debayer).arg("--persistent");
+        let mut ring_file = None;
+        #[cfg(target_os = "linux")]
+        if shm {
+            match ShmRing::create() {
+                Ok((file, via)) => {
+                    cmd.arg("--shm").arg(via);
+                    ring_file = Some(file);
+                }
+                Err(e) => log::warn!("no shared-memory transport ({e}); frames come over the pipe"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = shm;
         let mut child = spawn_child(&mut cmd, bridge)?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             reap(&mut child);
@@ -474,6 +606,16 @@ impl DecodeSession {
         loop {
             match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(Event::Metadata(meta)) => {
+                    let shm = match (ring_file, meta.shm) {
+                        (Some(file), Some((slots, slot_bytes))) => match ShmRing::open(file, slots, slot_bytes) {
+                            Ok(ring) => Some(ring),
+                            Err(e) => {
+                                reap(&mut child);
+                                return Err(e);
+                            }
+                        },
+                        _ => None,
+                    };
                     return Ok(Self {
                         child,
                         stdin,
@@ -482,6 +624,7 @@ impl DecodeSession {
                         pending: std::collections::VecDeque::new(),
                         unverified: None,
                         meta,
+                        shm,
                         last_timing: (Duration::ZERO, Duration::ZERO),
                     });
                 }
@@ -501,6 +644,11 @@ impl DecodeSession {
     /// What this bridge supports (from its start-up `metadata` event).
     pub fn caps(&self) -> Caps {
         self.meta.caps
+    }
+
+    /// Whether frames come through shared memory (the bridge accepted `--shm`).
+    pub fn uses_shm(&self) -> bool {
+        self.shm.is_some()
     }
 
     /// Whether the bridge process is still running (a pooled session whose bridge crashed while
@@ -613,13 +761,13 @@ impl DecodeSession {
     /// the `verify` events. Events of later replies are parked, not consumed.
     fn receive_frame(&mut self, index: u64, deadline: Instant) -> Result<Reply, String> {
         let waiting_since = Instant::now();
-        let (width, height, format) = loop {
+        let (width, height, format, slot) = loop {
             match self.next_event(deadline) {
-                Some(Ok(Event::Frame { index: i, width, height, format })) => {
+                Some(Ok(Event::Frame { index: i, width, height, format, slot })) => {
                     if i != index {
                         return Err(format!("bridge out of sync: answered frame {i} for {index}"));
                     }
-                    break (width, height, format);
+                    break (width, height, format, slot);
                 }
                 Some(Ok(Event::FrameError { index: i, message })) => {
                     if i != index {
@@ -641,15 +789,30 @@ impl DecodeSession {
         self.unverified = None;
         let announced = Instant::now();
         let bytes = frame_bytes(width, height, format)?;
-        self.pixels.want.send(bytes).map_err(|_| "bridge frame stream closed".to_string())?;
-        let data = match self.pixels.got.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(read) => read?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Stalled mid-frame: kill it (the reader thread then sees the pipe close).
-                reap(&mut self.child);
-                return Err("bridge frame timed out".into());
+        let data = match slot {
+            // Shared memory: one positional read (tmpfs never blocks on the bridge), then the
+            // slot goes back to the bridge.
+            Some(slot) => {
+                let Some(ring) = self.shm.as_mut() else {
+                    return Err(format!("bridge announced shared-memory slot {slot} without a ring"));
+                };
+                let data = ring.read(slot, bytes)?;
+                self.stdin.write_all(format!("release {slot}\n").as_bytes()).map_err(|e| format!("bridge command failed: {e}"))?;
+                self.stdin.flush().map_err(|e| format!("bridge command failed: {e}"))?;
+                data
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("bridge frame stream closed".into()),
+            None => {
+                self.pixels.want.send(bytes).map_err(|_| "bridge frame stream closed".to_string())?;
+                match self.pixels.got.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(read) => read?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Stalled mid-frame: kill it (the reader thread then sees the pipe close).
+                        reap(&mut self.child);
+                        return Err("bridge frame timed out".into());
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("bridge frame stream closed".into()),
+                }
+            }
         };
         self.unverified = Some((index, width, height));
         self.last_timing = (announced.duration_since(waiting_since), announced.elapsed());
@@ -692,7 +855,8 @@ mod tests {
                 height: 4320,
                 frame_count: 1200,
                 protocol: 1,
-                caps: Caps::default()
+                caps: Caps::default(),
+                shm: None
             }))
         );
         // Protocol 2: version and capabilities (unknown words are ignored).
@@ -706,15 +870,15 @@ mod tests {
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160}"#),
-            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgb24 })
+            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgb24, slot: None })
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160,"format":"rgba8"}"#),
-            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgba8 })
+            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgba8, slot: None })
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160,"format":"bgra8"}"#),
-            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Bgra8 })
+            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Bgra8, slot: None })
         );
         assert_eq!(parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160,"format":"ycbcr"}"#), None);
         assert_eq!(parse_event(r#"{"type":"verify","index":7,"width":4096,"height":2160}"#), Some(Event::Verify { index: 7, width: 4096, height: 2160 }));
@@ -774,7 +938,7 @@ while IFS= read -r line; do
 done
 "#,
         );
-        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
         let r = session.request_frame(0, None, Duration::from_secs(5));
         assert!(r.as_ref().is_err_and(|e| e.contains("4294967295")), "got {:?}", r.map(|f| f.map(|f| f.data.len())));
         std::fs::remove_dir_all(&dir).ok();
@@ -795,7 +959,7 @@ printf 'abc'
 sleep 30
 "#,
         );
-        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
         let t = Instant::now();
         let r = session.request_frame(0, None, Duration::from_millis(300));
         assert!(r.as_ref().is_err_and(|e| e.contains("timed out")), "got {:?}", r.map(|f| f.map(|f| f.data.len())));
@@ -817,7 +981,7 @@ echo '{"type":"error","message":"no GPU"}' >&2
 sleep 30
 "#,
         );
-        let r = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10));
+        let r = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10));
         assert!(matches!(&r, Err(e) if e == "no GPU"), "got {:?}", r.as_ref().err());
         let pid = std::fs::read_to_string(clip.with_extension("braw.pid")).unwrap_or_default();
         let pid = pid.trim();
@@ -848,7 +1012,7 @@ while IFS= read -r line; do
 done
 "#,
         );
-        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
         let first = session.request_frame(0, None, Duration::from_secs(5));
         let second = session.request_frame(1, None, Duration::from_secs(5));
         let caught = [&first, &second].iter().any(|r| r.as_ref().is_err_and(|e| e.contains("disagree")));
@@ -887,7 +1051,7 @@ while IFS= read -r l; do : ; done
         }
         let input = dir.join("clip.braw");
         std::fs::write(&input, b"placeholder").ok();
-        let mut session = DecodeSession::spawn(&bridge, &input, "full", Duration::from_secs(10)).ok().unwrap_or_else(|| panic!("session must start"));
+        let mut session = DecodeSession::spawn(&bridge, &input, "full", false, Duration::from_secs(10)).ok().unwrap_or_else(|| panic!("session must start"));
         let frames =
             session.request_batch(&[3, 4], None, Duration::from_secs(5)).unwrap_or_else(|e| panic!("a burst of replies must not stall the batch: {e}"));
         assert_eq!(frames.len(), 2);
@@ -924,7 +1088,7 @@ while IFS= read -r line; do
 done
 "#,
         );
-        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
         assert!(session.caps().scale && session.caps().frame_errors);
         let replies =
             session.request_batch(&[0, 1, 2, 3, 4], Some("quarter"), Duration::from_secs(5)).unwrap_or_else(|e| panic!("the session must survive: {e}"));
@@ -957,7 +1121,7 @@ while IFS= read -r line; do
 done
 "#,
         );
-        let mut session = DecodeSession::spawn(&bridge, &clip, "full", Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
         let mut asked = 0;
         let replies = session
             .request_batch_steered(
@@ -974,6 +1138,147 @@ done
         assert_eq!(replies.len(), 3, "the first command plus two allowed by the steering");
         let log = std::fs::read_to_string(bridge.with_extension("log")).unwrap_or_default();
         assert_eq!(log.lines().collect::<Vec<_>>(), ["0", "1", "2"], "a bridge without the scale capability gets no scale word");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shm_layouts_are_validated_before_use() {
+        assert_eq!(shm_layout(6, 85_983_232, 6 * 85_983_232), Ok((6, 85_983_232)));
+        assert_eq!(shm_layout(1, 32, 4096), Ok((1, 32)), "a file larger than the ring is fine");
+        assert!(shm_layout(0, 32, 64).is_err(), "no slots");
+        assert!(shm_layout(MAX_SHM_SLOTS + 1, 32, u64::MAX).is_err(), "too many slots");
+        assert!(shm_layout(2, 0, 64).is_err(), "empty slots");
+        assert!(shm_layout(4, 32, 64).is_err(), "a ring past the end of its file");
+        // slots × slot_bytes overflowed u64 here, and then passed the file-size check
+        assert!(shm_layout(16, u64::MAX / 8, u64::MAX).is_err());
+        assert!(shm_layout(2, MAX_SHM_BYTES, u64::MAX).is_err(), "over the ring cap");
+        let layout = (2, 32);
+        assert_eq!(shm_offset(layout, 0, 32), Ok(0));
+        assert_eq!(shm_offset(layout, 1, 8), Ok(32));
+        assert!(shm_offset(layout, 2, 8).is_err(), "no such slot");
+        assert!(shm_offset(layout, u32::MAX, 8).is_err());
+        assert!(shm_offset(layout, 1, 33).is_err(), "more than a slot holds");
+        assert!(shm_offset((u32::MAX, u64::MAX), u32::MAX - 1, 1).is_err(), "offset overflow");
+    }
+
+    #[test]
+    fn parses_shm_announcements() {
+        let meta = r#"{"type":"metadata","timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":2,"caps":"scale,frame-errors,shm","shm_slots":6,"shm_slot_bytes":2097152}"#;
+        let Some(Event::Metadata(m)) = parse_event(meta) else { panic!("metadata") };
+        assert!(m.caps.shm);
+        assert_eq!(m.shm, Some((6, 2_097_152)));
+        assert_eq!(
+            parse_event(r#"{"type":"frame","index":7,"width":4,"height":2,"format":"rgba8","slot":3}"#),
+            Some(Event::Frame { index: 7, width: 4, height: 2, format: FrameFormat::Rgba8, slot: Some(3) })
+        );
+        // A slot that is no u32 is refused, not taken for "on stdout" (that would desync).
+        assert_eq!(parse_event(r#"{"type":"frame","index":7,"width":4,"height":2,"format":"rgba8","slot":-1}"#), None);
+        assert_eq!(parse_event(r#"{"type":"frame","index":7,"width":4,"height":2,"format":"rgba8","slot":4294967296}"#), None);
+    }
+
+    /// A shell bridge with the shared-memory transport over the client's `/proc/<pid>/fd/<n>`
+    /// path: a two-slot ring of 32 bytes, frame `i` (4×2 RGBA, every byte `i+1`) in slot
+    /// `i % 2`; `release` lines are logged. The clip's first word picks a misbehaviour.
+    #[cfg(target_os = "linux")]
+    const SHM_BRIDGE: &str = r#"#!/bin/sh
+shm= input=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --shm) shm=$2; shift 2;;
+        --input) input=$2; shift 2;;
+        --debayer) shift 2;;
+        *) shift;;
+    esac
+done
+mode=$(head -c 5 "$input")
+slots=2
+[ "$mode" = short ] && slots=4
+[ -n "$shm" ] && truncate -s 64 "$shm"
+ring=
+[ -n "$shm" ] && ring=",\"shm_slots\":$slots,\"shm_slot_bytes\":32"
+echo "{\"type\":\"metadata\",\"timecode\":\"00:00:00:00\",\"fps_num\":24,\"fps_den\":1,\"width\":4,\"height\":2,\"frame_count\":8,\"protocol\":2,\"caps\":\"scale,frame-errors,shm\"$ring}" >&2
+while IFS= read -r line; do
+    case "$line" in
+        release\ *) echo "$line" >> "$input.log"; continue;;
+        quit) exit 0;;
+    esac
+    i=${line#frame }
+    i=${i%% *}
+    k=$((i % 2))
+    [ "$mode" = wild5 ] && k=7
+    b=$(printf "\\$(printf '%03o' $((i + 1)))")
+    out= j=0
+    while [ $j -lt 32 ]; do out="$out$b"; j=$((j + 1)); done
+    if [ -n "$shm" ]; then
+        printf '%s' "$out" | dd of="$shm" bs=32 seek=$k conv=notrunc status=none
+        [ "$mode" = trunc ] && truncate -s 40 "$shm"
+        echo "{\"type\":\"frame\",\"index\":$i,\"width\":4,\"height\":2,\"format\":\"rgba8\",\"slot\":$k}" >&2
+    else
+        echo "{\"type\":\"frame\",\"index\":$i,\"width\":4,\"height\":2,\"format\":\"rgba8\"}" >&2
+        printf '%s' "$out"
+    fi
+    echo "{\"type\":\"verify\",\"index\":$i,\"width\":4,\"height\":2}" >&2
+done
+"#;
+
+    /// Frames through shared memory: the right bytes from the right slot, every slot released,
+    /// and the ring file gone from `/dev/shm` the moment it was handed over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frames_arrive_through_shared_memory() {
+        let (dir, bridge, clip) = script_bridge("shm", SHM_BRIDGE);
+        std::fs::write(&clip, b"plain").ok();
+        let ours = || {
+            std::fs::read_dir("/dev/shm")
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("filmcraft-rawcam-{}-", std::process::id())))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let mut session = DecodeSession::spawn(&bridge, &clip, "full", true, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        assert!(session.uses_shm(), "the bridge took the ring");
+        assert_eq!(ours(), 0, "the ring file is unlinked at once");
+        let replies = session.request_batch(&[0, 1, 2, 5], Some("full"), Duration::from_secs(5)).unwrap_or_else(|e| panic!("batch: {e}"));
+        for (reply, i) in replies.into_iter().zip([0_u8, 1, 2, 5]) {
+            let f = reply.unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!((f.width, f.height, f.data.len()), (4, 2, 32));
+            assert!(f.data.iter().all(|&b| b == i + 1), "frame {i} holds its own pixels: {:?}", f.data);
+        }
+        // The bridge reads the releases after the commands queued before them.
+        let log_of = || std::fs::read_to_string(clip.with_extension("braw.log")).unwrap_or_default();
+        let t = Instant::now();
+        while log_of().lines().count() < 4 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(session);
+        let log = log_of();
+        assert_eq!(log.lines().collect::<Vec<_>>(), ["release 0", "release 1", "release 0", "release 1"]);
+        // Without the offer the same bridge streams over the pipe.
+        let mut plain = DecodeSession::spawn(&bridge, &clip, "full", false, Duration::from_secs(10)).unwrap_or_else(|e| panic!("session must start: {e}"));
+        assert!(!plain.uses_shm());
+        let f = plain.request_frame(3, None, Duration::from_secs(5)).unwrap_or_else(|e| panic!("{e}")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(f.data.iter().all(|&b| b == 4));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hostile shared-memory bridges fail cleanly: a ring larger than its file at start-up, a
+    /// slot outside the ring, a file cut short under an announced frame.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hostile_shared_memory_fails_cleanly() {
+        let (dir, bridge, clip) = script_bridge("shm-hostile", SHM_BRIDGE);
+        std::fs::write(&clip, b"short").ok();
+        let r = DecodeSession::spawn(&bridge, &clip, "full", true, Duration::from_secs(10));
+        assert!(r.as_ref().is_err_and(|e| e.contains("byte file")), "a 4-slot ring in a 2-slot file: {:?}", r.as_ref().err());
+        for (mode, expect) in [("wild5", "slot 7"), ("trunc", "ended after")] {
+            std::fs::write(&clip, mode).ok();
+            let mut session =
+                DecodeSession::spawn(&bridge, &clip, "full", true, Duration::from_secs(10)).unwrap_or_else(|e| panic!("{mode}: session must start: {e}"));
+            let r = session.request_frame(1, None, Duration::from_secs(5));
+            assert!(r.as_ref().is_err_and(|e| e.contains(expect)), "{mode}: got {:?}", r.map(|f| f.map(|f| f.data.len())));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

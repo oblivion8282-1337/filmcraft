@@ -11,7 +11,9 @@
 //! quarter/eighth resolution): a protocol 2 bridge takes the tier with every command, so one
 //! session serves them all; an older one gets a session per tier (at most [`TIERS`]). A
 //! read-ahead thread decodes [`PREFETCH_FRAMES`] ahead of playback through the bridge's
-//! pipeline, so showing a frame is normally a cache hit.
+//! pipeline, so showing a frame is normally a cache hit. Where the bridge offers it (Linux), frames come
+//! through a shared-memory ring instead of its stdout pipe ([`bridge::ShmRing`]): a 6K frame
+//! is ~62 MB, and the pipe alone took ~14 ms of a 25 ms seek.
 //!
 //! Scrubbing a paused monitor ([`filmcraft_media::cancel::with_scrub`]) is served at the
 //! [`SCRUB_TIER`] while the seeks come in a burst: a full-resolution 6K debayer takes ~50 ms, a
@@ -182,6 +184,12 @@ fn shuttle_steps(speed: f64) -> u32 {
     } else {
         0
     }
+}
+
+/// Whether the shared-memory frame transport may be offered (`FILMCRAFT_RAWCAM_SHM=0` keeps
+/// every frame on the pipe — comparisons, or a sandbox without `/dev/shm`).
+fn shm_wanted() -> bool {
+    std::env::var_os("FILMCRAFT_RAWCAM_SHM").is_none_or(|v| v != "0")
 }
 
 /// Whether per-request diagnostics are on (`FILMCRAFT_RAWCAM_STATS=1`): one line per
@@ -549,6 +557,9 @@ pub struct RawCamSource {
     /// The bridge takes the debayer tier with every command (protocol 2, from the probe): one
     /// session serves every tier. Cleared if a session turns out not to (the binary changed).
     per_command: AtomicBool,
+    /// Offer the bridge the shared-memory transport (its probe says it has it; off with
+    /// `FILMCRAFT_RAWCAM_SHM=0`). Cleared when a bridge refuses to start with it.
+    shm: AtomicBool,
 }
 
 /// Counts an interactive request in [`RawCamSource::waiting`] while it lives.
@@ -620,6 +631,7 @@ impl RawCamSource {
             scrub: Mutex::new(Scrub::default()),
             waiting: AtomicU32::new(0),
             per_command: AtomicBool::new(meta.caps.scale),
+            shm: AtomicBool::new(meta.caps.shm && shm_wanted()),
         });
         let _ = src.self_ref.set(Arc::downgrade(&src));
         Ok(src)
@@ -662,8 +674,19 @@ impl RawCamSource {
             return Ok(pooled);
         }
         let start = |word: &str| {
-            DecodeSession::spawn(&self.bridge, &self.path, word, PROBE_TIMEOUT)
-                .map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())))
+            let shm = self.shm.load(Ordering::Relaxed);
+            let mut started = DecodeSession::spawn(&self.bridge, &self.path, word, shm, PROBE_TIMEOUT);
+            if shm && started.is_err() {
+                // A bridge that will not start with the shared-memory offer (replaced by an
+                // older binary since the probe, or the ring rejected): the pipe, from now on.
+                let plain = DecodeSession::spawn(&self.bridge, &self.path, word, false, PROBE_TIMEOUT);
+                if plain.is_ok() {
+                    log::warn!("{}: {} does not start with shared memory; using its pipe", self.path.display(), self.format.bridge_name());
+                    self.shm.store(false, Ordering::Relaxed);
+                    started = plain;
+                }
+            }
+            started.map_err(|e| MediaError::Decode(format!("{}: cannot start {}: {e}", self.path.display(), self.format.bridge_name())))
         };
         if self.per_command() {
             let session = start(self.format.tier_word(1))?;
