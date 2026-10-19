@@ -255,6 +255,11 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         if let Some(rs) = cc.wgpu_render_state.clone()
             && std::env::var_os("FILMCRAFT_CPU_COMPOSITE").is_none()
         {
+            // camera-RAW frames straight from the bridges' GPU memory (ADR 0002)
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("FILMCRAFT_RAWCAM_GPU").is_none_or(|v| v != "0") {
+                filmcraft_platform::vk_interop::register(&rs.device);
+            }
             app.set_wgpu(rs);
         }
         // Keep device selection available even when the default device is unavailable.

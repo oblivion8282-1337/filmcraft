@@ -401,6 +401,17 @@ pub struct GpuState {
     pub broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Largest texture side the device accepts.
     pub max_texture: u32,
+    /// The Source monitor's compositor and texture (made when it first shows a GPU picture).
+    pub source: Option<GpuView>,
+}
+
+/// A second output of the GPU path: its own compositor (output target, upload cache) and the
+/// egui texture showing it.
+pub struct GpuView {
+    pub compositor: filmcraft_gpu::GpuCompositor,
+    pub texture: Option<egui::TextureId>,
+    pub last_key: Option<FrameKey>,
+    pub size: (u32, u32),
 }
 
 /// Largest texture side a plan needs on the GPU (output and every layer).
@@ -470,7 +481,17 @@ impl FilmcraftApp {
         match made {
             Ok(compositor) if !broken.load(std::sync::atomic::Ordering::Relaxed) => {
                 let max_texture = rs.device.limits().max_texture_dimension_2d;
-                self.gpu = Some(GpuState { render_state: rs, compositor, texture: None, last_key: None, size: (0, 0), last_ms: 0.0, broken, max_texture });
+                self.gpu = Some(GpuState {
+                    render_state: rs,
+                    compositor,
+                    texture: None,
+                    last_key: None,
+                    size: (0, 0),
+                    last_ms: 0.0,
+                    broken,
+                    max_texture,
+                    source: None,
+                });
             }
             _ => log::error!("GPU compositor failed to initialise; compositing on the CPU"),
         }
@@ -479,53 +500,94 @@ impl FilmcraftApp {
     /// Drop the GPU compositor after a GPU error; the monitors composite on the CPU from then on.
     fn disable_gpu(&mut self, why: &str) {
         log::error!("GPU compositor disabled: {why}");
-        if let Some(g) = self.gpu.take()
-            && let Some(id) = g.texture
-        {
-            g.render_state.renderer.write().free_texture(&id);
+        if let Some(g) = self.gpu.take() {
+            let mut renderer = g.render_state.renderer.write();
+            for id in g.texture.into_iter().chain(g.source.and_then(|v| v.texture)) {
+                renderer.free_texture(&id);
+            }
         }
         self.ui.status = tl!("Graphics problem: switched to software compositing").into();
     }
 
-    /// Composite a plan on the GPU and return the egui texture showing it.
+    /// Composite a plan on the GPU and return the egui texture showing it. Source monitor plans
+    /// ([`frames::Target::ItemPlan`]) go to the Source monitor's own compositor and texture, so
+    /// both monitors can show GPU pictures at once.
     pub fn gpu_present(&mut self, key: FrameKey, plan: &frames::GpuPlan) -> Option<(egui::TextureId, (u32, u32))> {
         if self.gpu.as_ref()?.broken.load(std::sync::atomic::Ordering::Relaxed) {
             self.disable_gpu("device error");
             return None;
         }
+        let source = matches!(key.target, frames::Target::ItemPlan(_));
         let g = self.gpu.as_mut()?;
-        if g.last_key == Some(key)
-            && let Some(t) = g.texture
-        {
-            return Some((t, g.size));
-        }
         if plan_side(&plan.plan) > g.max_texture as usize {
             self.disable_gpu("frame larger than the GPU's maximum texture size");
             return None;
         }
+        if source && g.source.is_none() {
+            let (device, queue) = (&g.render_state.device, &g.render_state.queue);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filmcraft_gpu::GpuCompositor::new(device, queue))) {
+                Ok(compositor) => g.source = Some(GpuView { compositor, texture: None, last_key: None, size: (0, 0) }),
+                Err(_) => {
+                    self.disable_gpu("compositor panicked");
+                    return None;
+                }
+            }
+        }
+        let GpuState { render_state, compositor, texture, last_key, size, last_ms, source: source_view, .. } = g;
+        let (compositor, texture, last_key, size) = match source_view.as_mut() {
+            Some(v) if source => (&mut v.compositor, &mut v.texture, &mut v.last_key, &mut v.size),
+            _ => (compositor, texture, last_key, size),
+        };
+        if *last_key == Some(key)
+            && let Some(t) = *texture
+        {
+            return Some((t, *size));
+        }
         let t0 = web_time::Instant::now();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (view, size) = g.compositor.composite_prepared(&plan.plan, Some(&plan.prepared));
+            let (view, size) = compositor.composite_prepared(&plan.plan, Some(&plan.prepared));
             (view.clone(), size)
         }));
-        let Ok((view, size)) = ran else {
+        let Ok((view, out_size)) = ran else {
             self.disable_gpu("compositor panicked");
             return None;
         };
-        let g = self.gpu.as_mut()?;
-        g.last_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        let mut renderer = g.render_state.renderer.write();
-        let id = match g.texture {
+        *last_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let mut renderer = render_state.renderer.write();
+        let id = match *texture {
             Some(id) => {
-                renderer.update_egui_texture_from_wgpu_texture(&g.render_state.device, &view, eframe::wgpu::FilterMode::Linear, id);
+                renderer.update_egui_texture_from_wgpu_texture(&render_state.device, &view, eframe::wgpu::FilterMode::Linear, id);
                 id
             }
-            None => renderer.register_native_texture(&g.render_state.device, &view, eframe::wgpu::FilterMode::Linear),
+            None => renderer.register_native_texture(&render_state.device, &view, eframe::wgpu::FilterMode::Linear),
         };
-        g.texture = Some(id);
-        g.last_key = Some(key);
-        g.size = size;
-        Some((id, size))
+        *texture = Some(id);
+        *last_key = Some(key);
+        *size = out_size;
+        Some((id, out_size))
+    }
+
+    /// The texture a monitor's GPU compositor shows now and its key (`source`: the Source
+    /// monitor's), while a newer plan is not ready.
+    pub fn gpu_shown(&self, source: bool) -> (Option<egui::TextureId>, Option<FrameKey>) {
+        let Some(g) = self.gpu.as_ref() else { return (None, None) };
+        match (&g.source, source) {
+            (Some(v), true) => (v.texture, v.last_key),
+            (None, true) => (None, None),
+            _ => (g.texture, g.last_key),
+        }
+    }
+
+    /// Composite the next plan of a monitor afresh, even under the key already shown (a refined
+    /// plan replaced it).
+    pub fn gpu_forget(&mut self, source: bool) {
+        if let Some(g) = self.gpu.as_mut() {
+            match (g.source.as_mut(), source) {
+                (Some(v), true) => v.last_key = None,
+                (None, true) => {}
+                _ => g.last_key = None,
+            }
+        }
     }
 }
 

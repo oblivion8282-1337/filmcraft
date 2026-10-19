@@ -15,6 +15,13 @@
 //! through a shared-memory ring instead of its stdout pipe ([`bridge::ShmRing`]): a 6K frame
 //! is ~62 MB, and the pipe alone took ~14 ms of a 25 ms seek.
 //!
+//! GPU frames (ADR 0002, Linux): when the app registered an importer for the GPU a bridge decodes
+//! on, requests made for the GPU compositor ([`filmcraft_media::cancel::with_gpu_frames`]) get
+//! frames that stay in the bridge's exported GPU memory — [`filmcraft_frame::PixelData::External`]
+//! pictures the compositor copies into a texture on the GPU. A CPU consumer of such a frame gets
+//! its pixels from the frame's fallback, which decodes it again over the host path. Playback's
+//! frame workers decode one clip side by side on handles of their own ([`PARALLEL_DECODES`]).
+//!
 //! Scrubbing a paused monitor ([`filmcraft_media::cancel::with_scrub`]) is served at the
 //! [`SCRUB_TIER`] while the seeks come in a burst: a full-resolution 6K debayer takes ~50 ms, a
 //! quarter one ~10 ms. Those frames are flagged provisional
@@ -207,6 +214,12 @@ fn shuttle_steps(speed: f64) -> u32 {
     }
 }
 
+/// Whether bridges may hand out frames in GPU memory (`FILMCRAFT_RAWCAM_GPU=0` keeps every frame
+/// on the host path; ADR 0002).
+fn gpu_frames_enabled() -> bool {
+    std::env::var_os("FILMCRAFT_RAWCAM_GPU").is_none_or(|v| v != "0")
+}
+
 /// Whether the shared-memory frame transport may be offered (`FILMCRAFT_RAWCAM_SHM=0` keeps
 /// every frame on the pipe — comparisons, or a sandbox without `/dev/shm`).
 fn shm_wanted() -> bool {
@@ -341,6 +354,74 @@ fn ahead_indices(last: u64, direction: i64, frame_count: u64) -> Vec<u64> {
         .map_while(|ahead| if direction < 0 { last.checked_sub(ahead) } else { last.checked_add(ahead) })
         .take_while(|&next| next < frame_count)
         .collect()
+}
+
+/// Camera-RAW frame counters for `perf.stats` (cumulative: diff two readings).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawStats {
+    /// Frames decoded for the GPU compositor that came in GPU memory.
+    pub gpu_frames: u64,
+    /// Frames decoded for the GPU compositor that came over the host after all (the bridge had no
+    /// buffer under its export budget, exports are off, another GPU…).
+    pub host_frames_for_gpu: u64,
+    /// Frames decoded over the host for everyone else (thumbnails, CPU-rendered layers).
+    pub host_frames: u64,
+    /// GPU frames a CPU code path read back through their fallback (decoded once more).
+    pub cpu_fallbacks: u64,
+}
+
+static GPU_FRAMES: AtomicU64 = AtomicU64::new(0);
+static HOST_FRAMES_FOR_GPU: AtomicU64 = AtomicU64::new(0);
+static HOST_FRAMES: AtomicU64 = AtomicU64::new(0);
+static CPU_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// The camera-RAW frame counters of this process.
+pub fn stats() -> RawStats {
+    RawStats {
+        gpu_frames: GPU_FRAMES.load(Ordering::Relaxed),
+        host_frames_for_gpu: HOST_FRAMES_FOR_GPU.load(Ordering::Relaxed),
+        host_frames: HOST_FRAMES.load(Ordering::Relaxed),
+        cpu_fallbacks: CPU_FALLBACKS.load(Ordering::Relaxed),
+    }
+}
+
+/// Count a decoded reply: in GPU memory, or over the host although `wanted_gpu`, or plainly.
+fn count_reply(reply: &bridge::FrameBytes, wanted_gpu: bool) {
+    let counter = match (reply.gpu.is_some(), wanted_gpu) {
+        (true, _) => &GPU_FRAMES,
+        (false, true) => &HOST_FRAMES_FOR_GPU,
+        (false, false) => &HOST_FRAMES,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether a cached frame can be shown as it is: not a GPU frame whose buffer the compositor
+/// already took back (nothing left to show without decoding it again).
+fn showable(f: &VideoFrame) -> bool {
+    !matches!(&f.data, filmcraft_frame::PixelData::External(img) if img.is_spent())
+}
+
+/// A host reply's pixels as RGBA8 rows (R3D's BGRA swapped in place, a legacy `rgb24` bridge's
+/// pixels widened).
+fn host_rgba(reply: bridge::FrameBytes) -> Vec<u8> {
+    match reply.format {
+        bridge::FrameFormat::Rgba8 => reply.data,
+        bridge::FrameFormat::Bgra8 => {
+            let mut data = reply.data;
+            for px in data.as_chunks_mut::<4>().0 {
+                px.swap(0, 2);
+            }
+            data
+        }
+        bridge::FrameFormat::Rgb24 => {
+            let mut rgba = Vec::with_capacity(reply.data.len() / 3 * 4);
+            for px in reply.data.as_chunks::<3>().0 {
+                rgba.extend_from_slice(px);
+                rgba.push(255);
+            }
+            rgba
+        }
+    }
 }
 
 fn bridge_path(f: Format) -> Option<PathBuf> {
@@ -576,6 +657,8 @@ pub struct RawCamSource {
     /// Frame index and tier of the newest interactive request (steers the read-ahead).
     last: AtomicU64,
     last_tier: AtomicU32,
+    /// Whether the newest interactive request welcomed GPU frames (the read-ahead follows it).
+    last_gpu: AtomicBool,
     /// The width interactive requests want their frames fitted to (steers the read-ahead).
     /// Bumped by every interactive cache miss; the read-ahead yields when it changes mid-run.
     demand: AtomicU64,
@@ -597,6 +680,8 @@ pub struct RawCamSource {
     /// Offer the bridge the shared-memory transport (its probe says it has it; off with
     /// `FILMCRAFT_RAWCAM_SHM=0`). Cleared when a bridge refuses to start with it.
     shm: AtomicBool,
+    /// The bridge binary takes the GPU frame socket (its probe says `gpu-export`; ADR 0002).
+    gpu_export: bool,
     /// Decode on the format's shared multi-clip bridge (its probe says it has it; off with
     /// `FILMCRAFT_RAWCAM_MULTI=0`). Cleared when the shared bridge does not start but a process
     /// of its own does.
@@ -664,6 +749,7 @@ impl RawCamSource {
             self_ref: OnceLock::new(),
             last: AtomicU64::new(0),
             last_tier: AtomicU32::new(1),
+            last_gpu: AtomicBool::new(false),
             demand: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             prefetch_started: AtomicBool::new(false),
@@ -674,6 +760,7 @@ impl RawCamSource {
             per_command: AtomicBool::new(meta.caps.scale),
             shm: AtomicBool::new(meta.caps.shm && shm_wanted()),
             multi: AtomicBool::new(meta.caps.multi && meta.caps.scale && multi_wanted()),
+            gpu_export: meta.caps.gpu_export,
         });
         let _ = src.self_ref.set(Arc::downgrade(&src));
         register(&src);
@@ -724,7 +811,7 @@ impl RawCamSource {
         if self.multi.load(Ordering::Relaxed) {
             let manager = shared::manager(&self.bridge);
             if !manager.isolated(&self.path) {
-                match manager.open(&self.path, self.frame_bytes(), self.shm.load(Ordering::Relaxed), PROBE_TIMEOUT) {
+                match manager.open(&self.path, self.frame_bytes(), self.shm.load(Ordering::Relaxed), self.gpu_export, PROBE_TIMEOUT) {
                     Ok(session) => return Ok((ANY_TIER, Session::Shared(session))),
                     Err(shared::SharedError::Spawn(e)) => {
                         // Replaced by a binary without the mode since the probe, or it cannot
@@ -865,7 +952,7 @@ impl RawCamSource {
                 // they stream back, in order — a waiting request picks each up as it lands.
                 let cache = this.cache.lock().unwrap_or_else(|e| e.into_inner());
                 let mut missing = ahead_indices(last, direction, this.frame_count);
-                missing.retain(|next| !cache.contains_key(&(*next, tier)));
+                missing.retain(|next| !cache.get(&(*next, tier)).is_some_and(|f| showable(f)));
                 drop(cache);
                 !missing.is_empty() && this.demand.load(Ordering::Relaxed) == start_demand && this.prefetch_batch(&missing, tier).is_ok()
             };
@@ -906,6 +993,9 @@ impl RawCamSource {
         // next command), and an interactive request arriving meanwhile waits behind at most
         // [`READ_AHEAD_WINDOW`] replies — no further command is sent once it waits.
         let start_demand = self.demand.load(Ordering::Relaxed);
+        // read ahead for whoever steers: GPU frames for a GPU compositor's playback
+        let wanted_gpu = Self::gpu_wanted(&session, self.last_gpu.load(Ordering::Relaxed));
+        session.set_gpu(wanted_gpu);
         let outcome = session.request_batch_steered(
             indices,
             self.scale_word(key, tier),
@@ -927,7 +1017,10 @@ impl RawCamSource {
         })?;
         for (idx, reply) in indices.iter().zip(replies) {
             match reply {
-                Ok(reply) => self.cache_frame((*idx, tier), Arc::new(Self::into_frame(reply, *idx, rate))),
+                Ok(reply) => {
+                    count_reply(&reply, wanted_gpu);
+                    self.cache_frame((*idx, tier), Arc::new(self.frame_of(reply, *idx, tier, rate)));
+                }
                 // One bad frame: the interactive request for it reports the error.
                 Err(e) => log::debug!("{}: read-ahead of frame {idx} failed: {e}", self.path.display()),
             }
@@ -935,29 +1028,87 @@ impl RawCamSource {
         Ok(())
     }
 
-    /// A bridge reply as a compositor frame. The persistent bridges send RGBA/BGRA straight
-    /// through — only the layouts needing work are converted (a legacy `rgb24` bridge, or
-    /// R3D's channel order).
-    fn into_frame(reply: bridge::FrameBytes, idx: u64, rate: FrameRate) -> VideoFrame {
-        let pts = || Tick::from_rational(i64::try_from(idx).unwrap_or(i64::MAX), rate.den, rate.num);
-        match reply.format {
-            bridge::FrameFormat::Rgba8 => VideoFrame::rgba8(reply.width, reply.height, reply.data).with_pts(pts()),
-            bridge::FrameFormat::Bgra8 => {
-                let mut data = reply.data;
-                for px in data.as_chunks_mut::<4>().0 {
-                    px.swap(0, 2);
-                }
-                VideoFrame::rgba8(reply.width, reply.height, data).with_pts(pts())
+    /// A bridge reply as a compositor frame (frame `idx`, decoded at `tier`). The persistent
+    /// bridges send RGBA/BGRA straight through — only the layouts needing work are converted (a
+    /// legacy `rgb24` bridge, or R3D's channel order). A frame in GPU memory stays there: an
+    /// external picture whose CPU fallback decodes the frame again over the host path.
+    fn frame_of(&self, reply: bridge::FrameBytes, idx: u64, tier: u32, rate: FrameRate) -> VideoFrame {
+        let pts = Tick::from_rational(i64::try_from(idx).unwrap_or(i64::MAX), rate.den, rate.num);
+        let (width, height) = (reply.width, reply.height);
+        match reply.gpu {
+            Some(gpu) => {
+                let layout = match reply.format {
+                    bridge::FrameFormat::Bgra8 => filmcraft_frame::ExternalLayout::Bgra8,
+                    _ => filmcraft_frame::ExternalLayout::Rgba8,
+                };
+                let me = self.self_ref.get().cloned().unwrap_or_default();
+                let fetch: filmcraft_frame::external::CpuFallback = Box::new(move || me.upgrade()?.host_pixels(idx, tier));
+                let image = filmcraft_frame::ExternalImage::new(gpu.memory, 0, gpu.pitch, layout, fetch, Some(Box::new(gpu.release)));
+                VideoFrame { width, height, data: filmcraft_frame::PixelData::External(Arc::new(image)), color: ColorInfo::SRGB_FULL, par: (1, 1), pts }
             }
-            bridge::FrameFormat::Rgb24 => {
-                let mut rgba = Vec::with_capacity(reply.data.len() / 3 * 4);
-                for px in reply.data.as_chunks::<3>().0 {
-                    rgba.extend_from_slice(px);
-                    rgba.push(255);
+            None => VideoFrame::rgba8(width, height, host_rgba(reply)).with_pts(pts),
+        }
+    }
+
+    /// Frame `idx` at `tier` decoded over the host path, not cached: the CPU fallback of a frame
+    /// that lives in GPU memory (only CPU code paths ask). Waits for a decode slot like any
+    /// request; `None` when the bridge cannot deliver it.
+    fn host_pixels(&self, idx: u64, tier: u32) -> Option<Vec<u8>> {
+        let started = Instant::now();
+        let (key, mut session, lease) = loop {
+            let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
+            let slots = if self.parallel() { PARALLEL_DECODES } else { 1 };
+            if state.leased < slots {
+                let pooled = state.take_session(tier);
+                if pooled.is_none() && state.backoff_left(Instant::now()).is_some() {
+                    return None;
                 }
-                VideoFrame::rgba8(reply.width, reply.height, rgba).with_pts(pts())
+                state.leased += 1;
+                let lease = Lease::new(&self.video);
+                drop(state);
+                match self.open_session(pooled, tier) {
+                    Ok((key, session)) => break (key, session, lease),
+                    Err(_) => {
+                        lease.fail();
+                        return None;
+                    }
+                }
+            }
+            drop(state);
+            if started.elapsed() >= MAX_SLOT_WAIT {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        session.set_gpu(false);
+        CPU_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        let outcome = session.request_frame(idx, self.scale_word(key, tier), FRAME_TIMEOUT);
+        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        match outcome {
+            Ok(Ok(reply)) => {
+                lease.succeed(key, session);
+                // a host request never comes back in GPU memory, but if it did it is no pixels
+                reply.gpu.is_none().then(|| host_rgba(reply))
+            }
+            Ok(Err(e)) => {
+                lease.keep(key, session);
+                log::warn!("{}: frame {idx} for the CPU: {e}", self.path.display());
+                None
+            }
+            Err(e) => {
+                drop(session);
+                lease.fail();
+                log::warn!("{}: frame {idx} for the CPU: {e}", self.path.display());
+                None
             }
         }
+    }
+
+    /// Whether frames decoded now on `session` should stay in GPU memory: the request welcomes
+    /// them (`gpu`: the GPU compositor runs it), and the bridge exports from the GPU the app
+    /// imports into.
+    fn gpu_wanted(session: &Session, gpu: bool) -> bool {
+        gpu && gpu_frames_enabled() && session.gpu_device().is_some_and(|d| filmcraft_frame::external::import_device() == Some(d))
     }
 
     /// The cached frame closest to `idx` (any tier) within [`NEAREST_FRAME_TOLERANCE`], if any.
@@ -966,7 +1117,7 @@ impl RawCamSource {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|((k, _), _)| k.abs_diff(idx) <= NEAREST_FRAME_TOLERANCE)
+            .filter(|((k, _), f)| k.abs_diff(idx) <= NEAREST_FRAME_TOLERANCE && showable(f))
             .min_by_key(|((k, _), _)| k.abs_diff(idx))
             .map(|(_, f)| f.clone())
     }
@@ -1088,10 +1239,11 @@ impl RawCamSource {
         loop {
             let hit = {
                 let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                // The exact frame beats a stand-in, even during a burst.
-                match cache.get(&(idx, tier)) {
+                // The exact frame beats a stand-in, even during a burst. A spent GPU frame is
+                // decoded again.
+                match cache.get(&(idx, tier)).filter(|f| showable(f)) {
                     Some(f) => Some((f.clone(), tier)),
-                    None if provisional => cache.get(&(idx, serve_tier)).map(|f| (f.clone(), serve_tier)),
+                    None if provisional => cache.get(&(idx, serve_tier)).filter(|f| showable(f)).map(|f| (f.clone(), serve_tier)),
                     None => None,
                 }
             };
@@ -1099,6 +1251,7 @@ impl RawCamSource {
                 if steer {
                     self.last.store(idx, Ordering::Relaxed);
                     self.last_tier.store(hit_tier, Ordering::Relaxed);
+                    self.last_gpu.store(filmcraft_media::cancel::gpu_frames(), Ordering::Relaxed);
                     self.ensure_prefetch();
                 }
                 if hit_tier != tier {
@@ -1180,6 +1333,12 @@ impl RawCamSource {
                 }
             };
 
+            let gpu = filmcraft_media::cancel::gpu_frames();
+            if steer {
+                self.last_gpu.store(gpu, Ordering::Relaxed);
+            }
+            let wanted_gpu = Self::gpu_wanted(&session, gpu);
+            session.set_gpu(wanted_gpu);
             let decode_started = Instant::now();
             let outcome = session.request_frame(idx, self.scale_word(key, serve_tier), FRAME_TIMEOUT);
             let decoded_in = decode_started.elapsed();
@@ -1210,7 +1369,8 @@ impl RawCamSource {
                     MediaError::Decode(format!("{}: {e}", self.path.display()))
                 })?
                 .map_err(|e| MediaError::Decode(format!("{}: frame {idx}: {e}", self.path.display())))?;
-            let frame = Arc::new(Self::into_frame(reply, idx, rate));
+            count_reply(&reply, wanted_gpu);
+            let frame = Arc::new(self.frame_of(reply, idx, serve_tier, rate));
             self.cache_frame((idx, serve_tier), frame.clone());
             if provisional {
                 filmcraft_media::pending::mark_provisional();
@@ -2405,7 +2565,7 @@ exit 0
             let reply = reply.unwrap_or_else(|e| panic!("frame {idx}: {e}"));
             let (d, p) = session.last_timing();
             let c = Instant::now();
-            let f = RawCamSource::into_frame(reply, idx, rate);
+            let f = VideoFrame::rgba8(reply.width, reply.height, host_rgba(reply)).with_pts(Tick::from_rational(idx as i64, rate.den, rate.num));
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
             (ms(t.elapsed()), ms(d), ms(p), ms(c.elapsed()), f.width, f.height)
         })
@@ -2415,7 +2575,13 @@ exit 0
         let _ = format;
         bench_with(s, 1, |session, scale| {
             let replies = session.request_batch_steered(part, scale, READ_AHEAD_WINDOW, || true, FRAME_TIMEOUT).unwrap_or_else(|e| panic!("batch: {e}"));
-            replies.into_iter().zip(part).filter_map(|(r, &i)| r.ok().map(|r| RawCamSource::into_frame(r, i, rate))).count()
+            replies
+                .into_iter()
+                .zip(part)
+                .filter_map(|(r, &i)| {
+                    r.ok().map(|r| VideoFrame::rgba8(r.width, r.height, host_rgba(r)).with_pts(Tick::from_rational(i as i64, rate.den, rate.num)))
+                })
+                .count()
         })
     }
 
@@ -2456,6 +2622,153 @@ exit 0
             std::thread::sleep(Duration::from_millis(10));
         }
         bridge::live_processes(bridge)
+    }
+
+    /// A multi-clip bridge that exports GPU frames (ADR 0002), in Python: its "GPU memory" is a
+    /// memfd per buffer, sent over the socket with `SCM_RIGHTS` like a CUDA export. Commands go to
+    /// `<bridge>.cmds`.
+    #[cfg(target_os = "linux")]
+    const FAKE_GPU_BRIDGE: &str = r#"#!/usr/bin/env python3
+import os, socket, struct, sys
+args = sys.argv[1:]
+def err(s):
+    sys.stderr.write(s + "\n"); sys.stderr.flush()
+CAPS = "scale,frame-errors,multi,gpu-export"
+META = '"timecode":"01:02:03:04","fps_num":24,"fps_den":1,"width":16,"height":8,"frame_count":8'
+if "--probe-only" in args:
+    err('{"type":"metadata",' + META + ',"protocol":2,"caps":"' + CAPS + '"}'); err('{"type":"done"}'); sys.exit(0)
+if "--multi" not in args:
+    err('{"type":"error","message":"single-clip mode not faked"}'); sys.exit(1)
+log = open(sys.argv[0] + ".cmds", "a")
+sock = None
+if "--gpu-export" in args:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(args[args.index("--gpu-export") + 1])
+gpu = ',"gpu_uuid":"000102030405060708090a0b0c0d0e0f"' if sock else ""
+err('{"type":"ready","protocol":3,"caps":"' + CAPS + (",gpu" if sock else "") + '"' + gpu + "}")
+fds, free, nxt = {}, [], 1
+for line in sys.stdin:
+    log.write(line); log.flush()
+    w = line.split()
+    if not w: continue
+    if w[0] == "open":
+        err('{"type":"metadata","handle":' + w[1] + "," + META + ',"protocol":3,"caps":"' + CAPS + '"}')
+    elif w[0] == "frame":
+        h, i, s = w[1], int(w[2]), (w[3] if len(w) > 3 else "full")
+        W, H = {"half": (8, 4), "quarter": (4, 2), "eighth": (2, 1)}.get(s, (16, 8))
+        px = bytes([(i + 1) % 256] * 3 + [255])
+        head = '{"type":"frame","handle":%s,"index":%d,"width":%d,"height":%d,"format":"rgba8"' % (h, i, W, H)
+        tail = '{"type":"verify","handle":%s,"index":%d,"width":%d,"height":%d}' % (h, i, W, H)
+        if len(w) > 4 and w[4] == "gpu" and sock:
+            if free:
+                b = free.pop()
+            else:
+                b, nxt = nxt, nxt + 1
+                fds[b] = os.memfd_create("gpu%d" % b); os.ftruncate(fds[b], 4096)
+                socket.send_fds(sock, [struct.pack("<QQ", b, 4096)], [fds[b]])
+            for y in range(H):
+                os.pwrite(fds[b], px * W, y * 256)
+            err(head + ',"gpu":%d,"pitch":256}' % b); err(tail)
+        else:
+            err(head + "}"); sys.stdout.buffer.write(px * (W * H)); sys.stdout.flush(); err(tail)
+    elif w[0] == "release-gpu":
+        free.append(int(w[1]))
+    elif w[0] == "quit":
+        break
+"#;
+
+    /// Frames for the GPU compositor stay in the bridge's exported GPU memory (ADR 0002): the
+    /// buffer's descriptor arrives over the socket, the frame is an external picture laid out
+    /// at the bridge's pitch, its CPU fallback decodes the same picture over the host path, a
+    /// request without the GPU hint gets host pixels, and the buffer goes back once the last
+    /// reference to the frame is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu_frames_stay_in_gpu_memory_with_a_host_fallback() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3").arg("-c").arg("import os; os.memfd_create").status().map_or(true, |s| !s.success()) {
+            eprintln!("no python3 with memfd_create; skipping");
+            return;
+        }
+        let (dir, paths) = clips("gpuframes", &["placeholder"]);
+        let bridge = dir.join("gpu-bridge");
+        std::fs::write(&bridge, FAKE_GPU_BRIDGE).ok();
+        std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).ok();
+        // (process-wide, and never withdrawn: tests run side by side; only bridges announcing
+        // `gpu-export` are affected)
+        let uuid: [u8; 16] = std::array::from_fn(|i| i as u8);
+        filmcraft_frame::external::set_import_device(Some(uuid));
+        let src = paths.first().map(|p| open_quiet(p, &bridge, &dir)).unwrap_or_else(|| panic!("clip"));
+        let req = |k: i64| FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 };
+
+        let f = filmcraft_media::cancel::with_gpu_frames(true, || src.video_frame(req(2))).unwrap_or_else(|e| panic!("gpu frame: {e:?}"));
+        let filmcraft_frame::PixelData::External(img) = &f.data else { panic!("a GPU frame, got {}", f.format_label()) };
+        let memory = img.memory().unwrap_or_else(|| panic!("the frame holds its buffer"));
+        assert_eq!((f.width, f.height, img.pitch(), memory.device_uuid()), (16, 8, 256, uuid));
+        let fd = memory.handle().downcast_ref::<std::os::fd::OwnedFd>().and_then(|fd| fd.try_clone().ok()).unwrap_or_else(|| panic!("fd"));
+        let mut mem = Vec::new();
+        std::fs::File::from(fd).read_to_end(&mut mem).ok();
+        for y in [0usize, 7] {
+            assert_eq!(mem.get(y * 256..y * 256 + 64), Some([3u8, 3, 3, 255].repeat(16).as_slice()), "row {y} at the bridge's pitch");
+        }
+        assert!(!img.has_cpu_pixels());
+        assert_eq!(f.cpu_frame().to_rgba8(), [3u8, 3, 3, 255].repeat(16 * 8), "the CPU fallback decodes the same picture");
+
+        let host = src.video_frame(req(5)).unwrap_or_else(|e| panic!("host frame: {e:?}"));
+        assert!(matches!(host.data, filmcraft_frame::PixelData::Rgba8(_)), "no GPU hint: host pixels");
+
+        drop(f);
+        src.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let cmds = bridge.with_extension("cmds");
+        let released = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            std::fs::read_to_string(&cmds).is_ok_and(|c| c.lines().any(|l| l == "release-gpu 1"))
+        });
+        let log = std::fs::read_to_string(&cmds).unwrap_or_default();
+        assert!(released, "the buffer goes back with the last reference:\n{log}");
+        assert!(log.lines().any(|l| l.starts_with("frame ") && l.ends_with(" gpu")), "asked for a GPU frame:\n{log}");
+        assert!(log.lines().any(|l| l.starts_with("frame ") && !l.ends_with(" gpu")), "and host frames:\n{log}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cached GPU frame whose buffer the compositor took (copied, then given back) is spent: a
+    /// later request decodes it again instead of serving a picture that holds nothing. Cached GPU
+    /// frames kept their buffers for as long as any cache held them, and the bridge's export
+    /// budget filled up within seconds of playback (the rest came over the host).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spent_gpu_frame_is_decoded_again() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3").arg("-c").arg("import os; os.memfd_create").status().map_or(true, |s| !s.success()) {
+            eprintln!("no python3 with memfd_create; skipping");
+            return;
+        }
+        let (dir, paths) = clips("gpuspent", &["placeholder"]);
+        let bridge = dir.join("gpu-bridge");
+        std::fs::write(&bridge, FAKE_GPU_BRIDGE).ok();
+        std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).ok();
+        // (process-wide, and never withdrawn: tests run side by side; only bridges announcing
+        // `gpu-export` are affected)
+        let uuid: [u8; 16] = std::array::from_fn(|i| i as u8);
+        filmcraft_frame::external::set_import_device(Some(uuid));
+        let src = paths.first().map(|p| open_quiet(p, &bridge, &dir)).unwrap_or_else(|| panic!("clip"));
+        let gpu_frame = || {
+            let f = filmcraft_media::cancel::with_gpu_frames(true, || src.video_frame(FrameRequest { time: Tick::from_rational(2, 1, 24), scale: 1.0 }))
+                .unwrap_or_else(|e| panic!("frame: {e:?}"));
+            match &f.data {
+                filmcraft_frame::PixelData::External(img) => img.clone(),
+                _ => panic!("a GPU frame, got {}", f.format_label()),
+            }
+        };
+        let first = gpu_frame();
+        drop(first.take_gpu()); // the compositor copied it
+        assert!(first.is_spent());
+        let again = gpu_frame();
+        assert!(again.has_gpu(), "decoded again, not the spent picture");
+        assert_ne!(again.serial(), first.serial());
+        let log = std::fs::read_to_string(bridge.with_extension("cmds")).unwrap_or_default();
+        assert_eq!(log.lines().filter(|l| l.starts_with("frame ") && l.contains(" 2 ")).count(), 2, "{log}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Frame workers asking one clip for different frames at once (playback) each decode on a

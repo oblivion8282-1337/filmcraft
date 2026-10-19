@@ -43,6 +43,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Bootstrap audio decoding (MPL-2.0, used unmodified); replaced by own decoders over time.
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "mp1", "mp2", "mp3", "flac", "alac", "pcm", "wav", "aiff", "ogg", "vorbis", "isomp4"] }
 
+# GPU frames from the camera-RAW bridges: their buffers' descriptors arrive over a Unix socket
+# (SCM_RIGHTS, safe API)
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "net", "time"] }
+
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
 serde_json = { workspace = true }

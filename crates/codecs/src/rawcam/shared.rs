@@ -49,6 +49,8 @@ struct State {
     isolated: HashSet<PathBuf>,
     /// The largest frame (bytes) any clip of this bridge was opened for: the next bridge's slots.
     slot_bytes: u64,
+    /// The binary would not start with `--gpu-export` (it predates GPU frames): never offered again.
+    gpu_refused: bool,
 }
 
 impl State {
@@ -100,8 +102,9 @@ impl Manager {
 
     /// A session for `clip` on the shared bridge, starting it if none runs. `frame_bytes`: the
     /// clip's largest frame (sizes the shared-memory slots of a bridge started now); `shm`:
-    /// whether to offer the shared-memory ring at all.
-    pub fn open(&self, clip: &Path, frame_bytes: u64, shm: bool, timeout: Duration) -> Result<ClipSession, SharedError> {
+    /// whether to offer the shared-memory ring at all; `gpu_export`: whether the binary takes the
+    /// GPU frame socket (its probe said `gpu-export`), offered when this process can import.
+    pub fn open(&self, clip: &Path, frame_bytes: u64, shm: bool, gpu_export: bool, timeout: Duration) -> Result<ClipSession, SharedError> {
         let (bridge, handle) = {
             let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.slot_bytes = st.slot_bytes.max(frame_bytes.min(MAX_SLOT_BYTES));
@@ -116,7 +119,18 @@ impl Manager {
                     }
                     // Started under the lock: whoever else asks meanwhile needs this very bridge.
                     let slots = (shm && st.slot_bytes > 0).then_some(st.slot_bytes);
-                    match MultiBridge::spawn(&self.bridge, slots, timeout) {
+                    // GPU frames when this process can import them (ADR 0002); a bridge that does
+                    // not know the argument fails to start and is started again without it
+                    let gpu = gpu_export && !st.gpu_refused && super::gpu_frames_enabled() && filmcraft_frame::external::import_device().is_some();
+                    let spawned = match MultiBridge::spawn(&self.bridge, slots, gpu, timeout) {
+                        Err(e) if gpu => {
+                            log::info!("{}: no GPU frames ({e}); starting it without", self.bridge.display());
+                            st.gpu_refused = true;
+                            MultiBridge::spawn(&self.bridge, slots, false, timeout)
+                        }
+                        other => other,
+                    };
+                    match spawned {
                         Ok(b) => {
                             st.current = Arc::downgrade(&b);
                             st.report = Some(b.death_report());

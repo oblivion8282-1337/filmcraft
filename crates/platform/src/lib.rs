@@ -52,6 +52,9 @@ pub mod videotoolbox;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub mod videotoolbox_encode;
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub mod vk_interop;
 
 pub use hybrid::HybridDecoder;
 

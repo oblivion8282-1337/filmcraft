@@ -36,6 +36,15 @@
 //! interleave. A reader thread demultiplexes the event stream to the waiting requests of each
 //! handle ([`ClipSession`]); one clip's per-frame errors or close never disturb another.
 //!
+//! GPU frames (`gpu` capability, Linux, ADR 0002): a multi-clip bridge started with
+//! `--gpu-export <socket>` connects to a Unix socket FilmCraft listens on, and `frame <h> <i>
+//! <scale> gpu` is answered with a frame in exportable GPU memory instead of pixels: the event
+//! names the buffer and its row pitch (`"gpu":B,"pitch":P`). Each buffer's file descriptor comes
+//! over the socket once (`SCM_RIGHTS`, payload: id and size), before the first frame naming it;
+//! the client owns a buffer until it sends `release-gpu <B>`, and `{"type":"gpu-freed","gpu":B}`
+//! says the bridge let go of one ([`GpuBuffers`]). The frames become
+//! [`filmcraft_frame::PixelData::External`] pictures the GPU compositor imports.
+//!
 //! Everything a bridge says is untrusted: dimensions are capped ([`MAX_FRAME_DIM`],
 //! [`MAX_FRAME_BYTES`]) before anything is allocated, pixel reads run on a reader thread so a
 //! stalled bridge times out instead of hanging its caller, and every child process is killed
@@ -76,6 +85,10 @@ pub struct Caps {
     pub shm: bool,
     /// `--persistent --multi`: one process serves many clips under handles (protocol 3).
     pub multi: bool,
+    /// `--gpu-export <socket>` is understood (probe `caps`): offer the GPU frame socket.
+    pub gpu_export: bool,
+    /// Frames in exportable GPU memory are on (the `ready` event of a bridge given the socket).
+    pub gpu: bool,
 }
 
 impl Caps {
@@ -87,6 +100,8 @@ impl Caps {
                 "frame-errors" => caps.frame_errors = true,
                 "shm" => caps.shm = true,
                 "multi" => caps.multi = true,
+                "gpu" => caps.gpu = true,
+                "gpu-export" => caps.gpu_export = true,
                 _ => {}
             }
         }
@@ -163,10 +178,74 @@ pub fn frame_bytes(width: u32, height: u32, format: FrameFormat) -> Result<usize
 /// One reply's pixels as the bridge sent them.
 #[derive(Clone, Debug)]
 pub struct FrameBytes {
+    /// Empty for a frame in GPU memory ([`FrameBytes::gpu`]).
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub format: FrameFormat,
+    /// The frame lives in exported GPU memory instead of `data`.
+    pub gpu: Option<GpuFrame>,
+}
+
+/// Where a `frame` event says a GPU frame is: the exported buffer's id and the row pitch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuRef {
+    pub buffer: u64,
+    pub pitch: u32,
+}
+
+/// A frame in exported GPU memory: rows of `pitch` bytes from offset 0 of `memory`. The bridge
+/// keeps its hands off the buffer until the last clone of `release` is dropped.
+#[derive(Clone, Debug)]
+pub struct GpuFrame {
+    pub memory: Arc<filmcraft_frame::ExternalMemory>,
+    pub pitch: u32,
+    pub release: Arc<GpuRelease>,
+}
+
+/// Hands a GPU buffer back to the bridge (`release-gpu <B>`) when dropped.
+pub struct GpuRelease {
+    shared: Weak<MultiShared>,
+    buffer: u64,
+}
+
+impl std::fmt::Debug for GpuRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GpuRelease({})", self.buffer)
+    }
+}
+
+impl Drop for GpuRelease {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            let _ = shared.send_line(&format!("release-gpu {}\n", self.buffer));
+        }
+    }
+}
+
+/// Whether a `width`×`height` RGBA/BGRA frame with rows `pitch` apart fits `size` bytes from
+/// offset 0, with the rows aligned as a GPU copy needs (256 bytes).
+pub fn gpu_layout_fits(width: u32, height: u32, pitch: u32, size: u64) -> bool {
+    let row = u64::from(width) * 4;
+    width > 0 && height > 0 && pitch.is_multiple_of(256) && u64::from(pitch) >= row && u64::from(pitch) * u64::from(height - 1) + row <= size
+}
+
+/// Largest GPU buffer a bridge may export (the bridges round frames up to their allocation
+/// granularity; a 12K RGBA frame is ~320 MB).
+pub const MAX_GPU_BUFFER: u64 = 1 << 30;
+
+/// `"0123…"` (32 hex digits) as a 16-byte UUID.
+fn parse_uuid(hex: &str) -> Option<[u8; 16]> {
+    let hex = hex.as_bytes();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        let pair = std::str::from_utf8(hex.get(i * 2..i * 2 + 2)?).ok()?;
+        *b = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// One NDJSON event from a bridge's stderr.
@@ -178,6 +257,8 @@ pub enum Event {
         protocol: u32,
         caps: Caps,
         shm: Option<(u64, u64)>,
+        /// The GPU the bridge decodes on (`gpu_uuid`, with the `gpu` capability).
+        gpu_uuid: Option<[u8; 16]>,
     },
     /// Before a frame's pixels: the frame the following bytes belong to, its dimensions and
     /// pixel layout.
@@ -188,6 +269,12 @@ pub enum Event {
         format: FrameFormat,
         /// The shared-memory slot holding the pixels (none: they follow on stdout).
         slot: Option<u32>,
+        /// The GPU buffer holding the frame (no pixels follow).
+        gpu: Option<GpuRef>,
+    },
+    /// The bridge freed a GPU buffer it had exported (it will not name it again).
+    GpuFreed {
+        buffer: u64,
     },
     /// One requested frame could not be produced (protocol 2): it takes that request's place in
     /// the reply order, no pixels follow, the session goes on.
@@ -265,6 +352,10 @@ fn json_dims(line: &str, kind: &str) -> Option<Event> {
                 Some(_) => Some(json_u32(line, "slot")?),
                 None => None,
             },
+            gpu: match after_key(line, "gpu") {
+                Some(_) => Some(GpuRef { buffer: json_u64(line, "gpu")?, pitch: json_u32(line, "pitch")? }),
+                None => None,
+            },
         }),
         "verify" => Some(Event::Verify { index, width, height }),
         _ => None,
@@ -292,7 +383,9 @@ pub fn parse_event(line: &str) -> Option<Event> {
             protocol: json_u32(line, "protocol").unwrap_or(1),
             caps: Caps::parse(json_str(line, "caps").as_deref()),
             shm: json_u64(line, "shm_slots").zip(json_u64(line, "shm_slot_bytes")),
+            gpu_uuid: json_str(line, "gpu_uuid").as_deref().and_then(parse_uuid),
         }),
+        Some("gpu-freed") => Some(Event::GpuFreed { buffer: json_u64(line, "gpu")? }),
         Some(kind @ ("frame" | "verify")) => json_dims(line, kind),
         Some("progress") => Some(Event::Progress { frame: json_u64(line, "frame")?, total: json_u64(line, "total")? }),
         Some("done") => Some(Event::Done),
@@ -892,7 +985,7 @@ impl DecodeSession {
         let waiting_since = Instant::now();
         let (width, height, format, slot) = loop {
             match self.next_event(deadline) {
-                Some(Ok(Event::Frame { index: i, width, height, format, slot })) => {
+                Some(Ok(Event::Frame { index: i, width, height, format, slot, .. })) => {
                     if i != index {
                         return Err(format!("bridge out of sync: answered frame {i} for {index}"));
                     }
@@ -955,7 +1048,7 @@ impl DecodeSession {
                 other => self.pending.push_back(other),
             }
         }
-        Ok(Ok(FrameBytes { data, width, height, format }))
+        Ok(Ok(FrameBytes { data, width, height, format, gpu: None }))
     }
 }
 
@@ -999,6 +1092,21 @@ impl Session {
     /// Whether this is a handle on a shared bridge (dropping it closes the handle only).
     pub fn is_shared(&self) -> bool {
         matches!(self, Session::Shared(_))
+    }
+
+    /// The GPU the session can export frames from (a shared bridge with the `gpu` capability).
+    pub fn gpu_device(&self) -> Option<[u8; 16]> {
+        match self {
+            Session::Own(_) => None,
+            Session::Shared(s) => s.bridge().gpu_device(),
+        }
+    }
+
+    /// Ask for the next frames in GPU memory, where the session can export them.
+    pub fn set_gpu(&mut self, on: bool) {
+        if let Session::Shared(s) = self {
+            s.set_gpu(on);
+        }
     }
 
     pub fn last_timing(&self) -> (Duration, Duration) {
@@ -1054,6 +1162,14 @@ enum Arrived {
         height: u32,
         format: FrameFormat,
     },
+    /// The frame is in an exported GPU buffer; the release hands it back if nobody keeps it.
+    Gpu {
+        release: GpuRelease,
+        gpu: GpuRef,
+        width: u32,
+        height: u32,
+        format: FrameFormat,
+    },
     /// The bridge could not produce this frame (the handle goes on).
     Failed(String),
 }
@@ -1105,6 +1221,8 @@ struct MultiShared {
     demux: Mutex<Demux>,
     ring: OnceLock<RingFile>,
     caps: OnceLock<Caps>,
+    /// The GPU buffers the bridge exported (with the `gpu` capability and a connected socket).
+    gpu: OnceLock<Arc<GpuBuffers>>,
     served: AtomicBool,
     /// Its last user let it go: the exit that follows is no crash.
     retired: AtomicBool,
@@ -1158,6 +1276,156 @@ impl Drop for SlotLease {
     }
 }
 
+/// The GPU buffers a bridge exported, by its buffer id: filled by a reader thread from the
+/// socket (`SCM_RIGHTS`), emptied by `gpu-freed` events. Frames naming a buffer wait here for it.
+pub struct GpuBuffers {
+    uuid: [u8; 16],
+    table: Mutex<GpuTable>,
+    arrived: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GpuTable {
+    by_id: HashMap<u64, Arc<filmcraft_frame::ExternalMemory>>,
+    /// The socket is gone (bridge exited, or it sent something unusable): no buffer comes any more.
+    closed: bool,
+}
+
+impl GpuBuffers {
+    fn new(uuid: [u8; 16]) -> Self {
+        GpuBuffers { uuid, table: Mutex::new(GpuTable::default()), arrived: std::sync::Condvar::new() }
+    }
+
+    /// Whether buffers can still arrive.
+    pub fn usable(&self) -> bool {
+        !self.table.lock().unwrap_or_else(PoisonError::into_inner).closed
+    }
+
+    /// A buffer the bridge exported: `size` bytes behind `handle` (a file descriptor).
+    fn insert(&self, id: u64, size: u64, handle: Box<dyn std::any::Any + Send + Sync>) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let memory = Arc::new(filmcraft_frame::ExternalMemory::new(NEXT.fetch_add(1, Ordering::Relaxed), size, self.uuid, handle));
+        self.table.lock().unwrap_or_else(PoisonError::into_inner).by_id.insert(id, memory);
+        self.arrived.notify_all();
+    }
+
+    /// The bridge let go of buffer `id`: frames still holding it keep the memory alive.
+    fn forget(&self, id: u64) {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner).by_id.remove(&id);
+    }
+
+    fn close(&self) {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner).closed = true;
+        self.arrived.notify_all();
+    }
+
+    /// Buffer `id`, waiting until `deadline` for its descriptor to arrive.
+    fn wait_for(&self, id: u64, deadline: Instant) -> Option<Arc<filmcraft_frame::ExternalMemory>> {
+        let mut t = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(m) = t.by_id.get(&id) {
+                return Some(m.clone());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if t.closed || left.is_zero() {
+                return None;
+            }
+            t = self.arrived.wait_timeout(t, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
+    }
+}
+
+/// The socket a bridge connects to for `--gpu-export`: a listener in a private directory, both
+/// removed once the bridge connected (or gave up).
+#[cfg(target_os = "linux")]
+struct GpuSocket {
+    dir: PathBuf,
+    listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(target_os = "linux")]
+impl GpuSocket {
+    fn create() -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("filmcraft-gpu-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("GPU socket dir: {e}"))?;
+        match std::os::unix::net::UnixListener::bind(dir.join("s")) {
+            Ok(listener) => Ok(GpuSocket { dir, listener }),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                Err(format!("GPU socket: {e}"))
+            }
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join("s")
+    }
+
+    /// The bridge's connection, if it made one (it connects before its `ready` event).
+    fn accept(&self) -> Option<std::os::unix::net::UnixStream> {
+        self.listener.set_nonblocking(true).ok()?;
+        let (stream, _) = self.listener.accept().ok()?;
+        stream.set_nonblocking(false).ok()?;
+        Some(stream)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GpuSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Read `(id, size, fd)` messages off the bridge's socket into `buffers` until it closes or sends
+/// something unusable.
+#[cfg(target_os = "linux")]
+fn gpu_socket_loop(stream: std::os::unix::net::UnixStream, buffers: &GpuBuffers) {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+    use std::mem::MaybeUninit;
+    loop {
+        let mut payload = [0u8; 16];
+        let mut got = 0;
+        let mut fd = None;
+        while got < payload.len() {
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let Some(rest) = payload.get_mut(got..) else { break };
+            let n = match recvmsg(&stream, &mut [std::io::IoSliceMut::new(rest)], &mut control, RecvFlags::CMSG_CLOEXEC) {
+                Ok(m) if m.bytes > 0 => m.bytes,
+                _ => return buffers.close(),
+            };
+            for msg in control.drain() {
+                if let RecvAncillaryMessage::ScmRights(fds) = msg {
+                    for f in fds {
+                        // one descriptor per message; extras are closed as they drop
+                        if fd.is_none() {
+                            fd = Some(f);
+                        }
+                    }
+                }
+            }
+            got += n;
+        }
+        let (Some(id), Some(size)) = (
+            payload.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes),
+            payload.get(8..).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes),
+        ) else {
+            return buffers.close();
+        };
+        match fd {
+            Some(fd) if size > 0 && size <= MAX_GPU_BUFFER => buffers.insert(id, size, Box::new(fd)),
+            _ => {
+                log::warn!("camera-RAW bridge sent an unusable GPU buffer ({id}, {size} bytes); no more GPU frames from it");
+                return buffers.close();
+            }
+        }
+    }
+}
+
 /// One multi-clip bridge process (`--persistent --multi`) shared by every clip of its format:
 /// one CUDA context, one SDK instance, one set of GPU pools. A guarded reader thread routes the
 /// bridge's events to the requests waiting on each handle; dropping the last reference kills and
@@ -1171,10 +1439,30 @@ impl MultiBridge {
     /// Start a multi-clip bridge and wait for its `ready` event. `shm_slot_bytes`: offer a
     /// shared-memory ring with slots of this size (the largest frame expected; a bridge without
     /// [`Caps::shm`] must not be offered one). On every failure the process is killed and reaped.
-    pub fn spawn(bridge: &Path, shm_slot_bytes: Option<u64>, timeout: Duration) -> Result<Arc<Self>, String> {
+    ///
+    /// `gpu_export`: offer the GPU frame socket (a bridge without [`Caps::gpu`] must not be
+    /// offered one: it refuses the argument).
+    pub fn spawn(bridge: &Path, shm_slot_bytes: Option<u64>, gpu_export: bool, timeout: Duration) -> Result<Arc<Self>, String> {
         let mut cmd = Command::new(bridge);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.arg("--persistent").arg("--multi");
+        #[cfg(target_os = "linux")]
+        let gpu_socket = if gpu_export {
+            match GpuSocket::create() {
+                Ok(sock) => {
+                    cmd.arg("--gpu-export").arg(sock.path());
+                    Some(sock)
+                }
+                Err(e) => {
+                    log::warn!("no GPU frames ({e}); they come through host memory");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = gpu_export;
         let mut ring_file = None;
         #[cfg(target_os = "linux")]
         if let Some(bytes) = shm_slot_bytes {
@@ -1199,6 +1487,7 @@ impl MultiBridge {
             demux: Mutex::new(Demux::default()),
             ring: OnceLock::new(),
             caps: OnceLock::new(),
+            gpu: OnceLock::new(),
             served: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             report: Arc::new(Mutex::new(None)),
@@ -1220,10 +1509,30 @@ impl MultiBridge {
             Ok(r) => r,
             Err(_) => Err(format!("{}: bridge did not start up (no ready event)", bridge.display())),
         };
-        let (caps, shm) = ready?; // dropping `this` kills and reaps the bridge
+        let (caps, shm, gpu_uuid) = ready?; // dropping `this` kills and reaps the bridge
         if !caps.multi {
             return Err(format!("{}: bridge does not serve multiple clips", bridge.display()));
         }
+        #[cfg(target_os = "linux")]
+        if let (Some(sock), Some(uuid)) = (gpu_socket, gpu_uuid.filter(|_| caps.gpu)) {
+            match sock.accept() {
+                Some(stream) => {
+                    let buffers = Arc::new(GpuBuffers::new(uuid));
+                    let reader = buffers.clone();
+                    let started = spawn_guarded("filmcraft-rawcam-gpu", move || {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu_socket_loop(stream, &reader))).is_err() {
+                            reader.close();
+                        }
+                    });
+                    if started {
+                        let _ = shared.gpu.set(buffers);
+                    }
+                }
+                None => log::warn!("{}: announced GPU frames but did not connect", bridge.display()),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = gpu_uuid;
         if let (Some((file, via)), Some((slots, slot_bytes))) = (ring_file, shm) {
             let len = file.metadata().map_err(|e| format!("shared-memory file: {e}"))?.len();
             let layout = shm_layout(slots, slot_bytes, len)?;
@@ -1236,6 +1545,11 @@ impl MultiBridge {
     /// The capabilities from the `ready` event.
     pub fn caps(&self) -> Caps {
         self.shared.caps.get().copied().unwrap_or_default()
+    }
+
+    /// The GPU this bridge exports frames from, while it can (`gpu` capability, socket up).
+    pub fn gpu_device(&self) -> Option<[u8; 16]> {
+        self.shared.gpu.get().filter(|g| g.usable()).map(|g| g.uuid)
     }
 
     /// Whether the bridge still serves (not exited, not desynchronised).
@@ -1315,9 +1629,11 @@ impl MultiBridge {
         drop(dropped.0);
     }
 
-    /// Queue `frame <handle> <index> [scale]`; the reply arrives on the receiver.
-    fn send_frame(&self, handle: u64, index: u64, scale: Option<&str>) -> Result<mpsc::Receiver<Delivery>, String> {
+    /// Queue `frame <handle> <index> [scale] [gpu]`; the reply arrives on the receiver. `gpu`
+    /// asks for the frame in GPU memory (only with a scale word, and only while exports work).
+    fn send_frame(&self, handle: u64, index: u64, scale: Option<&str>, gpu: bool) -> Result<mpsc::Receiver<Delivery>, String> {
         let line = match scale {
+            Some(word) if gpu && self.gpu_device().is_some() => format!("frame {handle} {index} {word} gpu\n"),
             Some(word) => format!("frame {handle} {index} {word}\n"),
             None => format!("frame {handle} {index}\n"),
         };
@@ -1370,7 +1686,7 @@ fn demux_loop(
     shared: &Arc<MultiShared>,
     stderr: std::process::ChildStderr,
     mut stdout: ChildStdout,
-    ready: mpsc::Sender<Result<(Caps, Option<(u64, u64)>), String>>,
+    ready: mpsc::Sender<Result<(Caps, Option<(u64, u64)>, Option<[u8; 16]>), String>>,
 ) {
     let mut ready = Some(ready);
     let mut lines = BufReader::new(stderr).lines();
@@ -1379,8 +1695,8 @@ fn demux_loop(
         let Some((handle, event)) = parse_tagged(&line) else { continue };
         if let Some(tx) = ready.take() {
             match event {
-                Event::Ready { caps, shm, .. } => {
-                    let _ = tx.send(Ok((caps, shm)));
+                Event::Ready { caps, shm, gpu_uuid, .. } => {
+                    let _ = tx.send(Ok((caps, shm, gpu_uuid)));
                 }
                 Event::Error(e) => {
                     let _ = tx.send(Err(e));
@@ -1409,11 +1725,20 @@ fn open_queue(d: &mut Demux, h: u64) -> Option<&mut VecDeque<Pending>> {
 /// Route one event; `Err` means the stream can no longer be trusted (the bridge is failed).
 fn route(shared: &Arc<MultiShared>, stdout: &mut ChildStdout, handle: Option<u64>, event: Event) -> Result<(), String> {
     match (handle, event) {
-        (Some(h), Event::Frame { index, width, height, format, slot }) => {
+        (Some(h), Event::Frame { index, width, height, format, slot, gpu }) => {
             let bytes = frame_bytes(width, height, format)?;
-            let arrived = match slot {
-                None => Arrived::Pixels(FrameBytes { data: read_pixels(stdout, bytes)?, width, height, format }),
-                Some(slot) => {
+            let arrived = match (gpu, slot) {
+                (Some(gpu), _) => {
+                    let release = GpuRelease { shared: Arc::downgrade(shared), buffer: gpu.buffer };
+                    if format == FrameFormat::Rgb24 {
+                        drop(release);
+                        Arrived::Failed("bridge sent a GPU frame as rgb24".into())
+                    } else {
+                        Arrived::Gpu { release, gpu, width, height, format }
+                    }
+                }
+                (None, None) => Arrived::Pixels(FrameBytes { data: read_pixels(stdout, bytes)?, width, height, format, gpu: None }),
+                (None, Some(slot)) => {
                     let Some(ring) = shared.ring.get() else {
                         return Err(format!("bridge announced shared-memory slot {slot} without a ring"));
                     };
@@ -1480,6 +1805,11 @@ fn route(shared: &Arc<MultiShared>, stdout: &mut ChildStdout, handle: Option<u64
             }
         }
         (None, Event::Error(message)) => log::warn!("camera-RAW bridge: {message}"),
+        (_, Event::GpuFreed { buffer }) => {
+            if let Some(g) = shared.gpu.get() {
+                g.forget(buffer);
+            }
+        }
         // A frame or verify without a handle cannot be routed: the pixels after it would desync.
         (None, Event::Frame { .. }) => return Err("bridge sent a frame without a clip handle".into()),
         _ => {}
@@ -1493,6 +1823,8 @@ pub struct ClipSession {
     bridge: Arc<MultiBridge>,
     handle: u64,
     meta: Metadata,
+    /// Ask for frames in GPU memory ([`ClipSession::set_gpu`]).
+    gpu: bool,
     /// This session's own description of the ring file (positional reads need no shared offset).
     ring: Option<File>,
     pub last_timing: (Duration, Duration),
@@ -1505,7 +1837,7 @@ impl ClipSession {
         // The bridge-wide capabilities (the metadata repeats them; a missing field is no reason
         // to lose the per-command scale).
         meta.caps = bridge.caps();
-        Ok(ClipSession { bridge, handle, meta, ring: None, last_timing: (Duration::ZERO, Duration::ZERO) })
+        Ok(ClipSession { bridge, handle, meta, gpu: false, ring: None, last_timing: (Duration::ZERO, Duration::ZERO) })
     }
 
     pub fn caps(&self) -> Caps {
@@ -1530,9 +1862,14 @@ impl ClipSession {
         &self.bridge
     }
 
+    /// Ask for the next frames in GPU memory (when the bridge exports them) or in host memory.
+    pub fn set_gpu(&mut self, on: bool) {
+        self.gpu = on;
+    }
+
     /// One frame: the outer error means this session (or the whole bridge) broke.
     pub fn request_frame(&mut self, index: u64, scale: Option<&str>, timeout: Duration) -> Result<Reply, String> {
-        let rx = self.bridge.send_frame(self.handle, index, scale)?;
+        let rx = self.bridge.send_frame(self.handle, index, scale, self.gpu)?;
         self.receive(&rx, Instant::now() + timeout)
     }
 
@@ -1563,7 +1900,7 @@ impl ClipSession {
                     break;
                 };
                 let Some(&index) = indices.get(sent) else { break };
-                waiting.push_back((self.bridge.send_frame(self.handle, index, scale)?, share));
+                waiting.push_back((self.bridge.send_frame(self.handle, index, scale, self.gpu)?, share));
                 sent += 1;
             }
             let Some((rx, _share)) = waiting.pop_front() else { break };
@@ -1591,8 +1928,9 @@ impl ClipSession {
             Arrived::Slot { lease, bytes, width, height, format } => {
                 let data = self.read_slot(lease.slot, bytes)?;
                 drop(lease); // `release`: the bridge may reuse the slot
-                Ok(Ok(FrameBytes { data, width, height, format }))
+                Ok(Ok(FrameBytes { data, width, height, format, gpu: None }))
             }
+            Arrived::Gpu { release, gpu, width, height, format } => self.gpu_frame(release, gpu, width, height, format, deadline),
         };
         self.last_timing = (announced.duration_since(waiting_since), announced.elapsed());
         reply
@@ -1608,6 +1946,24 @@ impl ClipSession {
         let Some(file) = self.ring.as_mut() else { return Err("no shared-memory ring".into()) };
         file.seek(SeekFrom::Start(at)).map_err(|e| format!("shared-memory seek: {e}"))?;
         read_pixels(file, bytes).map_err(|e| format!("shared memory: {e}"))
+    }
+
+    /// A reply in GPU buffer `gpu`: waits (until `deadline`) for the buffer's descriptor if it
+    /// has not come yet. A buffer that never arrives or does not hold the frame fails this one
+    /// frame (the buffer goes back); the session goes on.
+    fn gpu_frame(&self, release: GpuRelease, gpu: GpuRef, width: u32, height: u32, format: FrameFormat, deadline: Instant) -> Result<Reply, String> {
+        let memory = self.bridge.shared.gpu.get().and_then(|g| g.wait_for(gpu.buffer, deadline));
+        let Some(memory) = memory else {
+            if let Some(g) = self.bridge.shared.gpu.get() {
+                // it was announced but never came: no more GPU frames from this bridge
+                g.close();
+            }
+            return Ok(Err(format!("GPU buffer {} never arrived", gpu.buffer)));
+        };
+        if !gpu_layout_fits(width, height, gpu.pitch, memory.size()) {
+            return Ok(Err(format!("GPU frame {width}×{height} (pitch {}) does not fit buffer {} ({} bytes)", gpu.pitch, gpu.buffer, memory.size())));
+        }
+        Ok(Ok(FrameBytes { data: Vec::new(), width, height, format, gpu: Some(GpuFrame { memory, pitch: gpu.pitch, release: Arc::new(release) }) }))
     }
 }
 
@@ -1642,22 +1998,22 @@ mod tests {
         let v2 =
             r#"{"type":"metadata","timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":2,"caps":"scale,frame-errors,warp"}"#;
         let Some(Event::Metadata(m)) = parse_event(v2) else { panic!("metadata v2") };
-        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false, multi: false }));
+        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false, multi: false, gpu_export: false, gpu: false }));
         assert_eq!(
             parse_event(r#"{"type":"error","index":12,"message":"frame index 12 beyond clip"}"#),
             Some(Event::FrameError { index: 12, message: "frame index 12 beyond clip".into() })
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160}"#),
-            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgb24, slot: None })
+            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgb24, slot: None, gpu: None })
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160,"format":"rgba8"}"#),
-            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgba8, slot: None })
+            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Rgba8, slot: None, gpu: None })
         );
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160,"format":"bgra8"}"#),
-            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Bgra8, slot: None })
+            Some(Event::Frame { index: 7, width: 4096, height: 2160, format: FrameFormat::Bgra8, slot: None, gpu: None })
         );
         assert_eq!(parse_event(r#"{"type":"frame","index":7,"width":4096,"height":2160,"format":"ycbcr"}"#), None);
         assert_eq!(parse_event(r#"{"type":"verify","index":7,"width":4096,"height":2160}"#), Some(Event::Verify { index: 7, width: 4096, height: 2160 }));
@@ -1948,7 +2304,7 @@ done
         assert_eq!(m.shm, Some((6, 2_097_152)));
         assert_eq!(
             parse_event(r#"{"type":"frame","index":7,"width":4,"height":2,"format":"rgba8","slot":3}"#),
-            Some(Event::Frame { index: 7, width: 4, height: 2, format: FrameFormat::Rgba8, slot: Some(3) })
+            Some(Event::Frame { index: 7, width: 4, height: 2, format: FrameFormat::Rgba8, slot: Some(3), gpu: None })
         );
         // A slot that is no u32 is refused, not taken for "on stdout" (that would desync).
         assert_eq!(parse_event(r#"{"type":"frame","index":7,"width":4,"height":2,"format":"rgba8","slot":-1}"#), None);
@@ -2064,11 +2420,11 @@ done
     #[test]
     fn parses_multi_clip_events() {
         let ready = r#"{"type":"ready","protocol":3,"caps":"scale,frame-errors,shm,multi","shm_slots":5,"shm_slot_bytes":2097152}"#;
-        let Some((None, Event::Ready { protocol, caps, shm })) = parse_tagged(ready) else { panic!("ready") };
+        let Some((None, Event::Ready { protocol, caps, shm, .. })) = parse_tagged(ready) else { panic!("ready") };
         assert_eq!((protocol, caps.multi, caps.shm, shm), (3, true, true, Some((5, 2_097_152))));
         assert_eq!(
             parse_tagged(r#"{"type":"frame","handle":7,"index":3,"width":4,"height":2,"format":"rgba8","slot":1}"#),
-            Some((Some(7), Event::Frame { index: 3, width: 4, height: 2, format: FrameFormat::Rgba8, slot: Some(1) }))
+            Some((Some(7), Event::Frame { index: 3, width: 4, height: 2, format: FrameFormat::Rgba8, slot: Some(1), gpu: None }))
         );
         assert_eq!(
             parse_tagged(r#"{"type":"error","handle":2,"index":9,"message":"bad"}"#),
@@ -2194,7 +2550,7 @@ done
     fn multi_clip_replies_reach_their_own_handle() {
         let (dir, bridge, _) = script_bridge("multi-route", MULTI_BRIDGE);
         for shm in [None, Some(32)] {
-            let multi = MultiBridge::spawn(&bridge, shm, Duration::from_secs(5)).unwrap_or_else(|e| panic!("spawn: {e}"));
+            let multi = MultiBridge::spawn(&bridge, shm, false, Duration::from_secs(5)).unwrap_or_else(|e| panic!("spawn: {e}"));
             assert!(multi.caps().multi);
             assert_eq!(live_processes(&bridge), 1);
             let mut a = clip_session(&multi, &dir, 0, "a.braw", "plain");
@@ -2250,7 +2606,7 @@ done
             ("badv", None, "disagree"),
             ("stal", None, "timed out"),
         ] {
-            let multi = MultiBridge::spawn(&bridge, shm, Duration::from_secs(5)).unwrap_or_else(|e| panic!("{mode}: spawn: {e}"));
+            let multi = MultiBridge::spawn(&bridge, shm, false, Duration::from_secs(5)).unwrap_or_else(|e| panic!("{mode}: spawn: {e}"));
             let mut a = clip_session(&multi, &dir, 0, "a.braw", mode);
             let mut b = clip_session(&multi, &dir, 1, "b.braw", "plain");
             let tb = std::thread::spawn(move || b.request_frame(1, Some("full"), Duration::from_secs(10)));
@@ -2273,7 +2629,7 @@ done
             assert!(!multi.is_alive(), "{mode}");
         }
         std::fs::write(bridge.with_extension("noready"), "").ok();
-        let r = MultiBridge::spawn(&bridge, None, Duration::from_millis(500));
+        let r = MultiBridge::spawn(&bridge, None, false, Duration::from_millis(500));
         assert!(r.as_ref().is_err_and(|e| e.contains("ready")), "got {:?}", r.as_ref().err());
         assert_eq!(live_processes(&bridge), 0, "every bridge was reaped");
         std::fs::remove_dir_all(&dir).ok();

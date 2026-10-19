@@ -552,3 +552,83 @@ fn hdr_input_gpu_matches_cpu() {
         assert!(apart > 20, "{name}: colour management changed nothing ({apart})");
     }
 }
+
+/// Hands out buffers it was given, by memory id (stands in for a real cross-process import).
+struct TestImporter(std::sync::Mutex<HashMap<u64, wgpu::Buffer>>);
+
+impl external::ExternalImporter for TestImporter {
+    fn import(&self, _device: &wgpu::Device, memory: &filmcraft_frame::ExternalMemory) -> Option<wgpu::Buffer> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&memory.id()).cloned()
+    }
+}
+
+/// An external (other-process GPU) frame composites exactly like the same pixels uploaded from
+/// host memory: through a GPU copy from its imported buffer, with rows padded to wgpu's 256-byte
+/// alignment and in either byte order, never touching its CPU fallback — and through the CPU
+/// fallback when the import fails.
+#[test]
+fn an_external_frame_composites_like_its_host_pixels() {
+    use filmcraft_frame::{ExternalImage, ExternalLayout, ExternalMemory};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let (w, h) = (37u32, 5u32);
+    let rgba: Vec<u8> = (0..w * h * 4).map(|i| if i % 4 == 3 { 255 } else { (i * 29 % 253) as u8 }).collect();
+    let pitch = 256u32;
+    let padded = |bgra: bool| -> Vec<u8> {
+        let mut out = vec![0u8; (pitch * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let s = (y * w as usize + x) * 4;
+                let d = y * pitch as usize + x * 4;
+                out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+                if bgra {
+                    out.swap(d, d + 2);
+                }
+            }
+        }
+        out
+    };
+    let importer = Arc::new(TestImporter(std::sync::Mutex::new(HashMap::new())));
+    for (id, bgra) in [(1u64, false), (2, true)] {
+        let buf = wgpu::util::DeviceExt::create_buffer_init(
+            &dev,
+            &wgpu::util::BufferInitDescriptor { label: None, contents: &padded(bgra), usage: wgpu::BufferUsages::COPY_SRC },
+        );
+        importer.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, buf);
+    }
+    external::register_importer(importer);
+    let fallbacks = Arc::new(AtomicU32::new(0));
+    let frame = |id: u64, layout| {
+        let (px, n) = (rgba.clone(), fallbacks.clone());
+        let fetch = Box::new(move || {
+            n.fetch_add(1, Ordering::Relaxed);
+            Some(px.clone())
+        });
+        let mem = Arc::new(ExternalMemory::new(id, u64::from(pitch * h), [0; 16], Box::new(())));
+        Arc::new(VideoFrame {
+            width: w,
+            height: h,
+            data: PixelData::External(Arc::new(ExternalImage::new(mem, 0, pitch, layout, fetch, None))),
+            color: filmcraft_color::ColorInfo::SRGB_FULL,
+            par: (1, 1),
+            pts: Default::default(),
+        })
+    };
+    let render = |c: &mut GpuCompositor, f: Arc<VideoFrame>| {
+        c.composite(&FramePlan::Layers { width: w as usize, height: h as usize, layers: vec![PlanLayer::new(f, Affine::IDENTITY, 1.0, Blend::Normal)] });
+        c.read_output().expect("readback")
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let host = render(&mut c, Arc::new(VideoFrame::rgba8(w, h, rgba.clone())));
+    assert_eq!(render(&mut c, frame(1, ExternalLayout::Rgba8)), host, "RGBA buffer");
+    assert_eq!(render(&mut c, frame(2, ExternalLayout::Bgra8)), host, "BGRA buffer");
+    assert_eq!(c.external_copies(), 2);
+    assert_eq!(fallbacks.load(Ordering::Relaxed), 0, "zero-copy: the CPU fallback was never asked");
+    // a buffer the importer does not have: the CPU fallback's pixels, same picture
+    assert_eq!(render(&mut c, frame(3, ExternalLayout::Rgba8)), host, "fallback");
+    assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+    assert_eq!((c.external_copies(), c.external_fallbacks()), (2, 1));
+}

@@ -36,6 +36,7 @@ thread_local! {
     static DRAFT: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND: Cell<bool> = const { Cell::new(false) };
     static SCRUB: Cell<bool> = const { Cell::new(false) };
+    static GPU_FRAMES: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` with the paused-monitor seek hint `on` (restoring the previous one however `f` ends):
@@ -76,6 +77,26 @@ pub fn with_background<R>(on: bool, f: impl FnOnce() -> R) -> R {
 /// [`with_background`]`(true, …)`).
 pub fn background() -> bool {
     BACKGROUND.with(Cell::get)
+}
+
+/// Run `f` with the GPU-frames hint `on` (restoring the previous one however `f` ends): the
+/// caller composites on a GPU that can import external frames, so a decoder may hand out pictures
+/// that stay in GPU memory (`filmcraft_frame::PixelData::External`, ADR 0002) instead of reading
+/// them back to the host. Every other caller gets host pixels.
+pub fn with_gpu_frames<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GPU_FRAMES.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(GPU_FRAMES.with(|c| c.replace(on)));
+    f()
+}
+
+/// Whether the work on this thread welcomes frames in GPU memory (see [`with_gpu_frames`]).
+pub fn gpu_frames() -> bool {
+    GPU_FRAMES.with(Cell::get)
 }
 
 /// Run `f` with the draft-decoding hint `on` (restoring the previous one after). Frames decoded

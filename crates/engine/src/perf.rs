@@ -10,7 +10,17 @@ use crate::Session;
 pub fn decode_json() -> Value {
     let g = filmcraft_codecs::gop_stats();
     let hw = filmcraft_codecs::hw::hw_stats();
+    // camera-RAW frames: in GPU memory for the GPU compositor, over the host although the GPU
+    // was wanted, over the host for everyone else, and GPU frames read back for a CPU path
+    #[cfg(not(target_arch = "wasm32"))]
+    let rawcam = {
+        let r = filmcraft_codecs::rawcam::stats();
+        json!({"gpuFrames": r.gpu_frames, "hostFramesForGpu": r.host_frames_for_gpu, "hostFrames": r.host_frames, "cpuFallbacks": r.cpu_fallbacks})
+    };
+    #[cfg(target_arch = "wasm32")]
+    let rawcam = Value::Null;
     json!({
+        "rawcam": rawcam,
         "requests": g.hits + g.misses,
         "cacheHits": g.hits,
         "cacheMisses": g.misses,

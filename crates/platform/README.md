@@ -13,6 +13,15 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
 
 ## What it does
 
+- **Linux: camera-RAW frames straight from GPU memory** (`vk_interop.rs`,
+  [ADR 0002](../../docs/adr/0002-gpu-frame-interop.md)). The camera-RAW bridges decode into
+  exported CUDA memory; `vk_interop::register(&device)` (the desktop app calls it with its wgpu
+  device) registers a `filmcraft_gpu::external::ExternalImporter` that imports each buffer once
+  (`VK_KHR_external_memory_fd`, opaque fd, a device-local memory type) as a `wgpu::Buffer`, and
+  announces the device's UUID so sources only ask for GPU frames the device can import. Another
+  backend, another GPU or a refused import returns `None`: the frame is uploaded from its CPU
+  fallback instead.
+
 - **macOS: VideoToolbox H.264 (`avcC`) and HEVC (`hvcC`)**, 8- and 10-bit, 4:2:0 and 4:2:2
   (`videotoolbox.rs`). The session is created from the sample entry's parameter sets with a
   hardware decoder *required*; samples go in as `CMSampleBuffer`s with asynchronous decompression

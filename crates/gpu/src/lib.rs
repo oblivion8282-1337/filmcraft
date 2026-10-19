@@ -40,6 +40,7 @@ use filmcraft_render::plan::{FramePlan, PlanLayer, PlanStep};
 
 pub mod adapter;
 pub mod export_renderer;
+pub mod external;
 pub mod fx;
 pub mod lut;
 pub mod mask;
@@ -94,6 +95,8 @@ pub struct GpuCompositor {
     pub cpu_transitions: u64,
     /// Total bytes uploaded (stats).
     pub uploaded_bytes: u64,
+    /// Buffers of external (other-process GPU) frames imported into this device.
+    imports: external::Imports,
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -249,7 +252,7 @@ pub fn prepare_frame(f: &VideoFrame) -> Option<Prepared> {
         PixelData::Yuv16 { planes, bits, alpha, .. } => {
             Some(Prepared { planes: planes.iter().chain(alpha.as_ref()).map(|p| codes_to_f16_bytes(p, *bits)).collect() })
         }
-        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } => None,
+        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } | PixelData::External(_) => None,
     }
 }
 
@@ -427,7 +430,19 @@ impl GpuCompositor {
             gpu_transitions: 0,
             cpu_transitions: 0,
             uploaded_bytes: 0,
+            imports: external::Imports::default(),
         }
+    }
+
+    /// External frames copied on the GPU instead of uploaded (stats).
+    pub fn external_copies(&self) -> u64 {
+        self.imports.copies
+    }
+
+    /// External frames uploaded from their CPU fallback because they could not be copied on the
+    /// GPU (no importer, a failed import, the buffer already taken) (stats).
+    pub fn external_fallbacks(&self) -> u64 {
+        self.imports.fallbacks
     }
 
     fn target(
@@ -484,6 +499,7 @@ impl GpuCompositor {
             PixelData::RgbaF32(d) => Arc::as_ptr(d) as *const u8 as usize,
             PixelData::Yuv8 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
             PixelData::Yuv16 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
+            PixelData::External(e) => Arc::as_ptr(e) as *const u8 as usize,
         };
         let key = (id, f.width, f.height);
         self.clock += 1;
@@ -497,6 +513,27 @@ impl GpuCompositor {
         let up = match &f.data {
             PixelData::Rgba8(d) => {
                 let v = self.plane_texture(w, h, wgpu::TextureFormat::Rgba8UnormSrgb, d, 4);
+                Uploaded {
+                    views: [v, dummy(), dummy(), dummy()],
+                    kind: 0,
+                    code_scale: 1.0,
+                    alpha_scale: 0.0,
+                    chroma: (w, h),
+                    last_used: self.clock,
+                    _pixels: f.data.clone(),
+                }
+            }
+            PixelData::External(e) => {
+                // a GPU copy from the imported buffer, or (no importer, a failed import) the CPU
+                // fallback's pixels uploaded like any RGBA8 frame
+                let v = match self.imports.texture(&self.device, &self.queue, e, w, h) {
+                    Some(v) => v,
+                    None => {
+                        self.imports.fallbacks += 1;
+                        let px = e.rgba8(w, h);
+                        self.plane_texture(w, h, wgpu::TextureFormat::Rgba8UnormSrgb, &px, 4)
+                    }
+                };
                 Uploaded {
                     views: [v, dummy(), dummy(), dummy()],
                     kind: 0,

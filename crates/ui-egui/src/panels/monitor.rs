@@ -187,12 +187,18 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         };
         let size_key = (scale * 1000.0) as u32;
         let channel = display.is_channel();
-        let use_gpu = which == Which::Program && app.gpu.is_some() && !channel && !crate::panels::menu_dialogs::software_renderer(app);
+        let gpu_ok = app.gpu.is_some() && !channel && !crate::panels::menu_dialogs::software_renderer(app);
         let cpu_target = target;
-        let target = match (use_gpu, target) {
-            (true, Target::Sequence(s)) => Target::SequencePlan(s),
-            (_, t) => t,
+        // the Program monitor's sequence and the Source monitor's media composite on the GPU (a
+        // sequence opened in the Source monitor renders on the CPU)
+        let media = |i| app.session.project.item(i).is_some_and(|p| !matches!(p.kind, filmcraft_project::ItemKind::Sequence(_)));
+        let target = match (gpu_ok, which, target) {
+            (true, Which::Program, Target::Sequence(s)) => Target::SequencePlan(s),
+            (true, Which::Source, Target::Item(i)) if media(i) => Target::ItemPlan(i),
+            (_, _, t) => t,
         };
+        let use_gpu = target != cpu_target;
+        let source_gpu = matches!(target, Target::ItemPlan(_));
         // Draft decoding (opt-in): only while playing at 1/2 resolution or lower.
         let draft = crate::frames::draft_playback(playing, scale, app.session.prefs.playback.draft_decode);
         let key = FrameKey { target, frame, size: size_key, revision: rev, draft };
@@ -220,14 +226,12 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             match found {
                 Some((k, plan)) => {
                     // a refined plan under the key already on screen: composite it again
-                    if app.frames.take_refined(&k)
-                        && let Some(g) = app.gpu.as_mut()
-                    {
-                        g.last_key = None;
+                    if app.frames.take_refined(&k) {
+                        app.gpu_forget(source_gpu);
                     }
                     (app.gpu_present(k, &plan).map(|(id, _)| id), Some(k))
                 }
-                None => (app.gpu.as_ref().and_then(|g| g.texture), app.gpu.as_ref().and_then(|g| g.last_key)),
+                None => app.gpu_shown(source_gpu),
             }
         } else {
             cpu_texture(app, &ctx, &tex_name, key, &asked, display)

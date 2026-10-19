@@ -213,6 +213,32 @@ pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOption
     layers.finish(w, h)
 }
 
+/// The Source monitor's picture of `item` at media time `t` as a GPU plan: what
+/// [`crate::render_item`] renders on the CPU — the frame decoded at `scale`, shown as SDR Rec. 709
+/// — as one layer the compositor draws (and colour-manages, where its input transform runs on the
+/// GPU). Media the GPU cannot convert (log, other pipelines) and sequences come back as the CPU
+/// image ([`FramePlan::Image`]). `None` when there is no picture (no source, a failed decode).
+pub fn plan_item(project: &Project, item: ItemId, t: Tick, scale: f32, sources: &dyn SourceProvider) -> Option<FramePlan> {
+    if matches!(project.item(item)?.kind, ItemKind::Sequence(_)) {
+        return crate::render_item(project, item, t, scale, sources).map(FramePlan::Image);
+    }
+    let src = sources.source(item)?;
+    let frame = src.video_frame(FrameRequest { time: t, scale }).ok()?;
+    let pipe = filmcraft_color::ColorPipeline::REC709;
+    let cs = crate::colorman::source_space(project, item, &frame);
+    let managed = crate::colorman::needs_management(&pipe, cs, &frame);
+    let input = if managed { crate::colorman::gpu_input(project, item, &pipe, cs, &frame) } else { None };
+    let full_w = src.info().video.as_ref().map_or(frame.width, |v| v.width) as f32;
+    let n = crate::decimation(frame.width as f32, full_w * scale);
+    if managed && input.is_none() {
+        return Some(FramePlan::Image(crate::colorman::decode(project, item, &frame, n, &pipe)));
+    }
+    // the size render_item's decimated conversion has
+    let (w, h) = frame.decimated_size(n);
+    let matrix = Affine::scale(w as f64 / frame.width.max(1) as f64, h as f64 / frame.height.max(1) as f64);
+    Some(FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer { input, ..PlanLayer::new(frame, matrix, 1.0, Blend::Normal) }] })
+}
+
 /// Whether [`plan_frame`] hands the frame at `t` back as one CPU image ([`FramePlan::Image`]). A
 /// GPU renderer gains nothing on such a frame, so a caller with only a few of them (the export's
 /// pool) can render it on the CPU without taking one.

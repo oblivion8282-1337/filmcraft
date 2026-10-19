@@ -208,6 +208,23 @@ fn plan_matches_reference_renderer() {
     }
 }
 
+/// The Source monitor's GPU plan of a media item shows what the CPU path (`render_item`) shows:
+/// one layer, GPU-drawable, at the same size, for full and reduced resolution.
+#[test]
+fn an_item_plan_matches_the_item_render() {
+    let (p, red, ocean, _, map) = setup();
+    for (item, scale) in [(ocean, 1.0), (ocean, 0.5), (red, 0.25)] {
+        let t = Tick(TICKS_PER_SECOND / 2);
+        let reference = render_item(&p, item, t, scale, &map).unwrap_or_else(|| panic!("render"));
+        let plan = plan::plan_item(&p, item, t, scale, &map).unwrap_or_else(|| panic!("plan"));
+        assert!(matches!(&plan, plan::FramePlan::Layers { layers, .. } if layers.len() == 1), "one GPU-drawable layer");
+        let got = plan::execute_cpu(&plan);
+        assert_eq!((got.w, got.h), (reference.w, reference.h), "scale {scale}");
+        let max = got.px.iter().zip(&reference.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max < 0.02, "scale {scale}: max diff {max}");
+    }
+}
+
 #[test]
 fn push_plan_preserves_reference_track_order_and_reverse() {
     let (mut p, red, ocean, seq, map) = setup();

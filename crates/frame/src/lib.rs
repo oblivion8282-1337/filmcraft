@@ -7,10 +7,12 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod external;
 pub mod pool;
 
 use std::sync::Arc;
 
+pub use external::{ExternalImage, ExternalLayout, ExternalMemory};
 use filmcraft_color::{ColorInfo, DecodeTable, Matrix, Range, linear_to_srgb_u8, normalize_c, normalize_y, srgb_u8_to_linear_table, to_linear, ycbcr_to_rgb};
 use filmcraft_time::Tick;
 use rayon::prelude::*;
@@ -52,6 +54,9 @@ pub enum PixelData {
     Yuv8 { planes: [Arc<Vec<u8>>; 3], chroma: Chroma, alpha: Option<Arc<Vec<u8>>> },
     /// 9–16-bit planar Y'CbCr stored in u16 (`bits` significant bits).
     Yuv16 { planes: [Arc<Vec<u16>>; 3], chroma: Chroma, bits: u32, alpha: Option<Arc<Vec<u16>>> },
+    /// Like `Rgba8`, but in GPU memory another process exported (see [`external`]). CPU code reads
+    /// it through [`VideoFrame::cpu_frame`].
+    External(Arc<ExternalImage>),
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +126,7 @@ impl VideoFrame {
             PixelData::RgbaF32(_) => "RGBA 32-bit float".into(),
             PixelData::Yuv8 { chroma, .. } => format!("YUV {} 8-bit", chroma.label()),
             PixelData::Yuv16 { chroma, bits, .. } => format!("YUV {} {bits}-bit", chroma.label()),
+            PixelData::External(_) => "RGBA 8-bit (GPU)".into(),
         }
     }
 
@@ -131,6 +137,16 @@ impl VideoFrame {
             PixelData::RgbaF32(d) => d.len() * 4,
             PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len()),
             PixelData::Yuv16 { planes, alpha, .. } => (planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len())) * 2,
+            PixelData::External(e) => e.byte_size(self.width, self.height),
+        }
+    }
+
+    /// The frame with its pixels in host memory: an [`PixelData::External`] picture read back
+    /// through its CPU fallback (fetched once, then shared), any other frame as it is.
+    pub fn cpu_frame(&self) -> std::borrow::Cow<'_, VideoFrame> {
+        match &self.data {
+            PixelData::External(e) => std::borrow::Cow::Owned(VideoFrame { data: PixelData::Rgba8(e.rgba8(self.width, self.height)), ..self.clone() }),
+            _ => std::borrow::Cow::Borrowed(self),
         }
     }
 
@@ -174,7 +190,7 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(box_plane(a, w, h, ow, oh, n))),
                 }
             }
-            PixelData::Rgba8(_) | PixelData::RgbaF32(_) => return None,
+            PixelData::Rgba8(_) | PixelData::RgbaF32(_) | PixelData::External(_) => return None,
         };
         Some(VideoFrame { width: ow as u32, height: oh as u32, data, color: self.color, par: self.par, pts: self.pts })
     }
@@ -188,6 +204,7 @@ impl VideoFrame {
         let (sx, sy) = match &self.data {
             PixelData::Yuv8 { chroma, .. } | PixelData::Yuv16 { chroma, .. } => chroma.shifts(),
             PixelData::Rgba8(_) | PixelData::RgbaF32(_) => (0, 0),
+            PixelData::External(_) => return self.cpu_frame().cropped(region),
         };
         let (mx, my) = ((1usize << sx) - 1, (1usize << sy) - 1);
         let (x, y) = (region.x.min(w) & !mx, region.y.min(h) & !my);
@@ -230,6 +247,7 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(crop_plane(a, w, h, 1, r))),
                 }
             }
+            PixelData::External(_) => return self.cpu_frame().cropped(region),
         };
         VideoFrame { width: r.w as u32, height: r.h as u32, data, color: self.color, par: self.par, pts: self.pts }
     }
@@ -264,6 +282,7 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(rotate_plane(a, w, h, 1, q))),
                 }
             }
+            PixelData::External(_) => return self.cpu_frame().rotated(quarter_turns),
         };
         let (width, height, par) = if q % 2 == 1 { (self.height, self.width, (self.par.1, self.par.0)) } else { (self.width, self.height, self.par) };
         VideoFrame { width, height, data, color: self.color, par, pts: self.pts }
@@ -322,6 +341,9 @@ impl VideoFrame {
         if w == 0 || h == 0 {
             out.fill(0.0);
             return;
+        }
+        if let PixelData::External(_) = &self.data {
+            return self.cpu_frame().convert_region(n, decode, r, out);
         }
         if let PixelData::RgbaF32(d) = &self.data
             && n == 1
@@ -468,6 +490,8 @@ impl VideoFrame {
                     }
                 });
             }
+            // resolved to host pixels above
+            PixelData::External(_) => out.fill(0.0),
         }
     }
 
@@ -507,6 +531,7 @@ impl VideoFrame {
         let (w, h) = (self.width as usize, self.height as usize);
         match &self.data {
             PixelData::Rgba8(d) => d.as_ref().clone(),
+            PixelData::External(e) => e.rgba8(self.width, self.height).as_ref().clone(),
             PixelData::Yuv8 { planes, chroma, alpha: None }
                 if matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb) =>
             {
@@ -831,6 +856,35 @@ mod tests {
         assert!(VideoFrame::rgba8(2, 2, vec![0; 16]).box_decimated(2).is_none());
     }
     use super::*;
+
+    /// Every CPU path reads an external (GPU) picture exactly as the same pixels in host memory.
+    #[test]
+    fn an_external_frame_converts_like_its_host_pixels() {
+        let (w, h) = (6u32, 4u32);
+        let px: Vec<u8> = (0..w * h * 4).map(|i| (i * 37 % 251) as u8).collect();
+        let host = VideoFrame::rgba8(w, h, px.clone());
+        let ext = VideoFrame {
+            data: PixelData::External(Arc::new(ExternalImage::new(
+                Arc::new(ExternalMemory::new(9, 4096, [0; 16], Box::new(()))),
+                0,
+                256,
+                ExternalLayout::Rgba8,
+                Box::new(move || Some(px.clone())),
+                None,
+            ))),
+            ..host.clone()
+        };
+        assert_eq!(ext.to_linear_f32(), host.to_linear_f32());
+        assert_eq!(ext.to_linear_f32_decimated(2), host.to_linear_f32_decimated(2));
+        assert_eq!(ext.to_rgba8(), host.to_rgba8());
+        assert_eq!(ext.luma8(), host.luma8());
+        let r = Region { x: 1, y: 1, w: 3, h: 2 };
+        assert_eq!(ext.cropped(r).to_rgba8(), host.cropped(r).to_rgba8());
+        assert_eq!(ext.rotated(1).to_rgba8(), host.rotated(1).to_rgba8());
+        assert_eq!(ext.to_linear_f32_region(1, None, r), host.to_linear_f32_region(1, None, r));
+        assert!(ext.box_decimated(2).is_none());
+        assert_eq!(ext.byte_size(), 256 * 4, "a GPU frame counts its buffer rows while it holds them");
+    }
 
     #[test]
     fn rgba8_roundtrip_through_linear() {

@@ -57,9 +57,15 @@ windows = { version = "0.62", features = [
 # wgpu), so building needs no libva headers and a system without libva simply decodes in software.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
+# GPU frame import (vk_interop, ADR 0002): the app's wgpu device, its Vulkan handles
+filmcraft-gpu = { workspace = true }
+wgpu = { version = "30", default-features = false, features = ["vulkan"] }
+ash = "0.38"
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
+filmcraft-geom = { workspace = true }
+pollster = "0.4"
 filmcraft-media = { workspace = true }
 filmcraft-frame = { workspace = true }
 filmcraft-project = { workspace = true }

@@ -34,6 +34,10 @@ pub fn stats(app: &FilmcraftApp) -> Value {
     v["gpu"] = app.gpu.as_ref().map_or(Value::Null, |g| {
         json!({
             "uploadedBytes": g.compositor.uploaded_bytes,
+            // camera-RAW frames copied from a bridge's GPU memory, and those uploaded from their
+            // CPU fallback instead (ADR 0002)
+            "externalCopies": g.compositor.external_copies(),
+            "externalFallbacks": g.compositor.external_fallbacks(),
             "transitions": g.compositor.gpu_transitions,
             "cpuTransitions": g.compositor.cpu_transitions,
             "submitMs": g.last_ms,
