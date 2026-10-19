@@ -42,6 +42,7 @@ pub mod adapter;
 pub mod export_renderer;
 pub mod external;
 pub mod fx;
+mod intra;
 pub mod lut;
 pub mod mask;
 mod transition;
@@ -91,6 +92,9 @@ pub struct GpuCompositor {
     /// The effect stage (None on devices without compute shaders or storage textures: layers
     /// with effects are then rendered on the CPU here).
     fx: Option<fx::FxStage>,
+    /// Decodes coded (intra-only) pictures in compute shaders (None without compute support:
+    /// they are decoded on the CPU and uploaded).
+    intra: Option<intra::IntraStage>,
     transition: transition::PushStage,
     transition_inputs: [Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>; 2],
     pub gpu_transitions: u64,
@@ -277,7 +281,7 @@ pub fn prepare_frame(f: &VideoFrame) -> Option<Prepared> {
             Some(Prepared { planes: planes.iter().chain(alpha.as_ref()).map(|p| codes_to_f16_bytes(p, *bits)).collect() })
         }
         PixelData::Rgba16(d) => Some(Prepared { planes: vec![unorm16_to_f16_bytes(d)] }),
-        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } | PixelData::External(_) => None,
+        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } | PixelData::External(_) | PixelData::Coded(_) => None,
     }
 }
 
@@ -435,6 +439,20 @@ impl GpuCompositor {
                 }
             })
             .flatten();
+        let intra = intra::supported(device)
+            .then(|| {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let stage = intra::IntraStage::new(device);
+                match poll_now(scope.pop()) {
+                    Some(None) => Some(stage),
+                    Some(Some(e)) => {
+                        log::warn!("GPU decoding of ProRes unavailable on this device, decoding on the CPU: {e}");
+                        None
+                    }
+                    None => None,
+                }
+            })
+            .flatten();
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -452,6 +470,7 @@ impl GpuCompositor {
             clock: 0,
             dummy,
             fx,
+            intra,
             transition: transition::PushStage::new(device),
             transition_inputs: [None, None],
             gpu_transitions: 0,
@@ -571,6 +590,7 @@ impl GpuCompositor {
             PixelData::Yuv8 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
             PixelData::Yuv16 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
             PixelData::External(e) => Arc::as_ptr(e) as *const u8 as usize,
+            PixelData::Coded(c) => Arc::as_ptr(c) as *const u8 as usize,
         };
         let key = (id, f.width, f.height);
         self.clock += 1;
@@ -583,6 +603,7 @@ impl GpuCompositor {
         let d0 = self.dummy.clone();
         let dummy = || d0.clone();
         let up = match &f.data {
+            PixelData::Coded(c) => return self.upload_coded(f, c, key),
             PixelData::Rgba8(d) => {
                 let v = self.plane_texture(w, h, wgpu::TextureFormat::Rgba8UnormSrgb, d, 4);
                 Uploaded {
@@ -729,6 +750,44 @@ impl GpuCompositor {
         key
     }
 
+    /// A coded picture: decoded on the GPU into Y'CbCr textures, or (no compute stage, a frame the
+    /// stage cannot take, a corrupt one) decoded on the CPU and uploaded like any 16-bit frame.
+    fn upload_coded(&mut self, f: &VideoFrame, c: &Arc<filmcraft_frame::CodedImage>, key: (usize, u32, u32)) -> (usize, u32, u32) {
+        let (w, h) = (f.width, f.height);
+        if let Some(d) = self.intra.as_mut().and_then(|s| s.decode(&self.device, &self.queue, c, w, h)) {
+            let scale = (1u32 << d.bits) as f32;
+            let alpha_scale = if d.alpha.is_some() { scale / (scale - 1.0) } else { 0.0 };
+            let plane_bytes = (w as usize) * (h as usize) * 2;
+            let bytes = plane_bytes + 2 * (d.chroma.0 as usize) * (d.chroma.1 as usize) * 2 + if d.alpha.is_some() { plane_bytes } else { 0 };
+            let [y, u, v] = d.planes;
+            let up = Uploaded {
+                views: [y, u, v, d.alpha.unwrap_or_else(|| self.dummy.clone())],
+                kind: 2,
+                code_scale: scale,
+                alpha_scale,
+                chroma: d.chroma,
+                last_used: self.clock,
+                bytes,
+                _pixels: f.data.clone(),
+            };
+            self.uploads.insert(key, up);
+            self.trim_uploads();
+            return key;
+        }
+        let cpu = VideoFrame { data: c.cpu(w, h), ..f.clone() };
+        let k = self.upload(&cpu, None);
+        if let Some(u) = self.uploads.remove(&k) {
+            // cached under the coded picture (which keeps its CPU decode alive)
+            self.uploads.insert(key, Uploaded { _pixels: f.data.clone(), ..u });
+        }
+        key
+    }
+
+    /// Coded pictures decoded on the GPU / decoded on the CPU instead (stats).
+    pub fn intra_decodes(&self) -> (u64, u64) {
+        self.intra.as_ref().map_or((0, 0), |s| (s.decoded, s.fallbacks))
+    }
+
     /// Keep the most recent uploads — enough for several stacked layers, a still or a title held
     /// over many frames, and the frame a paused monitor redraws while its controls move — within
     /// [`MAX_UPLOADS`] and the memory budget, least recently used first. A frame played once is
@@ -756,6 +815,7 @@ impl GpuCompositor {
         let code_levels = match &f.data {
             PixelData::Yuv8 { .. } => 256.0,
             PixelData::Yuv16 { bits, .. } => (*bits as f32).exp2(),
+            PixelData::Coded(c) => (c.bits() as f32).exp2(),
             _ => 1.0,
         };
         Some(SrcInfo {
@@ -1405,5 +1465,7 @@ fn quad_bounds(l: &PlanLayer, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
 mod blend_tests;
 #[cfg(test)]
 mod fx_tests;
+#[cfg(test)]
+mod intra_tests;
 #[cfg(test)]
 mod tests;

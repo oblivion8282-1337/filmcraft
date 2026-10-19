@@ -7,11 +7,13 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod coded;
 pub mod external;
 pub mod pool;
 
 use std::sync::Arc;
 
+pub use coded::{CodedFormat, CodedImage};
 pub use external::{ExternalImage, ExternalLayout, ExternalMemory};
 use filmcraft_color::{ColorInfo, DecodeTable, Matrix, Range, linear_to_srgb_u8, normalize_c, normalize_y, srgb_u8_to_linear_table, to_linear, ycbcr_to_rgb};
 use filmcraft_time::Tick;
@@ -60,6 +62,9 @@ pub enum PixelData {
     /// Like `Rgba8`, but in GPU memory another process exported (see [`external`]). CPU code reads
     /// it through [`VideoFrame::cpu_frame`].
     External(Arc<ExternalImage>),
+    /// Planar Y'CbCr still in its compressed form, for the GPU compositor to decode (see
+    /// [`coded`]). CPU code reads it through [`VideoFrame::cpu_frame`].
+    Coded(Arc<CodedImage>),
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +136,7 @@ impl VideoFrame {
             PixelData::Yuv8 { chroma, .. } => format!("YUV {} 8-bit", chroma.label()),
             PixelData::Yuv16 { chroma, bits, .. } => format!("YUV {} {bits}-bit", chroma.label()),
             PixelData::External(_) => "RGBA 8-bit (GPU)".into(),
+            PixelData::Coded(c) => format!("YUV {} {}-bit ({:?})", c.chroma().label(), c.bits(), c.format()),
         }
     }
 
@@ -143,14 +149,17 @@ impl VideoFrame {
             PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len()),
             PixelData::Yuv16 { planes, alpha, .. } => (planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len())) * 2,
             PixelData::External(e) => e.byte_size(self.width, self.height),
+            PixelData::Coded(c) => c.byte_size(),
         }
     }
 
     /// The frame with its pixels in host memory: an [`PixelData::External`] picture read back
-    /// through its CPU fallback (fetched once, then shared), any other frame as it is.
+    /// through its CPU fallback (fetched once, then shared), a [`PixelData::Coded`] one decoded on
+    /// the CPU (once), any other frame as it is.
     pub fn cpu_frame(&self) -> std::borrow::Cow<'_, VideoFrame> {
         match &self.data {
             PixelData::External(e) => std::borrow::Cow::Owned(VideoFrame { data: e.cpu(self.width, self.height), ..self.clone() }),
+            PixelData::Coded(c) => std::borrow::Cow::Owned(VideoFrame { data: c.cpu(self.width, self.height), ..self.clone() }),
             _ => std::borrow::Cow::Borrowed(self),
         }
     }
@@ -195,7 +204,9 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(box_plane(a, w, h, ow, oh, n))),
                 }
             }
-            PixelData::Rgba8(_) | PixelData::Rgba16(_) | PixelData::RgbaF32(_) | PixelData::External(_) => return None,
+            // (a coded picture goes to the GPU whole: decoding it there costs less than the CPU
+            // decode a reduction would need)
+            PixelData::Rgba8(_) | PixelData::Rgba16(_) | PixelData::RgbaF32(_) | PixelData::External(_) | PixelData::Coded(_) => return None,
         };
         Some(VideoFrame { width: ow as u32, height: oh as u32, data, color: self.color, par: self.par, pts: self.pts })
     }
@@ -209,7 +220,7 @@ impl VideoFrame {
         let (sx, sy) = match &self.data {
             PixelData::Yuv8 { chroma, .. } | PixelData::Yuv16 { chroma, .. } => chroma.shifts(),
             PixelData::Rgba8(_) | PixelData::Rgba16(_) | PixelData::RgbaF32(_) => (0, 0),
-            PixelData::External(_) => return self.cpu_frame().cropped(region),
+            PixelData::External(_) | PixelData::Coded(_) => return self.cpu_frame().cropped(region),
         };
         let (mx, my) = ((1usize << sx) - 1, (1usize << sy) - 1);
         let (x, y) = (region.x.min(w) & !mx, region.y.min(h) & !my);
@@ -253,7 +264,7 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(crop_plane(a, w, h, 1, r))),
                 }
             }
-            PixelData::External(_) => return self.cpu_frame().cropped(region),
+            PixelData::External(_) | PixelData::Coded(_) => return self.cpu_frame().cropped(region),
         };
         VideoFrame { width: r.w as u32, height: r.h as u32, data, color: self.color, par: self.par, pts: self.pts }
     }
@@ -289,7 +300,7 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(rotate_plane(a, w, h, 1, q))),
                 }
             }
-            PixelData::External(_) => return self.cpu_frame().rotated(quarter_turns),
+            PixelData::External(_) | PixelData::Coded(_) => return self.cpu_frame().rotated(quarter_turns),
         };
         let (width, height, par) = if q % 2 == 1 { (self.height, self.width, (self.par.1, self.par.0)) } else { (self.width, self.height, self.par) };
         VideoFrame { width, height, data, color: self.color, par, pts: self.pts }
@@ -349,7 +360,7 @@ impl VideoFrame {
             out.fill(0.0);
             return;
         }
-        if let PixelData::External(_) = &self.data {
+        if let PixelData::External(_) | PixelData::Coded(_) = &self.data {
             return self.cpu_frame().convert_region(n, decode, r, out);
         }
         if let PixelData::RgbaF32(d) = &self.data
@@ -532,7 +543,7 @@ impl VideoFrame {
                 });
             }
             // resolved to host pixels above
-            PixelData::External(_) => out.fill(0.0),
+            PixelData::External(_) | PixelData::Coded(_) => out.fill(0.0),
         }
     }
 
@@ -572,7 +583,7 @@ impl VideoFrame {
         let (w, h) = (self.width as usize, self.height as usize);
         match &self.data {
             PixelData::Rgba8(d) => d.as_ref().clone(),
-            PixelData::External(_) => self.cpu_frame().to_rgba8(),
+            PixelData::External(_) | PixelData::Coded(_) => self.cpu_frame().to_rgba8(),
             PixelData::Yuv8 { planes, chroma, alpha: None }
                 if matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb) =>
             {

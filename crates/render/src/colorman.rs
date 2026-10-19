@@ -67,7 +67,8 @@ pub fn input_transform(cs: ColorSpace, range: Range, pipe: &ColorPipeline, peak_
 /// RAW). None for 8-bit and float RGBA and other pipelines, which [`decode`] converts on the CPU.
 pub fn gpu_input(project: &Project, item: ItemId, pipe: &ColorPipeline, cs: ColorSpace, frame: &VideoFrame) -> Option<Arc<InputTransform>> {
     use filmcraft_frame::PixelData;
-    let sampled_raw = matches!(frame.data, PixelData::Yuv8 { .. } | PixelData::Yuv16 { .. } | PixelData::Rgba16(_) | PixelData::External(_));
+    let sampled_raw =
+        matches!(frame.data, PixelData::Yuv8 { .. } | PixelData::Yuv16 { .. } | PixelData::Coded(_) | PixelData::Rgba16(_) | PixelData::External(_));
     if !pipe.is_plain() || !sampled_raw {
         return None;
     }

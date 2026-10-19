@@ -234,7 +234,7 @@ pub(crate) fn set_alpha(frame: &mut VideoFrame, a: &VideoFrame) {
             }
         }
         // (never a VP9 decoder's output)
-        PixelData::RgbaF32(_) | PixelData::Rgba16(_) | PixelData::External(_) => {}
+        PixelData::RgbaF32(_) | PixelData::Rgba16(_) | PixelData::External(_) | PixelData::Coded(_) => {}
     }
 }
 
