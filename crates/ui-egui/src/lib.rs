@@ -1293,6 +1293,9 @@ impl FilmcraftApp {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 filmcraft_engine::media_pool::media_key(m).hash(&mut h);
                 (m.proxy.is_some() && self.session.media.use_proxies()).hash(&mut h);
+                // Interpret Footage changes the picture (not the audio channel mapping)
+                let i = &m.interpret;
+                (i.color_space, i.par, i.frame_rate.map(|r| (r.num, r.den)), i.ignore_alpha, i.invert_alpha).hash(&mut h);
                 h.finish()
             }
             _ => self.session.revision,
@@ -2872,5 +2875,35 @@ mod native_menu_tests {
         app.sync_native_menu();
         assert_eq!(last(&sent, "edit.undo"), Some(false));
         assert_eq!(last(&sent, "edit.redo"), Some(true), "the undone edit can be redone");
+    }
+}
+
+#[cfg(test)]
+mod item_revision_tests {
+    use super::FilmcraftApp;
+
+    /// Interpret Footage (colour space, pixel aspect) changes what an item's frames look like, so
+    /// it changes the item's revision: the Source monitor, thumbnails and the Media Browser cache
+    /// pictures under it, and kept showing the old interpretation.
+    #[test]
+    fn interpret_footage_changes_the_item_revision() {
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", serde_json::json!({})).unwrap();
+        let item = s
+            .project
+            .items
+            .iter()
+            .find(|(_, i)| matches!(i.kind, filmcraft_project::ItemKind::Media(_)) && i.name.ends_with(".mp4"))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let mut app = FilmcraftApp::new(s);
+        let before = app.item_revision(item);
+        app.session.execute("clip.interpretFootage", serde_json::json!({"items": [item.0], "colorSpace": "slog3-sgamut3cine"})).unwrap();
+        let log = app.item_revision(item);
+        assert_ne!(log, before, "a new colour space is a new picture");
+        app.session.execute("clip.interpretFootage", serde_json::json!({"items": [item.0], "pixelAspect": [4, 3]})).unwrap();
+        assert_ne!(app.item_revision(item), log, "a new pixel aspect is a new picture");
+        app.session.execute("clip.interpretFootage", serde_json::json!({"items": [item.0], "colorSpace": "auto", "pixelAspect": "file"})).unwrap();
+        assert_eq!(app.item_revision(item), before, "back to the file's interpretation: the cached pictures are valid again");
     }
 }
