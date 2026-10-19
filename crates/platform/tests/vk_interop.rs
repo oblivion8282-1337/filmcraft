@@ -170,7 +170,7 @@ fn real_log_frame_through_the_colour_path() {
     let (ow, oh, rgba) = c.read_output().unwrap_or_else(|| panic!("readback"));
     eprintln!("{cs:?}: {ow}×{oh} through the colour path");
     if let Some(out) = std::env::var_os("FILMCRAFT_RAWCAM_DUMP") {
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
         let mut ppm = format!("P6 {ow} {oh} 255\n").into_bytes();
         ppm.extend_from_slice(&rgb);
         std::fs::write(out, ppm).unwrap_or_else(|e| panic!("write: {e}"));
