@@ -44,7 +44,8 @@ stays, unchanged, as the fallback for everything else.
   and the usual `verify` event; no pixels on stdout. Rows are `P` bytes apart (`P` a multiple of
   256, as wgpu requires for buffer → texture copies), starting at offset 0. All GPU work writing
   the buffer has completed (stream synchronised) before the event is written.
-- **16 bits (`f16`):** a bridge whose decode has more than 8 bits (R3D: REDCuda's 16-bit RGB)
+- **16 bits (`f16`):** a bridge whose decode has more than 8 bits (R3D: REDCuda's 16-bit RGB;
+  BRAW: the SDK's `RGBAU16` output of its 12-bit raw)
   lists `f16` in the `ready` caps and answers `frame <h> <i> <scale> gpu f16` with
   `"format":"rgbaf16"`: four IEEE 754 half floats per pixel (8 bytes, little-endian), linear
   light — the sRGB EOTF applied to the very values the 8-bit path rounds — premultiplied by

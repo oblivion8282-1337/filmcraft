@@ -59,8 +59,10 @@ fn real_gpu_frames_composite_like_host_frames() {
         let max = via_gpu.iter().zip(&via_host).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
         eprintln!("frame {k} at {scale} ({}×{}, {layout:?}): {diff} differing bytes, at most {max}", gpu.width, gpu.height);
         if layout == filmcraft_frame::ExternalLayout::RgbaF16 {
-            // the 16-bit decode against its 8-bit rounding: within one code value
-            assert!(max <= 1, "frame {k}: 16-bit GPU path within 1 of the 8-bit host path");
+            // the 16-bit decode against the SDK's own 8-bit rendering: R3D's 8 bits round its
+            // 16 (within 1), the BRAW SDK's 8-bit output sits up to 1.7 steps below its 16-bit
+            // one (within 2)
+            assert!(max <= 2, "frame {k}: 16-bit GPU path within 2 of the 8-bit host path");
         } else {
             assert_eq!(diff, 0, "frame {k}: GPU path and host path composite alike");
         }
