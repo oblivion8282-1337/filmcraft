@@ -1,8 +1,9 @@
 //! Camera-RAW media: Blackmagic `.braw` and RED `.R3D` clips decoded by external bridge binaries
 //! (`braw-bridge` / `r3d-bridge`) that wrap the vendor SDKs and stream debayered `rgb24` frames
 //! (see [`bridge`]). The SDKs are licensed and never ship with FilmCraft, so the bridges are
-//! user-provided: [`path_opener`] finds them via `FILMCRAFT_BRAW_BRIDGE` / `FILMCRAFT_R3D_BRIDGE`
-//! or on `PATH`, and a missing bridge yields a clear "unsupported" error naming the variable.
+//! user-provided or shipped beside the app: [`path_opener`] finds them via `FILMCRAFT_BRAW_BRIDGE` /
+//! `FILMCRAFT_R3D_BRIDGE`, next to the app's executable, or on `PATH`, and a missing bridge yields a
+//! clear "unsupported" error naming the variable.
 //!
 //! Frames are full-range sRGB RGB (the SDKs' processed output); audio is extracted once per file
 //! into a cache WAV (`FILMCRAFT_RAWCAM_CACHE`, default `$XDG_CACHE_HOME/filmcraft/rawcam`) and
@@ -473,14 +474,28 @@ pub(crate) fn f16_frames_enabled() -> bool {
     std::env::var_os("FILMCRAFT_RAWCAM_F16").is_none_or(|v| v != "0")
 }
 
+/// The bridge binary: `FILMCRAFT_BRAW_BRIDGE` / `FILMCRAFT_R3D_BRIDGE`, else one shipped with the
+/// app (next to its executable, see [`bundled_bridges`]), else the first on `PATH`.
 fn bridge_path(f: Format) -> Option<PathBuf> {
-    bridge_path_from(std::env::var_os(f.bridge_env()), std::env::var_os("PATH"), f)
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    bridge_path_from(std::env::var_os(f.bridge_env()), exe_dir.as_deref(), std::env::var_os("PATH"), f)
+}
+
+/// Where a bridge shipped with the app may sit, relative to the app's executable directory:
+/// beside it, in a directory of its own there (with the vendor library it loads), or under
+/// `../lib/filmcraft/` (an AppImage's or a distribution package's `usr/bin` → `usr/lib`).
+fn bundled_bridges(exe_dir: &Path, f: Format) -> [PathBuf; 3] {
+    let name = f.bridge_name();
+    [exe_dir.join(name), exe_dir.join(name).join(name), exe_dir.join("../lib/filmcraft").join(name).join(name)]
 }
 
 /// [`bridge_path`] over given environment values (tests).
-fn bridge_path_from(env: Option<std::ffi::OsString>, paths: Option<std::ffi::OsString>, f: Format) -> Option<PathBuf> {
+fn bridge_path_from(env: Option<std::ffi::OsString>, exe_dir: Option<&Path>, paths: Option<std::ffi::OsString>, f: Format) -> Option<PathBuf> {
     if let Some(p) = env.filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(p));
+    }
+    if let Some(found) = exe_dir.and_then(|d| bundled_bridges(d, f).into_iter().find(|c| c.is_file())) {
+        return Some(found);
     }
     paths.and_then(|paths| std::env::split_paths(&paths).map(|dir| dir.join(f.bridge_name())).find(|candidate| candidate.is_file()))
 }
@@ -1659,10 +1674,36 @@ mod tests {
     fn bridge_lookup_prefers_the_env_variable() {
         let dir = std::env::temp_dir();
         let env = dir.join("custom-bridge");
-        assert_eq!(bridge_path_from(Some(env.clone().into_os_string()), Some(dir.clone().into_os_string()), Format::Braw), Some(env));
+        assert_eq!(bridge_path_from(Some(env.clone().into_os_string()), None, Some(dir.clone().into_os_string()), Format::Braw), Some(env));
         // Without env: the first PATH entry holding the binary wins; an empty PATH finds nothing.
         let empty = dir.join(format!("filmcraft-empty-path-{}", std::process::id()));
-        assert_eq!(bridge_path_from(None, Some(empty.into_os_string()), Format::Braw), None);
+        assert_eq!(bridge_path_from(None, Some(&empty), Some(empty.clone().into_os_string()), Format::Braw), None);
+    }
+
+    #[test]
+    fn bridge_lookup_finds_one_shipped_with_the_app() {
+        let root = std::env::temp_dir().join(format!("filmcraft-bundled-bridge-{}", std::process::id()));
+        let bin = root.join("usr/bin");
+        let on_path = root.join("path");
+        for d in [&bin, &on_path, &root.join("usr/lib/filmcraft/braw-bridge")] {
+            std::fs::create_dir_all(d).ok();
+        }
+        std::fs::write(on_path.join("braw-bridge"), b"").ok();
+        let path = Some(on_path.clone().into_os_string());
+        // Nothing next to the app: PATH.
+        assert_eq!(bridge_path_from(None, Some(&bin), path.clone(), Format::Braw), Some(on_path.join("braw-bridge")));
+        // An AppImage-style usr/lib/filmcraft/braw-bridge/braw-bridge wins over PATH...
+        let lib = bin.join("../lib/filmcraft/braw-bridge/braw-bridge");
+        std::fs::write(&lib, b"").ok();
+        assert_eq!(bridge_path_from(None, Some(&bin), path.clone(), Format::Braw), Some(lib));
+        // ...and one in its own directory beside the executable over that.
+        std::fs::create_dir_all(bin.join("braw-bridge")).ok();
+        std::fs::write(bin.join("braw-bridge/braw-bridge"), b"").ok();
+        assert_eq!(bridge_path_from(None, Some(&bin), path.clone(), Format::Braw), Some(bin.join("braw-bridge/braw-bridge")));
+        // The env variable still wins.
+        let env = root.join("custom");
+        assert_eq!(bridge_path_from(Some(env.clone().into_os_string()), Some(&bin), path, Format::Braw), Some(env));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

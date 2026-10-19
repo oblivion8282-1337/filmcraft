@@ -1,8 +1,8 @@
 //! The camera-RAW bridge subprocess protocol: `braw-bridge` / `r3d-bridge` are external helper
 //! binaries that wrap the vendor SDKs (Blackmagic RAW, RED R3D) and stream debayered `rgb24`
 //! frames on stdout with NDJSON events on stderr. The SDKs are licensed, so the bridges are
-//! user-provided: [`crate::rawcam`] looks them up via `FILMCRAFT_BRAW_BRIDGE` /
-//! `FILMCRAFT_R3D_BRIDGE` or on `PATH`.
+//! user-provided or shipped beside the app: [`crate::rawcam`] looks them up via
+//! `FILMCRAFT_BRAW_BRIDGE` / `FILMCRAFT_R3D_BRIDGE`, next to the app's executable, or on `PATH`.
 //!
 //! One-shot invocations (`--probe-only`, `--extract-audio`) answer a single question. Decoding
 //! uses the bridges' `--persistent` command mode instead: the process stays alive, the SDK is
