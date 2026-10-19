@@ -63,6 +63,8 @@ struct Uploaded {
     alpha_scale: f32,
     chroma: (u32, u32),
     last_used: u64,
+    /// GPU memory the textures take (the upload cache's budget).
+    bytes: usize,
     /// The uploaded pixel buffers, kept alive while cached: the cache key is the buffer address,
     /// and a freed buffer's address can be reused by a different frame (stale texture).
     _pixels: PixelData,
@@ -97,6 +99,12 @@ pub struct GpuCompositor {
     pub uploaded_bytes: u64,
     /// Buffers of external (other-process GPU) frames imported into this device.
     imports: external::Imports,
+    /// Most bytes the upload cache keeps of frames the current composite does not use
+    /// ([`UPLOAD_BUDGET`]).
+    pub(crate) upload_budget: usize,
+    /// The clock value the current composite started at: uploads used since are its sources and
+    /// stay cached whatever the budget.
+    frame_start: u64,
     /// Log decode tables as textures, by input transform (the transforms are cached and shared,
     /// so there are a handful at most).
     luts: HashMap<usize, (Arc<filmcraft_color::InputTransform>, wgpu::TextureView)>,
@@ -451,7 +459,14 @@ impl GpuCompositor {
             uploaded_bytes: 0,
             imports: external::Imports::default(),
             luts: HashMap::new(),
+            upload_budget: UPLOAD_BUDGET,
+            frame_start: 0,
         }
+    }
+
+    /// GPU memory the cached uploads take (stats, tests).
+    pub fn cached_upload_bytes(&self) -> usize {
+        self.uploads.values().map(|u| u.bytes).fold(0, usize::saturating_add)
     }
 
     /// The decode-table texture of a layer's input transform (binding 6), or the dummy texture
@@ -564,6 +579,7 @@ impl GpuCompositor {
             return key;
         }
         let (w, h) = (f.width, f.height);
+        let uploaded_before = self.uploaded_bytes;
         let d0 = self.dummy.clone();
         let dummy = || d0.clone();
         let up = match &f.data {
@@ -576,6 +592,7 @@ impl GpuCompositor {
                     alpha_scale: 0.0,
                     chroma: (w, h),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -602,6 +619,7 @@ impl GpuCompositor {
                     alpha_scale: 0.0,
                     chroma: (w, h),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -622,6 +640,7 @@ impl GpuCompositor {
                     alpha_scale: 0.0,
                     chroma: (w, h),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -642,6 +661,7 @@ impl GpuCompositor {
                     alpha_scale: 0.0,
                     chroma: (w, h),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -660,6 +680,7 @@ impl GpuCompositor {
                     alpha_scale,
                     chroma: (cw, ch),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -689,20 +710,44 @@ impl GpuCompositor {
                     alpha_scale,
                     chroma: (cw, ch),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
         };
-        self.uploads.insert(key, up);
-        // keep the most recent uploads (enough for several stacked layers + playback lookahead)
-        if self.uploads.len() > 24 {
-            let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
-            v.sort_unstable();
-            for (_, k) in v.into_iter().take(self.uploads.len() - 24) {
-                self.uploads.remove(&k);
+        // what the textures take: the bytes uploaded for them, or (a GPU copy of an external
+        // frame) its size in the texture's format
+        let copied = match &f.data {
+            PixelData::External(e) if self.uploaded_bytes == uploaded_before => {
+                (w as usize) * (h as usize) * if e.layout() == filmcraft_frame::ExternalLayout::RgbaF16 { 8 } else { 4 }
             }
-        }
+            _ => 0,
+        };
+        let up = Uploaded { bytes: (self.uploaded_bytes - uploaded_before) as usize + copied, ..up };
+        self.uploads.insert(key, up);
+        self.trim_uploads();
         key
+    }
+
+    /// Keep the most recent uploads — enough for several stacked layers, a still or a title held
+    /// over many frames, and the frame a paused monitor redraws while its controls move — within
+    /// [`MAX_UPLOADS`] and the memory budget, least recently used first. A frame played once is
+    /// not shown again, and a 6K 16-bit frame is ~124 MB: by count alone the cache held gigabytes
+    /// of them. The sources of the composite being built are never dropped.
+    fn trim_uploads(&mut self) {
+        let mut total = self.cached_upload_bytes();
+        if self.uploads.len() <= MAX_UPLOADS && total <= self.upload_budget {
+            return;
+        }
+        let mut v: Vec<(u64, (usize, u32, u32), usize)> = self.uploads.iter().map(|(k, u)| (u.last_used, *k, u.bytes)).collect();
+        v.sort_unstable();
+        for (used, k, bytes) in v {
+            if (self.uploads.len() <= MAX_UPLOADS && total <= self.upload_budget) || used >= self.frame_start {
+                break;
+            }
+            self.uploads.remove(&k);
+            total = total.saturating_sub(bytes);
+        }
     }
 
     /// The source description of an uploaded frame.
@@ -853,6 +898,8 @@ impl GpuCompositor {
             FramePlan::Composite { width, height, steps } => return self.composite_steps(*width, *height, steps, prep),
         };
         let (w, h) = (w.max(1), h.max(1));
+        // this composite's uploads are protected from the cache trimming until the next one
+        self.frame_start = self.clock + 1;
         let accum_view = Self::target(&self.device, &mut self.accum, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_SRC);
         let backdrop_view = if layers.iter().any(|l| l.blend.reads_destination()) {
             Some(Self::target(&self.device, &mut self.backdrop, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_DST))
@@ -1301,6 +1348,10 @@ struct SrcInfo {
 
 /// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
 const UNIFORM_FLOATS: usize = 56;
+/// Most frames the upload cache keeps.
+const MAX_UPLOADS: usize = 24;
+/// Most bytes the upload cache keeps of frames the composite being drawn does not use.
+const UPLOAD_BUDGET: usize = 512 << 20;
 
 /// Poll a future once: wgpu's native error scopes resolve immediately. `None` if it is still
 /// pending (then the caller assumes the worst).

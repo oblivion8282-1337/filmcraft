@@ -752,3 +752,38 @@ fn a_half_float_external_frame_composites_like_its_8_bit_picture() {
     let err = host.iter().zip(&got).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
     assert!(err <= 1, "max error {err} code values");
 }
+
+/// The upload cache is bounded by memory as well as by count: frames played once are let go
+/// once past the budget — but never a source of the frame being drawn, even when that frame
+/// alone needs more than the budget (every layer must still be there).
+#[test]
+fn the_upload_cache_keeps_to_its_memory_budget_but_never_drops_the_frame_being_drawn() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (64u32, 32u32);
+    let frame_bytes = (w * h * 4) as usize;
+    c.upload_budget = 3 * frame_bytes;
+    let solid = |v: u8| Arc::new(VideoFrame::rgba8(w, h, [v, v, v, 255].repeat((w * h) as usize)));
+    // playback: one frame after the other
+    for v in 0..10u8 {
+        c.composite(&FramePlan::Layers {
+            width: w as usize,
+            height: h as usize,
+            layers: vec![PlanLayer::new(solid(v * 20), Affine::IDENTITY, 1.0, Blend::Normal)],
+        });
+        assert!(c.cached_upload_bytes() <= 3 * frame_bytes, "frame {v}: {} bytes cached", c.cached_upload_bytes());
+    }
+    // one frame of five layers (5 × the budget's third): side by side, each must be drawn
+    let layers: Vec<PlanLayer> =
+        (0..5u8).map(|i| PlanLayer::new(solid(40 + i * 40), Affine::translate(f64::from(i) * f64::from(w), 0.0), 1.0, Blend::Normal)).collect();
+    c.composite(&FramePlan::Layers { width: (5 * w) as usize, height: h as usize, layers });
+    let (_, _, out) = c.read_output().expect("readback");
+    for i in 0..5usize {
+        let x = i * w as usize + w as usize / 2;
+        let px = &out[(h as usize / 2 * 5 * w as usize + x) * 4..][..3];
+        assert!(px.iter().all(|v| *v > 20), "layer {i} missing: {px:?}");
+    }
+}
