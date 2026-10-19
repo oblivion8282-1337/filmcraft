@@ -556,6 +556,19 @@ fn hdr_input_gpu_matches_cpu() {
 /// Hands out buffers it was given, by memory id (stands in for a real cross-process import).
 struct TestImporter(std::sync::Mutex<HashMap<u64, wgpu::Buffer>>);
 
+/// The process's one test importer (the registration is process-wide and tests run side by
+/// side): each test files its buffers under ids of its own.
+fn test_importer() -> Arc<TestImporter> {
+    static IMPORTER: std::sync::OnceLock<Arc<TestImporter>> = std::sync::OnceLock::new();
+    IMPORTER
+        .get_or_init(|| {
+            let i = Arc::new(TestImporter(std::sync::Mutex::new(HashMap::new())));
+            external::register_importer(i.clone());
+            i
+        })
+        .clone()
+}
+
 impl external::ExternalImporter for TestImporter {
     fn import(&self, _device: &wgpu::Device, memory: &filmcraft_frame::ExternalMemory) -> Option<wgpu::Buffer> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&memory.id()).cloned()
@@ -591,7 +604,7 @@ fn an_external_frame_composites_like_its_host_pixels() {
         }
         out
     };
-    let importer = Arc::new(TestImporter(std::sync::Mutex::new(HashMap::new())));
+    let importer = test_importer();
     for (id, bgra) in [(1u64, false), (2, true)] {
         let buf = wgpu::util::DeviceExt::create_buffer_init(
             &dev,
@@ -599,7 +612,6 @@ fn an_external_frame_composites_like_its_host_pixels() {
         );
         importer.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, buf);
     }
-    external::register_importer(importer);
     let fallbacks = Arc::new(AtomicU32::new(0));
     let frame = |id: u64, layout| {
         let (px, n) = (rgba.clone(), fallbacks.clone());
@@ -631,4 +643,54 @@ fn an_external_frame_composites_like_its_host_pixels() {
     assert_eq!(render(&mut c, frame(3, ExternalLayout::Rgba8)), host, "fallback");
     assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
     assert_eq!((c.external_copies(), c.external_fallbacks()), (2, 1));
+}
+
+/// A 16-bit external frame (linear half floats, ADR 0002) composites like the same picture as an
+/// 8-bit host frame, within the 8-bit rounding: it is copied into a half-float texture and drawn
+/// as premultiplied linear light, with rows padded to 256 bytes.
+#[test]
+fn a_half_float_external_frame_composites_like_its_8_bit_picture() {
+    use filmcraft_frame::{ExternalImage, ExternalLayout, ExternalMemory};
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let (w, h) = (37u32, 5u32);
+    let rgba: Vec<u8> = (0..w * h * 4).map(|i| if i % 4 == 3 { 255 } else { (i * 29 % 253) as u8 }).collect();
+    let pitch = 512u32; // 37 px × 8 bytes = 296, padded to 512
+    let mut halves = vec![0u8; (pitch * h) as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            for c in 0..4 {
+                let v = rgba[(y * w as usize + x) * 4 + c];
+                let lin = if c == 3 { v as f32 / 255.0 } else { filmcraft_color::srgb_u8_to_linear_table()[v as usize] };
+                let d = y * pitch as usize + x * 8 + c * 2;
+                halves[d..d + 2].copy_from_slice(&f32_to_f16(lin).to_le_bytes());
+            }
+        }
+    }
+    let buf = wgpu::util::DeviceExt::create_buffer_init(
+        &dev,
+        &wgpu::util::BufferInitDescriptor { label: None, contents: &halves, usage: wgpu::BufferUsages::COPY_SRC },
+    );
+    test_importer().0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(77, buf);
+    let mem = Arc::new(ExternalMemory::new(77, u64::from(pitch * h), [0; 16], Box::new(())));
+    let ext = Arc::new(VideoFrame {
+        width: w,
+        height: h,
+        data: PixelData::External(Arc::new(ExternalImage::new(mem, 0, pitch, ExternalLayout::RgbaF16, Box::new(|| None), None))),
+        color: filmcraft_color::ColorInfo::SRGB_FULL,
+        par: (1, 1),
+        pts: Default::default(),
+    });
+    let mut c = GpuCompositor::new(&dev, &q);
+    let render = |c: &mut GpuCompositor, f: Arc<VideoFrame>| {
+        c.composite(&FramePlan::Layers { width: w as usize, height: h as usize, layers: vec![PlanLayer::new(f, Affine::IDENTITY, 1.0, Blend::Normal)] });
+        c.read_output().expect("readback").2
+    };
+    let host = render(&mut c, Arc::new(VideoFrame::rgba8(w, h, rgba.clone())));
+    let got = render(&mut c, ext);
+    assert_eq!(c.external_copies(), 1, "copied on the GPU, not uploaded from the fallback");
+    let err = host.iter().zip(&got).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+    assert!(err <= 1, "max error {err} code values");
 }

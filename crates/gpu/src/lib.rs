@@ -526,17 +526,17 @@ impl GpuCompositor {
             PixelData::External(e) => {
                 // a GPU copy from the imported buffer, or (no importer, a failed import) the CPU
                 // fallback's pixels uploaded like any RGBA8 frame
-                let v = match self.imports.texture(&self.device, &self.queue, e, w, h) {
-                    Some(v) => v,
+                let (v, kind) = match self.imports.texture(&self.device, &self.queue, e, w, h) {
+                    Some(t) => t,
                     None => {
                         self.imports.fallbacks += 1;
                         let px = e.rgba8(w, h);
-                        self.plane_texture(w, h, wgpu::TextureFormat::Rgba8UnormSrgb, &px, 4)
+                        (self.plane_texture(w, h, wgpu::TextureFormat::Rgba8UnormSrgb, &px, 4), 0)
                     }
                 };
                 Uploaded {
                     views: [v, dummy(), dummy(), dummy()],
-                    kind: 0,
+                    kind,
                     code_scale: 1.0,
                     alpha_scale: 0.0,
                     chroma: (w, h),

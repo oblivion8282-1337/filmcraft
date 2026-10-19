@@ -89,6 +89,8 @@ pub struct Caps {
     pub gpu_export: bool,
     /// Frames in exportable GPU memory are on (the `ready` event of a bridge given the socket).
     pub gpu: bool,
+    /// GPU frames can come as linear half floats (`frame … gpu f16`), the decode's full precision.
+    pub f16: bool,
 }
 
 impl Caps {
@@ -102,6 +104,7 @@ impl Caps {
                 "multi" => caps.multi = true,
                 "gpu" => caps.gpu = true,
                 "gpu-export" => caps.gpu_export = true,
+                "f16" => caps.f16 = true,
                 _ => {}
             }
         }
@@ -136,6 +139,8 @@ pub enum FrameFormat {
     Rgba8,
     /// 4 bytes per pixel, B G R A — one in-place channel swap away from RGBA.
     Bgra8,
+    /// 8 bytes per pixel: half floats R G B A, linear light, premultiplied (GPU frames only).
+    RgbaF16,
 }
 
 impl FrameFormat {
@@ -145,6 +150,7 @@ impl FrameFormat {
             Some("rgb24") => Some(Self::Rgb24),
             Some("rgba8") => Some(Self::Rgba8),
             Some("bgra8") => Some(Self::Bgra8),
+            Some("rgbaf16") => Some(Self::RgbaF16),
             _ => None,
         }
     }
@@ -154,6 +160,7 @@ impl FrameFormat {
         match self {
             Self::Rgb24 => 3,
             Self::Rgba8 | Self::Bgra8 => 4,
+            Self::RgbaF16 => 8,
         }
     }
 }
@@ -223,10 +230,10 @@ impl Drop for GpuRelease {
     }
 }
 
-/// Whether a `width`×`height` RGBA/BGRA frame with rows `pitch` apart fits `size` bytes from
-/// offset 0, with the rows aligned as a GPU copy needs (256 bytes).
-pub fn gpu_layout_fits(width: u32, height: u32, pitch: u32, size: u64) -> bool {
-    let row = u64::from(width) * 4;
+/// Whether a `width`×`height` frame of `bpp`-byte pixels with rows `pitch` apart fits `size`
+/// bytes from offset 0, with the rows aligned as a GPU copy needs (256 bytes).
+pub fn gpu_layout_fits(width: u32, height: u32, bpp: u32, pitch: u32, size: u64) -> bool {
+    let row = u64::from(width) * u64::from(bpp);
     width > 0 && height > 0 && pitch.is_multiple_of(256) && u64::from(pitch) >= row && u64::from(pitch) * u64::from(height - 1) + row <= size
 }
 
@@ -1633,6 +1640,9 @@ impl MultiBridge {
     /// asks for the frame in GPU memory (only with a scale word, and only while exports work).
     fn send_frame(&self, handle: u64, index: u64, scale: Option<&str>, gpu: bool) -> Result<mpsc::Receiver<Delivery>, String> {
         let line = match scale {
+            Some(word) if gpu && self.gpu_device().is_some() && self.caps().f16 && super::f16_frames_enabled() => {
+                format!("frame {handle} {index} {word} gpu f16\n")
+            }
             Some(word) if gpu && self.gpu_device().is_some() => format!("frame {handle} {index} {word} gpu\n"),
             Some(word) => format!("frame {handle} {index} {word}\n"),
             None => format!("frame {handle} {index}\n"),
@@ -1960,7 +1970,7 @@ impl ClipSession {
             }
             return Ok(Err(format!("GPU buffer {} never arrived", gpu.buffer)));
         };
-        if !gpu_layout_fits(width, height, gpu.pitch, memory.size()) {
+        if !gpu_layout_fits(width, height, format.bytes_per_pixel() as u32, gpu.pitch, memory.size()) {
             return Ok(Err(format!("GPU frame {width}×{height} (pitch {}) does not fit buffer {} ({} bytes)", gpu.pitch, gpu.buffer, memory.size())));
         }
         Ok(Ok(FrameBytes { data: Vec::new(), width, height, format, gpu: Some(GpuFrame { memory, pitch: gpu.pitch, release: Arc::new(release) }) }))
@@ -1998,7 +2008,7 @@ mod tests {
         let v2 =
             r#"{"type":"metadata","timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":2,"caps":"scale,frame-errors,warp"}"#;
         let Some(Event::Metadata(m)) = parse_event(v2) else { panic!("metadata v2") };
-        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false, multi: false, gpu_export: false, gpu: false }));
+        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false, multi: false, gpu_export: false, gpu: false, f16: false }));
         assert_eq!(
             parse_event(r#"{"type":"error","index":12,"message":"frame index 12 beyond clip"}"#),
             Some(Event::FrameError { index: 12, message: "frame index 12 beyond clip".into() })

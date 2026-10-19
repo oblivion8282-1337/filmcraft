@@ -44,6 +44,13 @@ stays, unchanged, as the fallback for everything else.
   and the usual `verify` event; no pixels on stdout. Rows are `P` bytes apart (`P` a multiple of
   256, as wgpu requires for buffer → texture copies), starting at offset 0. All GPU work writing
   the buffer has completed (stream synchronised) before the event is written.
+- **16 bits (`f16`):** a bridge whose decode has more than 8 bits (R3D: REDCuda's 16-bit RGB)
+  lists `f16` in the `ready` caps and answers `frame <h> <i> <scale> gpu f16` with
+  `"format":"rgbaf16"`: four IEEE 754 half floats per pixel (8 bytes, little-endian), linear
+  light — the sRGB EOTF applied to the very values the 8-bit path rounds — premultiplied by
+  alpha. That is the compositor's working precision (`Rgba16Float`), so the decode reaches it
+  uncut. FilmCraft asks for it whenever the bridge offers it (`FILMCRAFT_RAWCAM_F16=0` keeps 8
+  bits); the CPU fallback of such a frame still reads 8-bit pixels.
 - **Ownership:** a buffer named in a reply is the client's until it sends `release-gpu <B>`;
   the bridge never writes it meanwhile. A frame the bridge cannot (or will not) export — no
   buffer free under its export budget, an allocation failure — comes the old way; the client
@@ -75,15 +82,25 @@ stays, unchanged, as the fallback for everything else.
   `hal::vulkan::Buffer::from_raw_externally_owned` and `Device::create_buffer_from_hal`. It reads
   the adapter's `deviceUUID` (`VkPhysicalDeviceIDProperties`) for the UUID match. The app
   registers it at start-up.
-- Frames held as external count their bytes in the camera-RAW cache budget like host frames.
+- **Buffers go back as soon as they are copied.** The picture holds its buffer as a lease the
+  compositor takes for its copy and drops once the copy has run on the GPU; the texture keeps the
+  picture. Holding buffers for as long as some cache (the RAW cache, the monitor's plan cache,
+  the compositor's upload cache) held the frame filled the bridge's export budget within seconds
+  of playback, and the rest came over the host. A cached picture whose buffer went back is
+  *spent*: the source decodes it again when it is asked for once more. While it holds its
+  buffer, an external frame counts its bytes in the camera-RAW cache budget like a host frame.
+- The Source monitor composites media on the GPU as well (`plan_item`, `Target::ItemPlan`), with
+  a compositor and texture of its own, so its frames take the same path.
+- `perf.stats` reports `decode.rawcam` (GPU frames, host frames although the GPU was wanted,
+  other host frames, CPU fallbacks) and `gpu.externalCopies` / `gpu.externalFallbacks`.
 
 ## Consequences
 
 - Linux + NVIDIA + Vulkan first. Windows is the same design with Win32 handles
   (`CU_MEM_HANDLE_TYPE_WIN32`, `VK_KHR_external_memory_win32`, `DuplicateHandle` instead of
   `SCM_RIGHTS`); macOS has no CUDA and keeps the host path.
-- Frames cached as external live in the bridge's VRAM instead of FilmCraft's RAM; the cache
-  budgets bound both.
+- Buffers in flight live in the bridge's VRAM; they go back after the GPU copy (measured: the
+  BRAW bridge at ~0.5 GB while playing 6K, against 2.1 GB when cached frames kept them).
 - No timeline semaphores: the bridge synchronises its stream before announcing a frame, and the
-  client releases a buffer only after the frame is dropped *and* every GPU copy reading it has
-  completed (the compositor holds the frame until `on_submitted_work_done` of its copy).
+  client gives a buffer back only once its GPU copy has completed (the lease is dropped in
+  `on_submitted_work_done`).

@@ -46,12 +46,26 @@ impl std::fmt::Debug for ExternalMemory {
     }
 }
 
-/// The byte order of an external picture's pixels (8 bits per channel, sRGB/709-encoded,
-/// straight alpha).
+/// The pixel layout of an external picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalLayout {
+    /// 8 bits per channel, sRGB/709-encoded, straight alpha.
     Rgba8,
+    /// As `Rgba8`, blue first.
     Bgra8,
+    /// Half floats (IEEE 754, little-endian) per channel, linear light, premultiplied alpha — the
+    /// compositor's working precision (a 16-bit decode that is not cut to 8 bits).
+    RgbaF16,
+}
+
+impl ExternalLayout {
+    /// Bytes one pixel takes.
+    pub fn bytes_per_pixel(self) -> u32 {
+        match self {
+            ExternalLayout::Rgba8 | ExternalLayout::Bgra8 => 4,
+            ExternalLayout::RgbaF16 => 8,
+        }
+    }
 }
 
 /// Supplies an external picture's pixels to the CPU: tightly packed RGBA8 rows, or `None` when

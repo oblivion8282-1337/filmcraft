@@ -46,7 +46,8 @@ fn real_gpu_frames_composite_like_host_frames() {
     let mut c = GpuCompositor::new(&dev, &queue);
     for (k, scale) in [(3, 1.0), (4, 0.5), (5, 0.25)] {
         let gpu = filmcraft_media::cancel::with_gpu_frames(true, || src.video_frame(req(k, scale))).unwrap_or_else(|e| panic!("frame {k}: {e:?}"));
-        let PixelData::External(_) = &gpu.data else { panic!("frame {k} at {scale}: a GPU frame, got {}", gpu.format_label()) };
+        let PixelData::External(img) = &gpu.data else { panic!("frame {k} at {scale}: a GPU frame, got {}", gpu.format_label()) };
+        let layout = img.layout();
         let copies = c.external_copies();
         let via_gpu = composite(&mut c, gpu.clone());
         assert_eq!(c.external_copies(), copies + 1, "frame {k}: imported and copied on the GPU");
@@ -55,8 +56,14 @@ fn real_gpu_frames_composite_like_host_frames() {
         let via_host = composite(&mut c, host);
         assert_eq!(via_gpu.len(), via_host.len());
         let diff = via_gpu.iter().zip(&via_host).filter(|(a, b)| a != b).count();
-        eprintln!("frame {k} at {scale} ({}×{}): {diff} differing bytes", gpu.width, gpu.height);
-        assert_eq!(diff, 0, "frame {k}: GPU path and host path composite alike");
+        let max = via_gpu.iter().zip(&via_host).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        eprintln!("frame {k} at {scale} ({}×{}, {layout:?}): {diff} differing bytes, at most {max}", gpu.width, gpu.height);
+        if layout == filmcraft_frame::ExternalLayout::RgbaF16 {
+            // the 16-bit decode against its 8-bit rounding: within one code value
+            assert!(max <= 1, "frame {k}: 16-bit GPU path within 1 of the 8-bit host path");
+        } else {
+            assert_eq!(diff, 0, "frame {k}: GPU path and host path composite alike");
+        }
     }
 
     // Time decode + composite of 24 full-resolution frames per path (fresh frames each).
@@ -79,4 +86,58 @@ fn real_gpu_frames_composite_like_host_frames() {
         "full resolution, decode + composite per frame: GPU path {gpu_ms:.1} ms ({gpu_ext}/24 GPU frames), host path {host_ms:.1} ms ({host_ext}/24 GPU frames)"
     );
     assert!(gpu_ext >= 20, "the GPU path decodes into GPU memory");
+}
+
+/// Playback throughput at full resolution: frame workers asking for consecutive frames at once
+/// (as the Program monitor's do), over the GPU path (each worker takes the frame's buffer and
+/// gives it back, as the compositor does after its copy) and over the host path, 1 and 4
+/// workers, on disjoint frame ranges so no run reads another's cache. `cargo test --release`.
+#[test]
+#[ignore = "needs a real camera file (FILMCRAFT_RAWCAM_REAL), its vendor bridge and a CUDA GPU"]
+fn real_playback_throughput_gpu_vs_host() {
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    let Some(path) = std::env::var_os("FILMCRAFT_RAWCAM_REAL").map(std::path::PathBuf::from) else {
+        panic!("set FILMCRAFT_RAWCAM_REAL to a .braw/.R3D file");
+    };
+    let Some((dev, _queue)) = device() else { panic!("no Vulkan device") };
+    assert!(filmcraft_platform::vk_interop::register(&dev));
+    let src = match filmcraft_codecs::rawcam::path_opener(&path) {
+        Some(Ok(s)) => s,
+        other => panic!("open failed: {:?}", other.map(|r| r.err())),
+    };
+    let rate = src.info().frame_rate();
+    let per_run = 72;
+    let _ = src.video_frame(FrameRequest { time: Tick::ZERO, scale: 1.0 }); // start the bridge
+    let mut start = 1;
+    for (gpu, workers) in [(false, 1), (true, 1), (false, 4), (true, 4)] {
+        let next = AtomicI64::new(start);
+        let external = AtomicUsize::new(0);
+        let end = start + per_run;
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| {
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= end {
+                            break;
+                        }
+                        let req = FrameRequest { time: Tick::from_rational(k, rate.den, rate.num), scale: 1.0 };
+                        let f = filmcraft_media::cancel::with_gpu_frames(gpu, || src.video_frame(req)).unwrap_or_else(|e| panic!("frame {k}: {e:?}"));
+                        if let PixelData::External(img) = &f.data {
+                            external.fetch_add(1, Ordering::Relaxed);
+                            drop(img.take_gpu()); // what the compositor does once it copied the frame
+                        }
+                    }
+                });
+            }
+        });
+        let fps = per_run as f64 / t.elapsed().as_secs_f64();
+        eprintln!(
+            "{} path, {workers} worker(s), full resolution: {fps:.1} fps ({}/{per_run} GPU frames)",
+            if gpu { "GPU " } else { "host" },
+            external.load(Ordering::Relaxed)
+        );
+        start = end + 20;
+    }
 }

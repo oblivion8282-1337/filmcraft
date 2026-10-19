@@ -29,18 +29,22 @@ fn importer() -> Option<Arc<dyn ExternalImporter>> {
     IMPORTER.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// The texture format an external layout is sampled as (sRGB-encoded, like `Rgba8` frames).
-fn texture_format(layout: ExternalLayout) -> wgpu::TextureFormat {
+/// The texture format an external layout is sampled as (8-bit layouts sRGB-encoded like `Rgba8`
+/// frames, half floats as they are), and the compositor's source kind for it (0: RGBA, 1:
+/// premultiplied linear float).
+fn texture_format(layout: ExternalLayout) -> (wgpu::TextureFormat, u32) {
     match layout {
-        ExternalLayout::Rgba8 => wgpu::TextureFormat::Rgba8UnormSrgb,
-        ExternalLayout::Bgra8 => wgpu::TextureFormat::Bgra8UnormSrgb,
+        ExternalLayout::Rgba8 => (wgpu::TextureFormat::Rgba8UnormSrgb, 0),
+        ExternalLayout::Bgra8 => (wgpu::TextureFormat::Bgra8UnormSrgb, 0),
+        ExternalLayout::RgbaF16 => (wgpu::TextureFormat::Rgba16Float, 1),
     }
 }
 
-/// Whether a `width`×`height` picture at `offset` with rows `pitch` apart lies inside `size`
-/// bytes and meets wgpu's copy rules (rows a multiple of 256 bytes, at least a row of pixels).
-pub(crate) fn layout_fits(width: u32, height: u32, offset: u64, pitch: u32, size: u64) -> bool {
-    let row = u64::from(width) * 4;
+/// Whether a `width`×`height` picture of `bpp`-byte pixels at `offset` with rows `pitch` apart
+/// lies inside `size` bytes and meets wgpu's copy rules (rows a multiple of 256 bytes, at least a
+/// row of pixels).
+pub(crate) fn layout_fits(width: u32, height: u32, bpp: u32, offset: u64, pitch: u32, size: u64) -> bool {
+    let row = u64::from(width) * u64::from(bpp);
     if width == 0 || height == 0 || !pitch.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) || u64::from(pitch) < row || !offset.is_multiple_of(4) {
         return false;
     }
@@ -72,10 +76,10 @@ impl Imports {
         img: &Arc<ExternalImage>,
         width: u32,
         height: u32,
-    ) -> Option<wgpu::TextureView> {
+    ) -> Option<(wgpu::TextureView, u32)> {
         let lease = img.take_gpu()?;
         let memory = &lease.memory;
-        if !layout_fits(width, height, img.offset(), img.pitch(), memory.size()) {
+        if !layout_fits(width, height, img.layout().bytes_per_pixel(), img.offset(), img.pitch(), memory.size()) {
             log::warn!("GPU frame {width}×{height} (pitch {}, offset {}) does not fit its {}-byte buffer", img.pitch(), img.offset(), memory.size());
             return None;
         }
@@ -94,7 +98,7 @@ impl Imports {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: texture_format(img.layout()),
+            format: texture_format(img.layout()).0,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -112,7 +116,7 @@ impl Imports {
         // run on the GPU, not when it was submitted.
         queue.on_submitted_work_done(move || drop(lease));
         self.copies += 1;
-        Some(texture.create_view(&Default::default()))
+        Some((texture.create_view(&Default::default()), texture_format(img.layout()).1))
     }
 }
 
@@ -123,13 +127,16 @@ mod tests {
     #[test]
     fn a_layout_must_lie_inside_its_buffer_and_keep_wgpus_row_alignment() {
         // 6048 px: a 24192-byte row, padded to 24320
-        assert!(layout_fits(6048, 2556, 0, 24320, 24320 * 2556));
-        assert!(!layout_fits(6048, 2556, 0, 24192, 24192 * 2556), "rows must be 256-byte aligned");
-        assert!(layout_fits(6048, 2556, 0, 24320, 24320 * 2555 + 24192), "the last row needs only its pixels");
-        assert!(!layout_fits(6048, 2556, 0, 24320, 24320 * 2555 + 24191), "short buffer");
-        assert!(!layout_fits(64, 2, 0, 128, 1 << 20), "pitch below a row of pixels");
-        assert!(!layout_fits(0, 2, 0, 256, 1 << 20));
-        assert!(!layout_fits(64, 2, u64::MAX - 8, 256, u64::MAX), "overflowing end");
-        assert!(layout_fits(64, 2, 512, 256, 512 + 256 + 256));
+        assert!(layout_fits(6048, 2556, 4, 0, 24320, 24320 * 2556));
+        assert!(!layout_fits(6048, 2556, 4, 0, 24192, 24192 * 2556), "rows must be 256-byte aligned");
+        assert!(layout_fits(6048, 2556, 4, 0, 24320, 24320 * 2555 + 24192), "the last row needs only its pixels");
+        assert!(!layout_fits(6048, 2556, 4, 0, 24320, 24320 * 2555 + 24191), "short buffer");
+        assert!(!layout_fits(64, 2, 4, 0, 128, 1 << 20), "pitch below a row of pixels");
+        assert!(!layout_fits(0, 2, 4, 0, 256, 1 << 20));
+        assert!(!layout_fits(64, 2, 4, u64::MAX - 8, 256, u64::MAX), "overflowing end");
+        assert!(layout_fits(64, 2, 4, 512, 256, 512 + 256 + 256));
+        // half floats: 8 bytes a pixel
+        assert!(layout_fits(32, 2, 8, 0, 256, 512));
+        assert!(!layout_fits(33, 2, 8, 0, 256, 1 << 20), "a 264-byte row in 256-byte rows");
     }
 }

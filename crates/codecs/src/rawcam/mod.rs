@@ -421,7 +421,43 @@ fn host_rgba(reply: bridge::FrameBytes) -> Vec<u8> {
             }
             rgba
         }
+        // (bridges send half floats only into GPU memory; read one that came anyway)
+        bridge::FrameFormat::RgbaF16 => {
+            let mut rgba = Vec::with_capacity(reply.data.len() / 2);
+            for px in reply.data.as_chunks::<8>().0 {
+                let ch = |i: usize| half_to_f32(u16::from_le_bytes([px[i * 2], px[i * 2 + 1]]));
+                let a = ch(3).clamp(0.0, 1.0);
+                let straight = |v: f32| if a > 0.0 { v / a } else { 0.0 };
+                rgba.extend([ch(0), ch(1), ch(2)].map(|v| filmcraft_color::linear_to_srgb_u8(straight(v))));
+                rgba.push((a * 255.0).round() as u8);
+            }
+            rgba
+        }
     }
+}
+
+/// An IEEE 754 half float.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let man = f32::from(h & 0x3ff);
+    sign * match exp {
+        0 => man * (2f32).powi(-24),
+        31 => {
+            if man == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        e => (1.0 + man / 1024.0) * (2f32).powi(e - 15),
+    }
+}
+
+/// Whether to ask bridges that can for 16-bit (half-float) GPU frames (`FILMCRAFT_RAWCAM_F16=0`
+/// keeps them at 8 bits).
+pub(crate) fn f16_frames_enabled() -> bool {
+    std::env::var_os("FILMCRAFT_RAWCAM_F16").is_none_or(|v| v != "0")
 }
 
 fn bridge_path(f: Format) -> Option<PathBuf> {
@@ -1039,7 +1075,8 @@ impl RawCamSource {
             Some(gpu) => {
                 let layout = match reply.format {
                     bridge::FrameFormat::Bgra8 => filmcraft_frame::ExternalLayout::Bgra8,
-                    _ => filmcraft_frame::ExternalLayout::Rgba8,
+                    bridge::FrameFormat::RgbaF16 => filmcraft_frame::ExternalLayout::RgbaF16,
+                    bridge::FrameFormat::Rgba8 | bridge::FrameFormat::Rgb24 => filmcraft_frame::ExternalLayout::Rgba8,
                 };
                 let me = self.self_ref.get().cloned().unwrap_or_default();
                 let fetch: filmcraft_frame::external::CpuFallback = Box::new(move || me.upgrade()?.host_pixels(idx, tier));
@@ -2644,7 +2681,8 @@ sock = None
 if "--gpu-export" in args:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(args[args.index("--gpu-export") + 1])
 gpu = ',"gpu_uuid":"000102030405060708090a0b0c0d0e0f"' if sock else ""
-err('{"type":"ready","protocol":3,"caps":"' + CAPS + (",gpu" if sock else "") + '"' + gpu + "}")
+F16 = False
+err('{"type":"ready","protocol":3,"caps":"' + CAPS + (",gpu" + (",f16" if F16 else "") if sock else "") + '"' + gpu + "}")
 fds, free, nxt = {}, [], 1
 for line in sys.stdin:
     log.write(line); log.flush()
@@ -2659,6 +2697,12 @@ for line in sys.stdin:
         head = '{"type":"frame","handle":%s,"index":%d,"width":%d,"height":%d,"format":"rgba8"' % (h, i, W, H)
         tail = '{"type":"verify","handle":%s,"index":%d,"width":%d,"height":%d}' % (h, i, W, H)
         if len(w) > 4 and w[4] == "gpu" and sock:
+            f16 = len(w) > 5 and w[5] == "f16"
+            if f16:
+                x = ((i + 1) % 256) / 255.0
+                lin = x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+                px = struct.pack("<eeee", lin, lin, lin, 1.0)
+                head = head.replace('"rgba8"', '"rgbaf16"')
             if free:
                 b = free.pop()
             else:
@@ -2675,6 +2719,59 @@ for line in sys.stdin:
     elif w[0] == "quit":
         break
 "#;
+
+    /// A half-float frame that comes over the host after all reads as the same 8-bit picture:
+    /// half floats decoded exactly (normal, subnormal, zero), unpremultiplied, sRGB-encoded.
+    #[test]
+    fn half_float_host_frames_read_as_rgba8() {
+        assert_eq!(half_to_f32(0x3c00), 1.0);
+        assert_eq!(half_to_f32(0x0000), 0.0);
+        assert_eq!(half_to_f32(0xc000), -2.0);
+        assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+        assert!((half_to_f32(0x1376) - 0.000_911).abs() < 1e-6);
+        let px = |v: u16, a: u16| [v, v, v, a].iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<u8>>();
+        let data = [px(0x1376, 0x3c00), px(0x3c00, 0x3c00), px(0x0000, 0x0000)].concat();
+        let rgba = host_rgba(bridge::FrameBytes { data, width: 3, height: 1, format: bridge::FrameFormat::RgbaF16, gpu: None });
+        assert_eq!(rgba, vec![3, 3, 3, 255, 255, 255, 255, 255, 0, 0, 0, 0]);
+    }
+
+    /// R3D's 16-bit decode reaches the compositor uncut (ADR 0002): a bridge announcing `f16` is
+    /// asked for `gpu f16` frames and answers linear half floats, which become an external
+    /// picture of that layout; the CPU fallback still reads the same picture in 8 bits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_16_bit_bridge_hands_out_half_float_gpu_frames() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3").arg("-c").arg("import os; os.memfd_create").status().map_or(true, |s| !s.success()) {
+            eprintln!("no python3 with memfd_create; skipping");
+            return;
+        }
+        let (dir, paths) = clips("gpuf16", &["placeholder"]);
+        let bridge = dir.join("gpu-bridge");
+        std::fs::write(&bridge, FAKE_GPU_BRIDGE.replace("F16 = False", "F16 = True")).ok();
+        std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).ok();
+        // (process-wide, and never withdrawn: tests run side by side; only bridges announcing
+        // `gpu-export` are affected)
+        let uuid: [u8; 16] = std::array::from_fn(|i| i as u8);
+        filmcraft_frame::external::set_import_device(Some(uuid));
+        let src = paths.first().map(|p| open_quiet(p, &bridge, &dir)).unwrap_or_else(|| panic!("clip"));
+        let f = filmcraft_media::cancel::with_gpu_frames(true, || src.video_frame(FrameRequest { time: Tick::from_rational(2, 1, 24), scale: 1.0 }))
+            .unwrap_or_else(|e| panic!("gpu frame: {e:?}"));
+        let filmcraft_frame::PixelData::External(img) = &f.data else { panic!("a GPU frame, got {}", f.format_label()) };
+        assert_eq!((img.layout(), img.pitch()), (filmcraft_frame::ExternalLayout::RgbaF16, 256));
+        let memory = img.memory().unwrap_or_else(|| panic!("the frame holds its buffer"));
+        let fd = memory.handle().downcast_ref::<std::os::fd::OwnedFd>().and_then(|fd| fd.try_clone().ok()).unwrap_or_else(|| panic!("fd"));
+        let mut mem = Vec::new();
+        std::fs::File::from(fd).read_to_end(&mut mem).ok();
+        let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+        // 3/255 sRGB-encoded is 0.000911 linear: 0x1376 as a half float; alpha 1.0 is 0x3c00
+        assert_eq!(mem.get(0..8).map(|p| (half(&p[0..2]), half(&p[6..8]))), Some((0x1376, 0x3c00)));
+        assert_eq!(f.cpu_frame().to_rgba8(), [3u8, 3, 3, 255].repeat(16 * 8), "the CPU fallback reads the same picture");
+        let log = std::fs::read_to_string(bridge.with_extension("cmds")).unwrap_or_default();
+        assert!(log.lines().any(|l| l.starts_with("frame ") && l.ends_with(" gpu f16")), "asked for 16 bits:\n{log}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Frames for the GPU compositor stay in the bridge's exported GPU memory (ADR 0002): the
     /// buffer's descriptor arrives over the socket, the frame is an external picture laid out
