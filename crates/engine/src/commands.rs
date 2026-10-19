@@ -807,6 +807,14 @@ pub(crate) fn audio_placement_specs(clips: &[Vec<u16>], streams: usize) -> Vec<A
     specs
 }
 
+/// The audio clips placing `item` makes: Modify ▸ Audio Channels with several audio clips puts one
+/// per clip on the tracks below the destination, then one per further container stream.
+pub(crate) fn item_audio_specs(p: &Project, item: ItemId) -> Vec<AudioPlacementSpec> {
+    let media = p.resolve_media(item).map(|(_, m, _)| m);
+    let clips = media.and_then(|m| m.interpret.audio_channels.as_ref()).map_or(&[][..], |m| m.clips.as_slice());
+    audio_placement_specs(clips, media.map_or(1, |m| m.info.audio_streams.len()))
+}
+
 /// Make sure the sequence has audio tracks for `count` clips starting at track index `first`,
 /// adding tracks at the bottom when it has fewer. A new track is a copy of the destination track
 /// (channel format, volume, pan, inserts) without its clips, transitions, lock / mute / solo
@@ -839,11 +847,31 @@ pub(crate) fn ensure_audio_tracks(p: &mut Project, seq_id: ItemId, first: usize,
     Ok(p.sequence(seq_id).map(|q| q.audio_tracks.iter().map(|t| t.id).collect()).unwrap_or_default())
 }
 
-/// `timeline.place` for one item (`item`).
-fn place_one(s: &mut Session, p: &Value) -> Result<Value> {
-    if crate::sequence_tools::wants_new_track(p) {
-        return crate::sequence_tools::place_on_new_tracks(s, p);
-    }
+/// Where one stream of a `timeline.place` goes: an existing track, or the track a `"new"` adds
+/// after the last one of its kind (#483).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaceDest {
+    Track(TrackId),
+    NewVideo,
+    NewAudio,
+}
+
+/// One item's `timeline.place`, its parameters resolved and checked but nothing edited yet: what
+/// the drop places and what its drag preview shows ([`crate::place_preview`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlaceRequest {
+    pub item: ItemId,
+    pub range: TimeRange,
+    pub at: Tick,
+    pub video: Option<PlaceDest>,
+    pub audio: Option<PlaceDest>,
+    pub insert: bool,
+}
+
+/// Resolve the parameters of a `timeline.place` with `item` against the active sequence. A
+/// `"new"` track for a stream the item carries (and the call enables) becomes a `New…` destination;
+/// for any other stream it is as if no track was named.
+pub(crate) fn resolve_place(s: &Session, p: &Value) -> Result<PlaceRequest> {
     let stream_flag = |key: &str| match p.get(key) {
         None => Ok(true),
         Some(Value::Bool(v)) => Ok(*v),
@@ -858,10 +886,20 @@ fn place_one(s: &mut Session, p: &Value) -> Result<Value> {
     let tg = s.targeting();
     let pi = s.project.item(item).ok_or_else(|| bad("timeline.place", "no such item"))?;
     let (has_video, has_audio) = s.project.source_streams(item);
-    let is_audio = |t: TrackId| s.active_sequence().is_some_and(|q| q.audio_tracks.iter().any(|x| x.id == t));
+    let is_audio = |d: PlaceDest| match d {
+        PlaceDest::Track(t) => s.active_sequence().is_some_and(|q| q.audio_tracks.iter().any(|x| x.id == t)),
+        PlaceDest::NewVideo => false,
+        PlaceDest::NewAudio => true,
+    };
+    let dest = |key: &str, new: PlaceDest, carried: bool| -> Result<Option<PlaceDest>> {
+        if p.get(key).and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case("new")) {
+            return Ok(carried.then_some(new));
+        }
+        Ok(track_p(s, p, key, "timeline.place")?.map(PlaceDest::Track))
+    };
     // `track` is where the picture goes and `audioTrack` where the sound goes. A caller that
     // names an audio track as `track` asks for the sound alone, on that track.
-    let (v, a) = match (track_p(s, p, "track", "timeline.place")?, track_p(s, p, "audioTrack", "timeline.place")?) {
+    let (v, a) = match (dest("track", PlaceDest::NewVideo, has_video && video)?, dest("audioTrack", PlaceDest::NewAudio, has_audio && audio)?) {
         (Some(t), Some(_)) if is_audio(t) => {
             return Err(bad("timeline.place", "`track` names an audio track and `audioTrack` is given as well: name the sound's track once"));
         }
@@ -873,7 +911,7 @@ fn place_one(s: &mut Session, p: &Value) -> Result<Value> {
         (Some(_), None) if !has_video => {
             return Err(bad("timeline.place", "`track` names a video track and this item has no picture: name an audio track"));
         }
-        (v, a) => (v.or(tg.video_dest), a.or(tg.audio_dest)),
+        (v, a) => (v.or(tg.video_dest.map(PlaceDest::Track)), a.or(tg.audio_dest.map(PlaceDest::Track))),
     };
     let v = v.filter(|_| video);
     let a = a.filter(|_| audio);
@@ -898,12 +936,28 @@ fn place_one(s: &mut Session, p: &Value) -> Result<Value> {
     let end = rate.snap_nearest(Tick(at.0.saturating_add(dur.0)));
     let at = rate.snap_nearest(at);
     let dur = end - at;
-    let ids = place_item(s, item, TimeRange::new(sin, dur), at, v, a, bool_p(p, "insert").unwrap_or(false), "Place Clip", None)?;
+    Ok(PlaceRequest { item, range: TimeRange::new(sin, dur), at, video: v, audio: a, insert: bool_p(p, "insert").unwrap_or(false) })
+}
+
+/// `timeline.place` for one item (`item`).
+fn place_one(s: &mut Session, p: &Value) -> Result<Value> {
+    if crate::sequence_tools::wants_new_track(p) {
+        return crate::sequence_tools::place_on_new_tracks(s, p);
+    }
+    let r = resolve_place(s, p)?;
+    // without a `"new"` every destination is an existing track
+    let existing = |d: Option<PlaceDest>| match d {
+        None => Ok(None),
+        Some(PlaceDest::Track(t)) => Ok(Some(t)),
+        Some(_) => Err(bad("timeline.place", "a new track was not added")),
+    };
+    let (v, a) = (existing(r.video)?, existing(r.audio)?);
+    let ids = place_item(s, r.item, r.range, r.at, v, a, r.insert, "Place Clip", None)?;
     Ok(json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))
 }
 
 /// Most items one `timeline.place` with `items` takes: a larger list is refused, not cut.
-const MAX_PLACE_ITEMS: usize = 10_000;
+pub(crate) const MAX_PLACE_ITEMS: usize = 10_000;
 
 /// `timeline.place` for `items`: the first at the given time, each next one where the previous one
 /// ends, all as one undo step. `track`, `audioTrack`, `insert`, `video` and `audio` apply to every
@@ -1018,11 +1072,7 @@ pub(crate) fn place_item(
         if let Some(adest) = adest.filter(|_| has_a) {
             let (arange, aat) = audio_split.unwrap_or((range, at));
             let mut a = p.make_track_item(item, TrackKind::Audio, aat, arange, rate).ok_or_else(|| bad(label, "bad item"))?;
-            // Modify ▸ Audio Channels with several audio clips: one per clip, on the tracks below
-            let clips: Vec<Vec<u16>> =
-                p.resolve_media(item).and_then(|(_, m, _)| m.interpret.audio_channels.as_ref()).map(|m| m.clips.clone()).unwrap_or_default();
-            let streams = p.resolve_media(item).map_or(1, |(_, m, _)| m.info.audio_streams.len());
-            let specs = audio_placement_specs(&clips, streams);
+            let specs = item_audio_specs(p, item);
             let first = p.sequence(seq_id).and_then(|q| q.audio_tracks.iter().position(|t| t.id == adest)).unwrap_or(0);
             // too few audio tracks below the destination: grow the sequence from the destination track
             let tracks = ensure_audio_tracks(p, seq_id, first, specs.len(), label)?;

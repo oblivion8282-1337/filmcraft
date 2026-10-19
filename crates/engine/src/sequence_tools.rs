@@ -27,7 +27,7 @@
 //! takes its own range and lands offset by the difference of the In points (J- and L-cuts).
 
 use filmcraft_edit as edit;
-use filmcraft_project::{AudioChannels, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, SplitMarks, TrackId, TrackItem, TrackKind};
+use filmcraft_project::{AudioChannels, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, Sequence, SplitMarks, TrackId, TrackItem, TrackKind};
 use filmcraft_time::{Tick, TimeRange};
 use serde_json::{Value, json};
 
@@ -496,6 +496,38 @@ fn make_subsequence(s: &mut Session, p: &Value) -> Result<Value> {
 /// land on the destination track and the one above it), and tracks that are missing are added.
 /// A kind without a destination track is left out.
 #[allow(clippy::too_many_arguments)]
+/// How a sequence's clips edit in as clips (the nest toggle off): each source track with clips in
+/// `range` gets a lane, the lanes stack from the destination track of their kind (`vfirst` /
+/// `afirst`, track indices; a kind without one is left out).
+pub(crate) struct SequenceLanes {
+    /// (kind, how many tracks above the destination track, the clip trimmed to the range)
+    pub items: Vec<(TrackKind, usize, TrackItem)>,
+    /// (is audio, source track index) → lane. TrackKind has no Hash: keyed by "is audio".
+    pub lanes: std::collections::HashMap<(bool, usize), usize>,
+    /// is audio → index of the destination track
+    pub base: std::collections::HashMap<bool, usize>,
+}
+
+pub(crate) fn sequence_lanes(src: &Sequence, range: TimeRange, vfirst: Option<usize>, afirst: Option<usize>) -> SequenceLanes {
+    let mut out = SequenceLanes { items: Vec::new(), lanes: Default::default(), base: Default::default() };
+    for (kind, tracks, first) in [(TrackKind::Video, &src.video_tracks, vfirst), (TrackKind::Audio, &src.audio_tracks, afirst)] {
+        let Some(first) = first else { continue };
+        let audio = kind == TrackKind::Audio;
+        out.base.insert(audio, first);
+        let mut lane = 0usize;
+        for (ti, tr) in tracks.iter().enumerate() {
+            let clips: Vec<TrackItem> = tr.items.iter().filter_map(|it| edit::through::clip_item_to(it, range)).collect();
+            if clips.is_empty() {
+                continue;
+            }
+            out.lanes.insert((audio, ti), lane);
+            out.items.extend(clips.into_iter().map(|c| (kind, lane, c)));
+            lane = lane.saturating_add(1);
+        }
+    }
+    out
+}
+
 pub(crate) fn place_sequence_clips(
     s: &mut Session,
     item: ItemId,
@@ -509,27 +541,9 @@ pub(crate) fn place_sequence_clips(
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let src = s.project.sequence(item).ok_or_else(|| bad(label, "not a sequence"))?.clone();
     let dst = s.active_sequence().ok_or(EngineError::NoSequence)?;
-    // (kind, how many tracks above the destination track, the clip trimmed to the range)
-    let mut items: Vec<(TrackKind, usize, TrackItem)> = Vec::new();
-    // source track index → tracks above the destination track, per kind
-    // (TrackKind has no Hash: the maps are keyed by "is audio")
     let audio = |k: TrackKind| k == TrackKind::Audio;
-    let mut lanes: std::collections::HashMap<(bool, usize), usize> = std::collections::HashMap::new();
-    let mut base: std::collections::HashMap<bool, usize> = std::collections::HashMap::new();
-    for (kind, tracks, dest) in [(TrackKind::Video, &src.video_tracks, vdest), (TrackKind::Audio, &src.audio_tracks, adest)] {
-        let Some(first) = dest.and_then(|d| dst.tracks(kind).iter().position(|t| t.id == d)) else { continue };
-        base.insert(audio(kind), first);
-        let mut lane = 0;
-        for (ti, tr) in tracks.iter().enumerate() {
-            let clips: Vec<TrackItem> = tr.items.iter().filter_map(|it| edit::through::clip_item_to(it, range)).collect();
-            if clips.is_empty() {
-                continue;
-            }
-            lanes.insert((audio(kind), ti), lane);
-            items.extend(clips.into_iter().map(|c| (kind, lane, c)));
-            lane += 1;
-        }
-    }
+    let first = |kind: TrackKind, dest: Option<TrackId>| dest.and_then(|d| dst.tracks(kind).iter().position(|t| t.id == d));
+    let SequenceLanes { items, lanes, base } = sequence_lanes(&src, range, first(TrackKind::Video, vdest), first(TrackKind::Audio, adest));
     if items.is_empty() {
         return Err(EngineError::Other("no destination track for this sequence's clips (check source patching)".into()));
     }
