@@ -198,6 +198,35 @@ pub struct InputTransform {
     /// Display-referred wide-gamut media (BT.2020 / P3 / HDR): desaturate into the working gamut
     /// with these luma weights instead of the camera-gamut compression.
     desaturate: Option<[f32; 3]>,
+    /// Scene-referred (log) media on an SDR pipeline: rendered for display like the camera makers'
+    /// Rec. 709 conversions ([`render_scene`]), with this roll-off knee.
+    render: Option<f32>,
+}
+
+/// Where the roll-off of rendered log media starts (scene light relative to the BT.709 camera
+/// curve's white): below it the curve is exact, above it highlights approach white softly.
+pub const RENDER_KNEE: f32 = 0.8;
+
+/// Scene light → display light the way camera makers render log footage to Rec. 709: the
+/// BT.709 camera curve (OETF) applied to scene light, shown as the display shows Rec. 709 code
+/// values. Highlights past `knee` (on max(R,G,B), hue kept) roll off into white instead of
+/// clipping at 1.0 — hyperbolically, with the curve's slope at the knee, so several stops over
+/// white keep their gradation (+1 stop lands at 97 %, +3 stops at 99.5 %). Mid grey 0.18 becomes
+/// 0.139 display light, the contrast of a Rec. 709 camera.
+#[inline]
+pub fn render_scene(c: [f32; 3], knee: f32) -> [f32; 3] {
+    let m = c[0].max(c[1]).max(c[2]);
+    let k = if m > knee {
+        let span = (1.0 - knee).max(1e-6);
+        let x = m - knee;
+        (knee + span * x / (x + span)) / m
+    } else {
+        1.0
+    };
+    c.map(|v| {
+        let x = (v * k).clamp(0.0, 1.0);
+        srgb_to_linear(if x < 0.018 { 4.5 * x } else { 1.099 * x.powf(0.45) - 0.099 })
+    })
 }
 
 impl InputTransform {
@@ -217,19 +246,32 @@ impl InputTransform {
             Curve::Log(c) => (c.peak_linear() * REFERENCE_WHITE_NITS).clamp(REFERENCE_WHITE_NITS, LOG_PEAK_NITS),
             _ => REFERENCE_WHITE_NITS,
         };
-        let tone = (src.is_hdr() && !pipe.working.is_hdr() && pipe.auto_tone_map).then(|| ToneMap::new(peak, REFERENCE_WHITE_NITS));
+        // log media is rendered like a camera's Rec. 709 (its own highlight roll-off); display HDR
+        // (PQ, HLG) is tone mapped
+        let render = (src.is_log() && !pipe.working.is_hdr() && pipe.auto_tone_map).then_some(RENDER_KNEE);
+        let tone = (src.is_hdr() && render.is_none() && !pipe.working.is_hdr() && pipe.auto_tone_map).then(|| ToneMap::new(peak, REFERENCE_WHITE_NITS));
         let wider = !identity_matrix && !gamut_within(src.gamut(), wg);
         // camera gamuts (log media) get the soft compression; display gamuts keep their in-gamut
         // colours exactly (BT.709 content in a BT.2020 file comes back unchanged)
         let compress = wider && src.is_log();
         let l = wg.luma();
         let desaturate = (wider && !src.is_log()).then(|| [l[0] as f32, l[1] as f32, l[2] as f32]);
-        InputTransform { source: src, table: DecodeTable::for_curve(curve, range), matrix: to_f32(&m), identity_matrix, hlg, tone, compress, desaturate }
+        InputTransform {
+            source: src,
+            table: DecodeTable::for_curve(curve, range),
+            matrix: to_f32(&m),
+            identity_matrix,
+            hlg,
+            tone,
+            compress,
+            desaturate,
+            render,
+        }
     }
 
     /// Whether anything happens after the per-channel table.
     pub fn has_pixel_stage(&self) -> bool {
-        !self.identity_matrix || self.hlg.is_some() || self.tone.is_some() || self.compress || self.desaturate.is_some()
+        !self.identity_matrix || self.hlg.is_some() || self.tone.is_some() || self.compress || self.desaturate.is_some() || self.render.is_some()
     }
 
     /// The per-pixel stage (input: the table's output).
@@ -248,6 +290,9 @@ impl InputTransform {
         }
         if self.compress {
             c = gamut_compress(c);
+        }
+        if let Some(knee) = self.render {
+            c = render_scene(c, knee);
         }
         if let Some(l) = self.desaturate {
             c = desaturate_into_gamut(c, l);
@@ -278,6 +323,7 @@ impl InputTransform {
             matrix: (!self.identity_matrix).then_some(self.matrix),
             tone: self.tone.as_ref().map(|t| (t.src_peak_nits as f32, t.dst_peak_nits as f32)),
             compress: self.compress,
+            render: self.render,
             desaturate: self.desaturate,
         })
     }
@@ -310,6 +356,8 @@ pub struct GpuInputParams {
     pub tone: Option<(f32, f32)>,
     /// The camera-gamut compression ([`gamut_compress`]) after tone mapping.
     pub compress: bool,
+    /// Render scene light for display ([`render_scene`]) with this knee, after the compression.
+    pub render: Option<f32>,
     /// Luma weights to desaturate into the working gamut with ([`desaturate_into_gamut`]).
     pub desaturate: Option<[f32; 3]>,
 }
@@ -499,20 +547,38 @@ mod tests {
         assert!((a[1] - 0.2001).abs() < 1e-3);
     }
 
+    /// Log (scene-referred) media on an SDR sequence is rendered the way the camera makers' own
+    /// Rec. 709 conversions do — the BT.709 camera curve on scene light (the Blackmagic RAW SDK's
+    /// "Rec.709" output is exactly that) — with a soft roll-off into white instead of clipping.
+    /// Showing scene light 1:1 as display light looked flat and pale.
     #[test]
-    fn log_sources_land_sensibly_in_rec709() {
-        // mid grey stays mid grey; the S-Gamut3.Cine primaries map out of 709 and get compressed
+    fn log_sources_render_like_the_camera_makers_rec709() {
+        let rendered = |scene: f32| srgb_to_linear(if scene < 0.018 { 4.5 * scene } else { 1.099 * scene.powf(0.45) - 0.099 });
         for cs in ColorSpace::ALL.into_iter().filter(|c| c.is_log()) {
             let Curve::Log(curve) = cs.curve() else { unreachable!() };
-            let grey = normalized_from_signal(curve.encode(0.18), Range::Limited, curve.domain()) as f32;
+            let sig = |x: f64| normalized_from_signal(curve.encode(x), Range::Limited, curve.domain()) as f32;
             let t = InputTransform::new(cs, Range::Limited, &ColorPipeline::REC709, None);
-            let g = t.convert([grey; 3]);
-            assert!(g.iter().all(|v| (v - 0.18).abs() < 0.01), "{cs:?}: {g:?}");
-            let red = t.convert([0.9, grey, grey]);
+            // mid grey where Rec. 709 puts it (BT.709 OETF 0.409, shown as display light 0.139)
+            let g = t.convert([sig(0.18); 3]);
+            assert!(g.iter().all(|v| (v - rendered(0.18)).abs() < 0.004), "{cs:?}: {g:?}");
+            // below the knee: exactly the camera curve
+            let s = t.convert([sig(0.5); 3]);
+            assert!((s[0] - rendered(0.5)).abs() < 0.004, "{cs:?}: {s:?}");
+            // above it: rolled off into white, monotone, never clipped
+            let (a, b, c) = (t.convert([sig(1.0); 3])[0], t.convert([sig(2.0); 3])[0], t.convert([sig(8.0); 3])[0]);
+            assert!(a < b && b < c && c < 1.0 && c > 0.97, "{cs:?}: {a} {b} {c}");
+            // saturated colours stay in gamut
+            let red = t.convert([0.9, sig(0.18), sig(0.18)]);
             assert!(red.iter().all(|v| *v >= -1e-6) && red.iter().all(|v| *v <= 1.0 + 1e-4), "{cs:?}: {red:?}");
-            let disp = log_to_rec709(cs, [grey; 3], Range::Limited);
-            assert!((disp[0] - linear_to_srgb(0.18)).abs() < 0.02);
+            let disp = log_to_rec709(cs, [sig(0.18); 3], Range::Limited);
+            assert!((disp[0] - linear_to_srgb(rendered(0.18))).abs() < 0.01, "{cs:?}: {disp:?}");
         }
+        // a sequence without automatic tone mapping keeps scene light as it is
+        let raw = ColorPipeline { auto_tone_map: false, ..ColorPipeline::REC709 };
+        let Curve::Log(curve) = ColorSpace::SLog3SGamut3Cine.curve() else { unreachable!() };
+        let grey = normalized_from_signal(curve.encode(0.18), Range::Limited, curve.domain()) as f32;
+        let g = InputTransform::new(ColorSpace::SLog3SGamut3Cine, Range::Limited, &raw, None).convert([grey; 3]);
+        assert!(g.iter().all(|v| (v - 0.18).abs() < 0.01), "{g:?}");
     }
 
     #[test]
@@ -533,7 +599,7 @@ mod tests {
         for cs in ColorSpace::ALL.into_iter().filter(|c| c.is_log()) {
             let g = p(cs).unwrap_or_else(|| panic!("{cs:?}: on the GPU"));
             assert_eq!((g.curve, g.table, g.compress), (GpuCurve::Table, Some((-0.1, 1.1, 8192)), true), "{cs:?}");
-            assert!(g.matrix.is_some() && g.tone.is_some(), "{cs:?}");
+            assert!(g.matrix.is_some() && g.tone.is_none() && g.render == Some(RENDER_KNEE), "{cs:?}: rendered, not tone mapped");
         }
     }
 

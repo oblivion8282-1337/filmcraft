@@ -23,6 +23,7 @@ struct U {
     q4: vec4<f32>,   // gamut matrix row 2, tone-mapping target peak cd/m²
     q5: vec4<f32>,   // desaturation luma weights, desaturation on
     q6: vec4<f32>,   // decode table signal range lo, hi; camera-gamut compression on; table entries - 1
+    q7: vec4<f32>,   // scene rendering of log media on, its roll-off knee, unused, unused
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -160,8 +161,23 @@ fn gamut_compress(c: vec3<f32>) -> vec3<f32> {
     return o;
 }
 
+// `filmcraft_color::render_scene`: scene light → display light like a camera's Rec. 709 (BT.709
+// OETF shown as display light), highlights past the knee rolled off hyperbolically into white.
+fn render_scene(c: vec3<f32>, knee: f32) -> vec3<f32> {
+    let m = max(max(c.r, c.g), c.b);
+    var k = 1.0;
+    if m > knee {
+        let span = max(1.0 - knee, 1e-6);
+        let x = m - knee;
+        k = (knee + span * x / (x + span)) / m;
+    }
+    let v = clamp(c * k, vec3(0.0), vec3(1.0));
+    let e = select(1.099 * pow(v, vec3(0.45)) - 0.099, 4.5 * v, v < vec3(0.018));
+    return srgb_to_linear(e);
+}
+
 // Signal → working linear: `InputTransform::convert` (curve, HLG OOTF, gamut matrix, tone
-// mapping, camera-gamut compression, desaturation into the working gamut). The display curves
+// mapping, camera-gamut compression, scene rendering, desaturation into the working gamut). The display curves
 // clamp the signal to 0..1 as the CPU's tables do; a log table covers its own range.
 fn managed(rgb: vec3<f32>) -> vec3<f32> {
     let v = clamp(rgb, vec3(0.0), vec3(1.0));
@@ -196,6 +212,9 @@ fn managed(rgb: vec3<f32>) -> vec3<f32> {
     }
     if u.q6.z > 0.5 {
         c = gamut_compress(c);
+    }
+    if u.q7.x > 0.5 {
+        c = render_scene(c, u.q7.y);
     }
     if u.q5.w > 0.5 {
         let mn = min(min(c.r, c.g), c.b);

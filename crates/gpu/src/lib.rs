@@ -790,8 +790,8 @@ impl GpuCompositor {
         let footprint = (1.0 / sx.min(sy).max(1e-6)) as f32;
         let taps = if footprint > 1.25 { footprint.ceil().min(4.0) } else { 1.0 };
         let _ = Matrix::Bt709;
-        // colour management (q0..q6), stage by stage as `InputTransform::apply`
-        let q = src.input.map_or([0.0; 28], |p| {
+        // colour management (q0..q7), stage by stage as `InputTransform::apply`
+        let q = src.input.map_or([0.0; 32], |p| {
             let curve = match p.curve {
                 filmcraft_color::GpuCurve::Sdr => 0.0,
                 filmcraft_color::GpuCurve::Linear => 1.0,
@@ -814,6 +814,7 @@ impl GpuCompositor {
                 mx[2][0], mx[2][1], mx[2][2], dp,
                 dl[0], dl[1], dl[2], on(p.desaturate.is_some()),
                 lo, hi, on(p.compress), n.saturating_sub(1) as f32,
+                on(p.render.is_some()), p.render.unwrap_or(1.0), 0.0, 0.0,
             ];
             q
         });
@@ -1347,7 +1348,7 @@ struct SrcInfo {
 }
 
 /// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
-const UNIFORM_FLOATS: usize = 56;
+const UNIFORM_FLOATS: usize = 60;
 /// Most frames the upload cache keeps.
 const MAX_UPLOADS: usize = 24;
 /// Most bytes the upload cache keeps of frames the composite being drawn does not use.

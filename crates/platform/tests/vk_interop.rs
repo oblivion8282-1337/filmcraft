@@ -138,3 +138,41 @@ fn real_playback_throughput_gpu_vs_host() {
         start = end + 20;
     }
 }
+
+/// A camera-RAW frame through the whole colour path on the GPU (zero-copy frame, the clip's log
+/// space, the log → Rec. 709 rendering), written as a PNG for comparing against the vendor SDK's
+/// own Rec. 709 output: `FILMCRAFT_RAWCAM_DUMP=<out.png> FILMCRAFT_RAWCAM_FRAME=<n>`.
+#[test]
+#[ignore = "needs a real camera file (FILMCRAFT_RAWCAM_REAL), its vendor bridge and a CUDA GPU"]
+fn real_log_frame_through_the_colour_path() {
+    let Some(path) = std::env::var_os("FILMCRAFT_RAWCAM_REAL").map(std::path::PathBuf::from) else {
+        panic!("set FILMCRAFT_RAWCAM_REAL to a .braw/.R3D file");
+    };
+    let Some((dev, queue)) = device() else { panic!("no Vulkan device") };
+    assert!(filmcraft_platform::vk_interop::register(&dev));
+    let src = match filmcraft_codecs::rawcam::path_opener(&path) {
+        Some(Ok(s)) => s,
+        other => panic!("open failed: {:?}", other.map(|r| r.err())),
+    };
+    let info = src.info().video.clone().unwrap_or_else(|| panic!("video"));
+    let cs = info.color_space.unwrap_or_else(|| panic!("the bridge reports the clip's colour space"));
+    let k: i64 = std::env::var("FILMCRAFT_RAWCAM_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let rate = info.frame_rate;
+    let frame =
+        filmcraft_media::cancel::with_gpu_frames(true, || src.video_frame(FrameRequest { time: Tick::from_rational(k, rate.den, rate.num), scale: 1.0 }))
+            .unwrap_or_else(|e| panic!("frame {k}: {e:?}"));
+    let t = Arc::new(filmcraft_color::InputTransform::new(cs, filmcraft_color::Range::Full, &filmcraft_color::ColorPipeline::REC709, None));
+    assert!(t.gpu_params().is_some());
+    let (w, h) = (frame.width, frame.height);
+    let layer = PlanLayer { input: Some(t), ..PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal) };
+    let mut c = GpuCompositor::new(&dev, &queue);
+    c.composite(&FramePlan::Layers { width: w as usize, height: h as usize, layers: vec![layer] });
+    let (ow, oh, rgba) = c.read_output().unwrap_or_else(|| panic!("readback"));
+    eprintln!("{cs:?}: {ow}×{oh} through the colour path");
+    if let Some(out) = std::env::var_os("FILMCRAFT_RAWCAM_DUMP") {
+        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let mut ppm = format!("P6 {ow} {oh} 255\n").into_bytes();
+        ppm.extend_from_slice(&rgb);
+        std::fs::write(out, ppm).unwrap_or_else(|e| panic!("write: {e}"));
+    }
+}

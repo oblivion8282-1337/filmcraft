@@ -146,9 +146,9 @@ mod tests {
         let b = builtins().iter().find(|b| b.id == "slog3-sgamut3cine-to-rec709").unwrap();
         let l = b.generate();
         // S-Log3 mid grey (code 420; the LUT sees video-range normalised values like the rest of
-        // Lumetri) → ≈ 18 % linear on the sRGB curve
+        // Lumetri) → where a Rec. 709 camera puts 18 % grey: the BT.709 OETF's 0.409
         let g = l.apply([(420.0 - 64.0) / 876.0; 3]);
-        assert!((g[0] - filmcraft_color::linear_to_srgb(0.18)).abs() < 0.03, "{g:?}");
+        assert!((g[0] - 0.409).abs() < 0.01, "{g:?}");
         assert!(resolve(None, "builtin:slog3-sgamut3cine-to-rec709").is_some());
         assert!(resolve(None, "builtin:look-teal-orange").is_some());
         assert!(resolve(None, "").is_none() && resolve(None, "lib:nope").is_none());
