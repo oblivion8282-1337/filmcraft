@@ -209,22 +209,18 @@ pub const RENDER_KNEE: f32 = 0.8;
 
 /// Scene light → display light the way camera makers render log footage to Rec. 709: the
 /// BT.709 camera curve (OETF) applied to scene light, shown as the display shows Rec. 709 code
-/// values. Highlights past `knee` (on max(R,G,B), hue kept) roll off into white instead of
-/// clipping at 1.0 — hyperbolically, with the curve's slope at the knee, so several stops over
-/// white keep their gradation (+1 stop lands at 97 %, +3 stops at 99.5 %). Mid grey 0.18 becomes
-/// 0.139 display light, the contrast of a Rec. 709 camera.
+/// values. Each channel past `knee` rolls off into white on its own instead of clipping at 1.0
+/// — hyperbolically, with the curve's slope at the knee, so several stops over white keep their
+/// gradation (+1 stop lands at 97 %, +3 stops at 99.5 %) — and very bright colours converge on
+/// white the way a camera's own Rec. 709 clips them there: sensor-clipped highlights (magenta,
+/// where red and blue clip before green) come out white, not pink. Below the knee it is the
+/// camera curve exactly; mid grey 0.18 becomes 0.139 display light.
 #[inline]
 pub fn render_scene(c: [f32; 3], knee: f32) -> [f32; 3] {
-    let m = c[0].max(c[1]).max(c[2]);
-    let k = if m > knee {
-        let span = (1.0 - knee).max(1e-6);
-        let x = m - knee;
-        (knee + span * x / (x + span)) / m
-    } else {
-        1.0
-    };
+    let span = (1.0 - knee).max(1e-6);
     c.map(|v| {
-        let x = (v * k).clamp(0.0, 1.0);
+        let v = if v > knee { knee + span * (v - knee) / (v - knee + span) } else { v };
+        let x = v.clamp(0.0, 1.0);
         srgb_to_linear(if x < 0.018 { 4.5 * x } else { 1.099 * x.powf(0.45) - 0.099 })
     })
 }
@@ -572,6 +568,17 @@ mod tests {
             assert!(red.iter().all(|v| *v >= -1e-6) && red.iter().all(|v| *v <= 1.0 + 1e-4), "{cs:?}: {red:?}");
             let disp = log_to_rec709(cs, [sig(0.18); 3], Range::Limited);
             assert!((disp[0] - linear_to_srgb(rendered(0.18))).abs() < 0.01, "{cs:?}: {disp:?}");
+        }
+        // sensor-clipped highlights go to white: a BRAW pixel measured at the sensor's ceiling
+        // (scene light 5.5 / 3.7 / 6.0, magenta because red and blue clip before green) showed
+        // magenta when the roll-off kept the channel ratios; every channel rolls off on its own
+        let clipped = render_scene([5.532, 3.746, 6.012], RENDER_KNEE);
+        let spread = clipped.iter().fold(0f32, |a, v| a.max(*v)) - clipped.iter().fold(1f32, |a, v| a.min(*v));
+        assert!(spread < 0.02 && clipped.iter().all(|v| *v > 0.95), "{clipped:?}");
+        // a saturated colour below the knee is exactly the camera curve, hue and all
+        let below = render_scene([0.5, 0.1, 0.05], RENDER_KNEE);
+        for (v, s) in below.iter().zip([0.5f32, 0.1, 0.05]) {
+            assert!((v - rendered(s)).abs() < 1e-5, "{below:?}");
         }
         // a sequence without automatic tone mapping keeps scene light as it is
         let raw = ColorPipeline { auto_tone_map: false, ..ColorPipeline::REC709 };

@@ -162,16 +162,12 @@ fn gamut_compress(c: vec3<f32>) -> vec3<f32> {
 }
 
 // `filmcraft_color::render_scene`: scene light → display light like a camera's Rec. 709 (BT.709
-// OETF shown as display light), highlights past the knee rolled off hyperbolically into white.
+// OETF shown as display light), each channel past the knee rolled off hyperbolically into white.
 fn render_scene(c: vec3<f32>, knee: f32) -> vec3<f32> {
-    let m = max(max(c.r, c.g), c.b);
-    var k = 1.0;
-    if m > knee {
-        let span = max(1.0 - knee, 1e-6);
-        let x = m - knee;
-        k = (knee + span * x / (x + span)) / m;
-    }
-    let v = clamp(c * k, vec3(0.0), vec3(1.0));
+    let span = max(1.0 - knee, 1e-6);
+    let x = max(c - knee, vec3(0.0));
+    let r = select(c, knee + span * x / (x + span), c > vec3(knee));
+    let v = clamp(r, vec3(0.0), vec3(1.0));
     let e = select(1.099 * pow(v, vec3(0.45)) - 0.099, 4.5 * v, v < vec3(0.018));
     return srgb_to_linear(e);
 }
