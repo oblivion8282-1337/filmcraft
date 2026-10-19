@@ -72,6 +72,9 @@ const TIERS: usize = 2;
 /// Frames the read-ahead keeps outstanding in the bridge (its pipeline decodes up to 4 at once).
 /// An interactive request waits behind at most this many replies.
 const READ_AHEAD_WINDOW: usize = 4;
+/// Interactive decodes of one clip that may run at once on a shared bridge, each on a handle of
+/// its own (the bridges pipeline 2–4 frames).
+const PARALLEL_DECODES: u32 = 4;
 /// How far a contended request may reach into the cache for a frame to show while it waits.
 const NEAREST_FRAME_TOLERANCE: u64 = 12;
 /// Frames the read-ahead thread decodes past the playhead (≈ 250 ms at 24 fps).
@@ -433,11 +436,14 @@ struct SessionSlot {
 
 /// Idle decode sessions: one serving every tier ([`ANY_TIER`]), or for older bridges at most
 /// [`TIERS`] (one per debayer tier in use — playback at full resolution, thumbnails at quarter —
-/// so the two never restart each other), most recently used last. While a request decodes, it owns its session *outside* this lock with [`VideoState::busy`]
-/// set: concurrent requests then serve from the frame cache instead of queueing up behind the
-/// decode (a scrub burst must not restart the bridge once per queued jump).
+/// so the two never restart each other), most recently used last. While a request decodes, it owns its session *outside* this lock, counted in
+/// [`VideoState::leased`]: concurrent requests past the slots then serve from the frame cache
+/// instead of queueing up behind the decode (a scrub burst must not restart the bridge once per
+/// queued jump).
 struct VideoState {
-    busy: bool,
+    /// Sessions out on a decode: at most one, or [`PARALLEL_DECODES`] for playback on a shared
+    /// bridge (see [`RawCamSource::parallel`]).
+    leased: u32,
     sessions: Vec<SessionSlot>,
     /// Consecutive bridge failures (start-up or decode), reset by a decoded frame.
     failures: u32,
@@ -447,7 +453,7 @@ struct VideoState {
 
 impl VideoState {
     fn new() -> Self {
-        VideoState { busy: false, sessions: Vec::new(), failures: 0, retry_at: None }
+        VideoState { leased: 0, sessions: Vec::new(), failures: 0, retry_at: None }
     }
 
     /// A pooled session serving `tier` and its pool key, if its bridge still runs (a dead one is
@@ -479,16 +485,17 @@ impl VideoState {
         self.retry_at = None;
     }
 
-    /// Return a working session to the pool (most recently used last, at most [`TIERS`]).
+    /// Return a working session to the pool (most recently used last, at most [`TIERS`], or one
+    /// per parallel decode).
     fn put_back(&mut self, tier: u32, session: Session) {
         self.sessions.push(SessionSlot { tier, session });
-        if self.sessions.len() > TIERS {
+        if self.sessions.len() > TIERS.max(PARALLEL_DECODES as usize) {
             self.sessions.remove(0);
         }
     }
 }
 
-/// The decode slot, held ([`VideoState::busy`] is set): [`Lease::succeed`] / [`Lease::fail`]
+/// A decode slot, held (counted in [`VideoState::leased`]): [`Lease::succeed`] / [`Lease::fail`]
 /// release it with the outcome, and dropping it releases it too — a decode that panics must not
 /// leave every later request waiting for a slot that never frees.
 struct Lease<'a> {
@@ -497,7 +504,7 @@ struct Lease<'a> {
 }
 
 impl<'a> Lease<'a> {
-    /// Take the slot; the caller has just set `busy` under the lock.
+    /// Take the slot; the caller has just counted it in `leased` under the lock.
     fn new(video: &'a Mutex<VideoState>) -> Self {
         Lease { video, held: true }
     }
@@ -506,7 +513,7 @@ impl<'a> Lease<'a> {
     /// error on a session that is still fine).
     fn release(mut self, outcome: Option<(u32, Session)>, ok: Option<bool>) {
         let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-        state.busy = false;
+        state.leased = state.leased.saturating_sub(1);
         match ok {
             Some(true) => state.note_success(),
             Some(false) => state.note_failure(Instant::now()),
@@ -538,7 +545,8 @@ impl<'a> Lease<'a> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         if self.held {
-            self.video.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+            let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
+            state.leased = state.leased.saturating_sub(1);
         }
     }
 }
@@ -696,6 +704,12 @@ impl RawCamSource {
     }
 
     /// Whether the bridge takes the tier per command (one session for every tier).
+    /// Whether interactive requests may decode side by side: each needs a handle of its own on
+    /// the format's shared bridge, serving every tier.
+    fn parallel(&self) -> bool {
+        self.multi.load(Ordering::Relaxed) && self.per_command()
+    }
+
     fn per_command(&self) -> bool {
         self.per_command.load(Ordering::Relaxed)
     }
@@ -802,7 +816,7 @@ impl RawCamSource {
         }
         let retired = {
             let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-            if state.busy || (own_only && !state.sessions.iter().any(|s| !s.session.is_shared())) {
+            if state.leased > 0 || (own_only && !state.sessions.iter().any(|s| !s.session.is_shared())) {
                 return false;
             }
             std::mem::take(&mut state.sessions)
@@ -870,14 +884,14 @@ impl RawCamSource {
     fn prefetch_batch(&self, indices: &[u64], tier: u32) -> Result<(), MediaError> {
         let rate = self.info.video.as_ref().map_or(FrameRate::FPS_25, |v| v.frame_rate);
         let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-        if state.busy || indices.is_empty() || self.waiting.load(Ordering::Relaxed) > 0 {
+        if state.leased > 0 || indices.is_empty() || self.waiting.load(Ordering::Relaxed) > 0 {
             return Ok(());
         }
         let pooled = state.take_session(tier);
         if pooled.is_none() && state.backoff_left(Instant::now()).is_some() {
             return Ok(()); // a failing bridge is not restarted for read-ahead
         }
-        state.busy = true;
+        state.leased += 1;
         let lease = Lease::new(&self.video);
         drop(state);
         let (key, mut session) = match self.open_session(pooled, tier) {
@@ -1067,6 +1081,9 @@ impl RawCamSource {
         let mut rest_checked = !steer || seek;
         // Set while this interactive request waits for the decode slot (the read-ahead yields).
         let mut waiting = None;
+        // Playback's frame workers decode side by side on a shared bridge (its pipeline overlaps
+        // them); seeks and background work keep to one decode at a time.
+        let slots = if steer && !seek && self.parallel() { PARALLEL_DECODES } else { 1 };
 
         loop {
             let hit = {
@@ -1105,7 +1122,7 @@ impl RawCamSource {
                 waiting = Some(Waiting::new(&self.waiting));
             }
             let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
-            if state.busy {
+            if state.leased >= slots {
                 // Someone is decoding. Background work takes a nearby cached frame and leaves;
                 // an interactive request waits for the slot — but never past its own
                 // cancellation, so scrubbing past stale frames costs nothing.
@@ -1146,7 +1163,7 @@ impl RawCamSource {
                 self.last_tier.store(serve_tier, Ordering::Relaxed);
                 self.demand.fetch_add(1, Ordering::Relaxed);
             }
-            state.busy = true;
+            state.leased += 1;
             let lease = Lease::new(&self.video);
             drop(state);
             drop(waiting.take());
@@ -2053,13 +2070,13 @@ exit 0
     #[test]
     fn a_panicking_decode_releases_the_slot() {
         let video = Mutex::new(VideoState::new());
-        video.lock().unwrap_or_else(|e| e.into_inner()).busy = true;
+        video.lock().unwrap_or_else(|e| e.into_inner()).leased = 1;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _lease = Lease::new(&video);
             panic!("decoder bug");
         }));
         assert!(r.is_err());
-        assert!(!video.lock().unwrap_or_else(|e| e.into_inner()).busy);
+        assert_eq!(video.lock().unwrap_or_else(|e| e.into_inner()).leased, 0);
     }
 
     /// A bridge reporting `u64::MAX` frames: the duration stays positive and requests do not
@@ -2146,6 +2163,44 @@ exit 0
             eprintln!("frame {idx:>3}: {:>6.1} ms  ({}×{})", t0.elapsed().as_secs_f64() * 1000.0, frame.width, frame.height);
         }
         eprintln!("{} frames in {:.2}s", frames, start.elapsed().as_secs_f64());
+    }
+
+    /// Real-material benchmark (`cargo test -- --ignored`): frame workers requesting consecutive
+    /// full-tier frames at once, as the Program monitor's do while playing (without the
+    /// catch-up hint, so shuttle tiers stay out of it) — the throughput playback can reach.
+    #[test]
+    #[ignore = "needs a real camera file (FILMCRAFT_RAWCAM_REAL) and the vendor bridge"]
+    fn real_clip_concurrent_workers_bench() {
+        let Some(path) = std::env::var_os("FILMCRAFT_RAWCAM_REAL").map(PathBuf::from) else {
+            panic!("set FILMCRAFT_RAWCAM_REAL to a .braw/.R3D file");
+        };
+        let format = Format::from_path(&path).unwrap_or_else(|| panic!("{} is not braw/r3d", path.display()));
+        let bridge = bridge_path(format).unwrap_or_else(|| panic!("no {} on PATH", format.bridge_name()));
+        let src = RawCamSource::open(&path, format, bridge, None).unwrap_or_else(|e| panic!("open failed: {e}"));
+        let rate = src.info().video.as_ref().map_or(FrameRate::FPS_25, |v| v.frame_rate);
+        let frames = src.frame_count.min(144);
+        // warm the session (SDK start-up is not what is measured)
+        let _ = src.video_frame(FrameRequest { time: Tick::from_rational(i64::try_from(frames).unwrap_or(0) - 1, rate.den, rate.num), scale: 1.0 });
+        // disjoint ranges, so the second run finds nothing the first one cached
+        for (workers, range) in [(1usize, 0..frames / 2), (4, frames / 2..frames)] {
+            let next = AtomicU64::new(range.start);
+            let t = Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        loop {
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            if idx >= range.end {
+                                break;
+                            }
+                            let req = FrameRequest { time: Tick::from_rational(i64::try_from(idx).unwrap_or(0), rate.den, rate.num), scale: 1.0 };
+                            src.video_frame(req).unwrap_or_else(|e| panic!("frame {idx}: {e:?}"));
+                        }
+                    });
+                }
+            });
+            eprintln!("{workers} worker(s), full tier: {:.1} fps", (range.end - range.start) as f64 / t.elapsed().as_secs_f64());
+        }
     }
 
     /// Real-material test (`cargo test -- --ignored`): a single `frame` request followed by a
@@ -2401,6 +2456,36 @@ exit 0
             std::thread::sleep(Duration::from_millis(10));
         }
         bridge::live_processes(bridge)
+    }
+
+    /// Frame workers asking one clip for different frames at once (playback) each decode on a
+    /// handle of their own on the shared bridge, so its pipeline overlaps them: the clip's one
+    /// decode slot made them queue, and the bridge decoded a single frame at a time (6K playback
+    /// topped out at ~1 / seek latency, 50–60 fps, of the 67–84 the bridges sustain).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn playback_workers_decode_one_clip_in_parallel() {
+        let (dir, paths) = clips("parallel", &["slow"]);
+        let bridge = fake_bridge_v3(&dir);
+        let src = paths.first().map(|p| open_quiet(p, &bridge, &dir)).unwrap_or_else(|| panic!("clip"));
+        src.prefetch_started.store(true, Ordering::Relaxed); // no read-ahead: only the workers decode
+        let got: Vec<_> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..3_i64)
+                .map(|k| {
+                    let src = &src;
+                    s.spawn(move || src.video_frame(FrameRequest { time: Tick::from_rational(k, 1, 24), scale: 1.0 }))
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap_or_else(|_| panic!("worker"))).collect()
+        });
+        for (k, f) in got.into_iter().enumerate() {
+            let f = f.unwrap_or_else(|e| panic!("frame {k}: {e:?}"));
+            assert_eq!(f.pts, Tick::from_rational(k as i64, 1, 24));
+        }
+        let cmds = std::fs::read_to_string(bridge.with_extension("cmds")).unwrap_or_default();
+        let handles = cmds.lines().filter(|l| l.starts_with("open ")).count();
+        assert!(handles >= 2, "the workers shared one handle (decoded one at a time):\n{cmds}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Three clips of a multi-clip bridge, decoded at once from three threads: ONE bridge process
