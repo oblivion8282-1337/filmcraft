@@ -38,8 +38,13 @@ for limited- and full-range files.
 | ARRI LogC4 | ARRI Wide Gamut 4 | ARRI, *ARRI LogC4 Logarithmic Color Space — Specification* (2022) | CV | a = (2¹⁸ − 16)/117.45, b = 928/1023, c = 95/1023, s = 7·ln2·2^(7 − 14c/b)/(a·b), t = (2^(6 − 14c/b) − 64)/a; y ≥ 0: x = (2^(14(y − c)/b + 6) − 64)/a; else x = y·s + t |
 | Apple Log | BT.2020 | Apple, *Apple Log Profile* white paper (2023) | IRE | R0 = −0.05641088, Rt = 0.01, c = 47.28711236, β = 0.00964052, γ = 0.08550479, δ = 0.69336945; P ≥ c(Rt − R0)²: x = 2^((P − δ)/γ) − β; else x = √(P/c) + R0 |
 | DJI D-Log | D-Gamut | DJI, *White Paper on D-Log and D-Gamut of DJI Cinema Color System* (2017) | CV | y ≤ 0.14: x = (y − 0.0929)/6.025; else x = (10^(3.89616y − 2.27752) − 0.0108)/0.9892 |
+| Blackmagic Film Gen 5 | Blackmagic Wide Gamut | Blackmagic Design, *Blackmagic Generation 5 Color Science* (2021) | CV | A = 0.08692876065491224, B = 0.005494072432257808, C = 0.5300133392291939, D = 8.283605932402494, E = 0.09246575342465753; y < 0.005·D + E: x = (y − E)/D; else x = e^((y − C)/A) − B |
+| RED Log3G10 | REDWideGamutRGB | RED Digital Cinema, *White Paper on REDWideGamutRGB and Log3G10* (Form 915-0187 Rev B, 2017) | CV | a = 0.224282, b = 155.975327, c = 0.01, g = 15.1927; y < 0: x = y/g − c; else x = (10^(y/a) − 1)/b − c |
 
-The encoders are the exact inverses given in the same documents. DJI **D-Log M** is not
+The encoders are the exact inverses given in the same documents. The two camera-RAW curves were also
+checked against their vendors' SDKs (October 2026): Blackmagic Film Gen 5 decoded with these constants
+matches the Blackmagic RAW SDK's linear output to 2·10⁻⁷, Log3G10 matches the R3D SDK's linear output
+within 0.24 % (a constant 1.0022 gain), and both gamuts reproduce the SDKs' gamut conversions. DJI **D-Log M** is not
 implemented: DJI has not published its formula (only conversion LUTs), and we do not derive curves
 from third-party LUTs. (Checked again in October 2026: DJI's published white papers cover D-Log /
 D-Gamut only; D-Log M remains unsupported, so D-Log M footage should be interpreted with a LUT.)
@@ -58,6 +63,8 @@ Gamut primaries (all D65 white, x/y):
 | ARRI Wide Gamut 3 | 0.6840, 0.3130 | 0.2210, 0.8480 | 0.0861, −0.1020 | ARRI Log C document |
 | ARRI Wide Gamut 4 | 0.7347, 0.2653 | 0.1424, 0.8576 | 0.0991, −0.0308 | ARRI LogC4 specification |
 | D-Gamut | 0.71, 0.31 | 0.21, 0.88 | 0.09, −0.08 | DJI white paper |
+| Blackmagic Wide Gamut (Gen 4/5) | 0.7177, 0.3171 | 0.2280, 0.8616 | 0.1006, −0.0820 | Blackmagic Gen 5 colour science document |
+| REDWideGamutRGB | 0.780308, 0.304253 | 0.121595, 1.493994 | 0.095612, −0.084589 | RED white paper (its RWG → Rec. 709 matrix is a test) |
 
 Matrices are derived from the chromaticities (SMPTE RP 177 normalised primary matrix); tests check
 the result against the published BT.709 RGB→XYZ and BT.2087 BT.709→BT.2020 matrices.

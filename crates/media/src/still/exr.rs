@@ -71,6 +71,7 @@ pub fn still(name: &str, bytes: &[u8]) -> Result<StillSource> {
             has_alpha: d.has_alpha,
             bitrate: None,
             hdr: None,
+            color_space: None,
         }),
         audio_streams: Vec::new(),
         container: "Image".into(),

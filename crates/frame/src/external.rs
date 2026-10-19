@@ -46,15 +46,17 @@ impl std::fmt::Debug for ExternalMemory {
     }
 }
 
-/// The pixel layout of an external picture.
+/// The pixel layout of an external picture. Every layout holds *encoded* values (the frame's
+/// transfer, or its media's colour space — log for camera RAW) and straight alpha; colour
+/// management decodes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalLayout {
-    /// 8 bits per channel, sRGB/709-encoded, straight alpha.
+    /// 8 bits per channel.
     Rgba8,
     /// As `Rgba8`, blue first.
     Bgra8,
-    /// Half floats (IEEE 754, little-endian) per channel, linear light, premultiplied alpha — the
-    /// compositor's working precision (a 16-bit decode that is not cut to 8 bits).
+    /// Half floats (IEEE 754, little-endian) per channel, the encoded value normalised to 0..1: a
+    /// 16-bit decode that is not cut to 8 bits.
     RgbaF16,
 }
 
@@ -68,9 +70,10 @@ impl ExternalLayout {
     }
 }
 
-/// Supplies an external picture's pixels to the CPU: tightly packed RGBA8 rows, or `None` when
-/// they cannot be had (the picture then reads as transparent black).
-pub type CpuFallback = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
+/// Supplies an external picture's pixels to the CPU in host memory (RGBA, 8 or 16 bits, tightly
+/// packed rows, the same encoding), or `None` when they cannot be had (the picture then reads as
+/// transparent black).
+pub type CpuFallback = Box<dyn Fn() -> Option<crate::PixelData> + Send + Sync>;
 
 /// The claim on an exported buffer a picture holds until the GPU has copied it: dropping it
 /// gives the buffer back to the exporter.
@@ -98,7 +101,7 @@ pub struct ExternalImage {
     layout: ExternalLayout,
     gpu: Mutex<Option<GpuLease>>,
     fetch: CpuFallback,
-    cpu: OnceLock<Arc<Vec<u8>>>,
+    cpu: OnceLock<crate::PixelData>,
 }
 
 impl ExternalImage {
@@ -157,25 +160,33 @@ impl ExternalImage {
         if self.has_gpu() {
             usize::try_from(u64::from(self.pitch).saturating_mul(u64::from(height))).unwrap_or(usize::MAX)
         } else {
-            self.cpu.get().map_or(0, |_| (width as usize).saturating_mul(height as usize).saturating_mul(4))
+            match self.cpu.get() {
+                Some(crate::PixelData::Rgba16(d)) => d.len() * 2,
+                Some(crate::PixelData::Rgba8(d)) => d.len(),
+                Some(_) => (width as usize).saturating_mul(height as usize).saturating_mul(4),
+                None => 0,
+            }
         }
     }
 
-    /// The picture's pixels as tightly packed RGBA8 rows of a `width`×`height` picture, fetched
-    /// once through the fallback; transparent black when it fails or delivers the wrong amount.
-    pub fn rgba8(&self, width: u32, height: u32) -> Arc<Vec<u8>> {
+    /// The picture's pixels in host memory (RGBA8 or RGBA16 rows of a `width`×`height` picture),
+    /// fetched once through the fallback; transparent black when it fails or delivers anything
+    /// else.
+    pub fn cpu(&self, width: u32, height: u32) -> crate::PixelData {
         self.cpu
             .get_or_init(|| {
                 let want = (width as usize).saturating_mul(height as usize).saturating_mul(4);
-                match (self.fetch)() {
-                    Some(px) if px.len() == want => Arc::new(px),
+                let fetched = (self.fetch)();
+                match fetched {
+                    Some(crate::PixelData::Rgba8(d)) if d.len() == want => crate::PixelData::Rgba8(d),
+                    Some(crate::PixelData::Rgba16(d)) if d.len() == want => crate::PixelData::Rgba16(d),
                     other => {
                         log::warn!(
                             "GPU frame {}×{height}: the CPU fallback {} — showing it transparent",
                             width,
-                            if other.is_some() { "delivered the wrong size" } else { "failed" }
+                            if other.is_some() { "delivered the wrong size or layout" } else { "failed" }
                         );
-                        Arc::new(vec![0; want])
+                        crate::PixelData::Rgba8(Arc::new(vec![0; want]))
                     }
                 }
             })
@@ -228,17 +239,25 @@ mod tests {
         let c = calls.clone();
         let img = image(Box::new(move || {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(vec![7; 2 * 2 * 4])
+            Some(crate::PixelData::Rgba16(Arc::new(vec![7; 2 * 2 * 4])))
         }));
-        assert_eq!(img.rgba8(2, 2).as_slice(), &[7; 16]);
-        assert_eq!(img.rgba8(2, 2).as_slice(), &[7; 16]);
+        let px = |d: crate::PixelData| match d {
+            crate::PixelData::Rgba16(d) => d.as_ref().clone(),
+            _ => vec![],
+        };
+        assert_eq!(px(img.cpu(2, 2)), vec![7; 16]);
+        assert_eq!(px(img.cpu(2, 2)), vec![7; 16]);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
     fn a_failing_or_short_fallback_reads_transparent() {
-        assert_eq!(image(Box::new(|| None)).rgba8(2, 1).as_slice(), &[0; 8]);
-        assert_eq!(image(Box::new(|| Some(vec![9; 3]))).rgba8(2, 1).as_slice(), &[0; 8]);
+        let bytes = |d: crate::PixelData| match d {
+            crate::PixelData::Rgba8(d) => d.as_ref().clone(),
+            _ => vec![1],
+        };
+        assert_eq!(bytes(image(Box::new(|| None)).cpu(2, 1)), vec![0; 8]);
+        assert_eq!(bytes(image(Box::new(|| Some(crate::PixelData::Rgba8(Arc::new(vec![9; 3]))))).cpu(2, 1)), vec![0; 8]);
     }
 
     #[test]
@@ -281,7 +300,7 @@ mod tests {
             0,
             256,
             ExternalLayout::Rgba8,
-            Box::new(|| Some(vec![5; 2 * 3 * 4])),
+            Box::new(|| Some(crate::PixelData::Rgba8(Arc::new(vec![5; 2 * 3 * 4])))),
             Some(Box::new(Flag(released.clone()))),
         );
         assert_eq!((img.byte_size(2, 3), img.is_spent()), (768, false));
@@ -291,7 +310,7 @@ mod tests {
         drop(lease);
         assert!(released.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!((img.byte_size(2, 3), img.is_spent(), img.memory().is_none()), (0, true, true));
-        assert_eq!(img.rgba8(2, 3).len(), 24);
+        assert!(matches!(img.cpu(2, 3), crate::PixelData::Rgba8(d) if d.len() == 24));
         assert_eq!((img.byte_size(2, 3), img.is_spent()), (24, false));
     }
 }

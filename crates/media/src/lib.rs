@@ -78,6 +78,11 @@ pub struct VideoStreamInfo {
     /// HDR static metadata (mastering display, content light level) when the file carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr: Option<filmcraft_color::HdrMetadata>,
+    /// The colour space the source says its frames are in when the stream colour flags cannot say
+    /// it (camera RAW decoded to a camera log encoding). Colour management takes it as the
+    /// detected space; Interpret Footage still overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_space: Option<filmcraft_color::ColorSpace>,
 }
 
 /// Most audio streams a source reports (the count comes from the file: never trusted).

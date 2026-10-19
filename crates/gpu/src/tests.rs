@@ -553,6 +553,65 @@ fn hdr_input_gpu_matches_cpu() {
     }
 }
 
+/// Camera log media on a Rec. 709 sequence: the shader's colour management (the decode table,
+/// gamut matrix, BT.2390 tone mapping and camera-gamut compression) matches the CPU running the
+/// same `InputTransform` — for Y'CbCr log (S-Log3, LogC4) and for RGB log frames whose encoded
+/// values come as a 16-bit RGBA picture (Blackmagic Film Gen 5, RED Log3G10: camera RAW).
+#[test]
+fn log_input_gpu_matches_cpu() {
+    use filmcraft_color::{ColorInfo, ColorPipeline, ColorSpace, InputTransform};
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (256u32, 6u32);
+    let run = |c: &mut GpuCompositor, name: &str, frame: Arc<VideoFrame>, cs: ColorSpace| {
+        let t = Arc::new(InputTransform::new(cs, frame.color.range, &ColorPipeline::REC709, None));
+        assert!(t.gpu_params().is_some(), "{name}");
+        let layer = PlanLayer { input: Some(t), ..PlanLayer::new(frame.clone(), Affine::IDENTITY, 1.0, Blend::Normal) };
+        let plan = FramePlan::Layers { width: w as usize, height: h as usize, layers: vec![layer] };
+        let cpu = execute_cpu(&plan).over_black_rgba8();
+        c.composite(&plan);
+        let (_, _, gpu) = c.read_output().expect("readback");
+        let error = cpu.iter().zip(&gpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        let plain = FramePlan::Layers { width: w as usize, height: h as usize, layers: vec![PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal)] };
+        c.composite(&plain);
+        let (_, _, unmanaged) = c.read_output().expect("readback");
+        let apart = cpu.iter().zip(&unmanaged).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        eprintln!("{name}: max error {error}, unmanaged differs by up to {apart}");
+        assert!(error <= 2, "{name}: GPU differs from the CPU by up to {error} codes");
+        assert!(apart > 20, "{name}: colour management changed nothing ({apart})");
+    };
+    // 10-bit Y'CbCr log: a full-range luma ramp under neutral and saturated chroma
+    let chroma = [(512, 512), (300, 760), (760, 300), (64, 512), (960, 960), (512, 64)];
+    let y: Vec<u16> = (0..h).flat_map(|_| (0..w).map(|x| (x * 1023 / 255) as u16)).collect();
+    let cb: Vec<u16> = (0..h).flat_map(|r| std::iter::repeat_n(chroma[r as usize].0, w as usize)).collect();
+    let cr: Vec<u16> = (0..h).flat_map(|r| std::iter::repeat_n(chroma[r as usize].1, w as usize)).collect();
+    let yuv = PixelData::Yuv16 { planes: [Arc::new(y), Arc::new(cb), Arc::new(cr)], chroma: Chroma::C444, bits: 10, alpha: None };
+    let color = ColorInfo { range: Range::Full, ..ColorInfo::REC709 };
+    for cs in [ColorSpace::SLog3SGamut3Cine, ColorSpace::LogC4Awg4] {
+        let frame = Arc::new(VideoFrame { width: w, height: h, data: yuv.clone(), color, par: (1, 1), pts: Default::default() });
+        run(&mut c, cs.label(), frame, cs);
+    }
+    // 16-bit RGBA log (camera RAW over the host): a ramp per channel, rows of saturated mixes
+    let mix = [[1.0, 1.0, 1.0], [1.0, 0.3, 0.2], [0.2, 1.0, 0.3], [0.3, 0.2, 1.0], [1.0, 1.0, 0.1], [0.05, 0.6, 1.0]];
+    let rgba: Vec<u16> = (0..h as usize)
+        .flat_map(|r| (0..w as usize).flat_map(move |x| (0..4).map(move |k| if k == 3 { u16::MAX } else { (x as f64 / 255.0 * mix[r][k] * 65535.0) as u16 })))
+        .collect();
+    for cs in [ColorSpace::BmdFilm5Bmdwg, ColorSpace::Log3G10Rwg] {
+        let frame = Arc::new(VideoFrame {
+            width: w,
+            height: h,
+            data: PixelData::Rgba16(Arc::new(rgba.clone())),
+            color: ColorInfo::SRGB_FULL,
+            par: (1, 1),
+            pts: Default::default(),
+        });
+        run(&mut c, cs.label(), frame, cs);
+    }
+}
+
 /// Hands out buffers it was given, by memory id (stands in for a real cross-process import).
 struct TestImporter(std::sync::Mutex<HashMap<u64, wgpu::Buffer>>);
 
@@ -617,7 +676,7 @@ fn an_external_frame_composites_like_its_host_pixels() {
         let (px, n) = (rgba.clone(), fallbacks.clone());
         let fetch = Box::new(move || {
             n.fetch_add(1, Ordering::Relaxed);
-            Some(px.clone())
+            Some(PixelData::Rgba8(Arc::new(px.clone())))
         });
         let mem = Arc::new(ExternalMemory::new(id, u64::from(pitch * h), [0; 16], Box::new(())));
         Arc::new(VideoFrame {
@@ -645,9 +704,9 @@ fn an_external_frame_composites_like_its_host_pixels() {
     assert_eq!((c.external_copies(), c.external_fallbacks()), (2, 1));
 }
 
-/// A 16-bit external frame (linear half floats, ADR 0002) composites like the same picture as an
-/// 8-bit host frame, within the 8-bit rounding: it is copied into a half-float texture and drawn
-/// as premultiplied linear light, with rows padded to 256 bytes.
+/// A 16-bit external frame (half floats of the encoded values, ADR 0002) composites like the same
+/// picture as an 8-bit host frame, within the 8-bit rounding: it is copied into a half-float
+/// texture whose values the shader decodes with the frame's transfer, rows padded to 256 bytes.
 #[test]
 fn a_half_float_external_frame_composites_like_its_8_bit_picture() {
     use filmcraft_frame::{ExternalImage, ExternalLayout, ExternalMemory};
@@ -663,9 +722,8 @@ fn a_half_float_external_frame_composites_like_its_8_bit_picture() {
         for x in 0..w as usize {
             for c in 0..4 {
                 let v = rgba[(y * w as usize + x) * 4 + c];
-                let lin = if c == 3 { v as f32 / 255.0 } else { filmcraft_color::srgb_u8_to_linear_table()[v as usize] };
                 let d = y * pitch as usize + x * 8 + c * 2;
-                halves[d..d + 2].copy_from_slice(&f32_to_f16(lin).to_le_bytes());
+                halves[d..d + 2].copy_from_slice(&f32_to_f16(v as f32 / 255.0).to_le_bytes());
             }
         }
     }

@@ -89,8 +89,10 @@ pub struct Caps {
     pub gpu_export: bool,
     /// Frames in exportable GPU memory are on (the `ready` event of a bridge given the socket).
     pub gpu: bool,
-    /// GPU frames can come as linear half floats (`frame … gpu f16`), the decode's full precision.
+    /// GPU frames can come as half floats (`frame … gpu f16`), the decode's full precision.
     pub f16: bool,
+    /// Host frames can come in 16 bits (`frame … rgba16`).
+    pub rgba16: bool,
 }
 
 impl Caps {
@@ -105,6 +107,7 @@ impl Caps {
                 "gpu" => caps.gpu = true,
                 "gpu-export" => caps.gpu_export = true,
                 "f16" => caps.f16 = true,
+                "rgba16" => caps.rgba16 = true,
                 _ => {}
             }
         }
@@ -127,6 +130,9 @@ pub struct Metadata {
     /// The shared-memory ring the bridge laid out (`shm_slots`, `shm_slot_bytes`): only in a
     /// persistent session started with `--shm` that the bridge could use. Unvalidated.
     pub shm: Option<(u64, u64)>,
+    /// The colour space every frame comes in (`color`: a `filmcraft_color::ColorSpace` id, e.g.
+    /// `bmdfilm5-bmdwg`); `None` when the bridge does not say (older bridges: display RGB).
+    pub color: Option<String>,
 }
 
 /// The pixel layout of the bytes a bridge sends after a `frame` event (`format` field; absent
@@ -139,8 +145,10 @@ pub enum FrameFormat {
     Rgba8,
     /// 4 bytes per pixel, B G R A — one in-place channel swap away from RGBA.
     Bgra8,
-    /// 8 bytes per pixel: half floats R G B A, linear light, premultiplied (GPU frames only).
+    /// 8 bytes per pixel: half floats R G B A, encoded values, straight alpha (GPU frames only).
     RgbaF16,
+    /// 8 bytes per pixel: little-endian u16 R G B A, encoded values, straight alpha.
+    Rgba16,
 }
 
 impl FrameFormat {
@@ -151,6 +159,7 @@ impl FrameFormat {
             Some("rgba8") => Some(Self::Rgba8),
             Some("bgra8") => Some(Self::Bgra8),
             Some("rgbaf16") => Some(Self::RgbaF16),
+            Some("rgba16") => Some(Self::Rgba16),
             _ => None,
         }
     }
@@ -160,7 +169,7 @@ impl FrameFormat {
         match self {
             Self::Rgb24 => 3,
             Self::Rgba8 | Self::Bgra8 => 4,
-            Self::RgbaF16 => 8,
+            Self::RgbaF16 | Self::Rgba16 => 8,
         }
     }
 }
@@ -385,6 +394,7 @@ pub fn parse_event(line: &str) -> Option<Event> {
             protocol: json_u32(line, "protocol").unwrap_or(1),
             caps: Caps::parse(json_str(line, "caps").as_deref()),
             shm: json_u64(line, "shm_slots").zip(json_u64(line, "shm_slot_bytes")),
+            color: json_str(line, "color"),
         })),
         Some("ready") => Some(Event::Ready {
             protocol: json_u32(line, "protocol").unwrap_or(1),
@@ -1644,6 +1654,8 @@ impl MultiBridge {
                 format!("frame {handle} {index} {word} gpu f16\n")
             }
             Some(word) if gpu && self.gpu_device().is_some() => format!("frame {handle} {index} {word} gpu\n"),
+            // host frames in 16 bits where the bridge has them
+            Some(word) if self.caps().rgba16 && super::f16_frames_enabled() => format!("frame {handle} {index} {word} rgba16\n"),
             Some(word) => format!("frame {handle} {index} {word}\n"),
             None => format!("frame {handle} {index}\n"),
         };
@@ -1740,9 +1752,9 @@ fn route(shared: &Arc<MultiShared>, stdout: &mut ChildStdout, handle: Option<u64
             let arrived = match (gpu, slot) {
                 (Some(gpu), _) => {
                     let release = GpuRelease { shared: Arc::downgrade(shared), buffer: gpu.buffer };
-                    if format == FrameFormat::Rgb24 {
+                    if matches!(format, FrameFormat::Rgb24 | FrameFormat::Rgba16) {
                         drop(release);
-                        Arrived::Failed("bridge sent a GPU frame as rgb24".into())
+                        Arrived::Failed("bridge sent a GPU frame as rgb24 / rgba16 (GPU frames are rgba8, bgra8 or rgbaf16)".into())
                     } else {
                         Arrived::Gpu { release, gpu, width, height, format }
                     }
@@ -2001,14 +2013,18 @@ mod tests {
                 frame_count: 1200,
                 protocol: 1,
                 caps: Caps::default(),
-                shm: None
+                shm: None,
+                color: None
             }))
         );
         // Protocol 2: version and capabilities (unknown words are ignored).
         let v2 =
             r#"{"type":"metadata","timecode":"00:00:00:00","fps_num":25,"width":16,"height":8,"frame_count":3,"protocol":2,"caps":"scale,frame-errors,warp"}"#;
         let Some(Event::Metadata(m)) = parse_event(v2) else { panic!("metadata v2") };
-        assert_eq!((m.protocol, m.caps), (2, Caps { scale: true, frame_errors: true, shm: false, multi: false, gpu_export: false, gpu: false, f16: false }));
+        assert_eq!(
+            (m.protocol, m.caps),
+            (2, Caps { scale: true, frame_errors: true, shm: false, multi: false, gpu_export: false, gpu: false, f16: false, rgba16: false })
+        );
         assert_eq!(
             parse_event(r#"{"type":"error","index":12,"message":"frame index 12 beyond clip"}"#),
             Some(Event::FrameError { index: 12, message: "frame index 12 beyond clip".into() })

@@ -4,9 +4,9 @@
 //!
 //! A sequence whose pipeline is "plain" (Rec. 709 working space without wide gamut) and media
 //! whose metadata says Rec. 709 / sRGB / linear take the original fast path unchanged. On such a
-//! sequence, display-referred HDR and wide-gamut Y'CbCr (PQ, HLG, BT.2020, P3) stays on the GPU
-//! path as well, with its input transform run in the compositor's shader ([`gpu_input`]); log
-//! media and the other pipelines are converted here, on the CPU.
+//! sequence, HDR, wide-gamut and log media stay on the GPU path as well — Y'CbCr, and the 16-bit
+//! and GPU-memory RGBA of camera RAW — with their input transform run in the compositor's shader
+//! ([`gpu_input`]); 8-bit RGBA and the other pipelines are converted here, on the CPU.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,9 +22,16 @@ pub fn override_of(project: &Project, item: ItemId) -> Option<ColorSpace> {
     project.resolve_media(item).and_then(|(_, media, _)| media.interpret.color_space)
 }
 
-/// The colour space a frame of `item` is interpreted in.
+/// The colour space a source reports for its frames when their colour flags cannot say it
+/// (camera RAW decoded to a camera log encoding), following subclips to their media.
+pub fn detected_of(project: &Project, item: ItemId) -> Option<ColorSpace> {
+    project.resolve_media(item).and_then(|(_, media, _)| media.info.video.as_ref()?.color_space)
+}
+
+/// The colour space a frame of `item` is interpreted in: the Interpret Footage override, else
+/// what the source reports, else the frame's colour flags.
 pub fn source_space(project: &Project, item: ItemId, frame: &VideoFrame) -> ColorSpace {
-    override_of(project, item).unwrap_or_else(|| ColorSpace::from_info(&frame.color))
+    override_of(project, item).or_else(|| detected_of(project, item)).unwrap_or_else(|| ColorSpace::from_info(&frame.color))
 }
 
 /// Whether the frame needs more than the default (transfer-only) decode.
@@ -54,12 +61,14 @@ pub fn input_transform(cs: ColorSpace, range: Range, pipe: &ColorPipeline, peak_
     t
 }
 
-/// The input transform of a frame the GPU compositor can colour manage itself (#965): a Y'CbCr
-/// frame of display-referred HDR or wide-gamut media (PQ, HLG, BT.2020, P3) on a plain pipeline,
-/// whose working → monitor transform is the identity. None for log media (camera-gamut
-/// compression), RGB frames and other pipelines, which [`decode`] converts on the CPU.
+/// The input transform of a frame the GPU compositor can colour manage itself (#965) on a plain
+/// pipeline, whose working → monitor transform is the identity: HDR, wide-gamut and log media
+/// as Y'CbCr, or as encoded RGBA the shader samples raw (16-bit RGBA and GPU-memory frames: camera
+/// RAW). None for 8-bit and float RGBA and other pipelines, which [`decode`] converts on the CPU.
 pub fn gpu_input(project: &Project, item: ItemId, pipe: &ColorPipeline, cs: ColorSpace, frame: &VideoFrame) -> Option<Arc<InputTransform>> {
-    if !pipe.is_plain() || !matches!(frame.data, filmcraft_frame::PixelData::Yuv8 { .. } | filmcraft_frame::PixelData::Yuv16 { .. }) {
+    use filmcraft_frame::PixelData;
+    let sampled_raw = matches!(frame.data, PixelData::Yuv8 { .. } | PixelData::Yuv16 { .. } | PixelData::Rgba16(_) | PixelData::External(_));
+    if !pipe.is_plain() || !sampled_raw {
         return None;
     }
     let t = input_transform(cs, frame.color.range, pipe, source_peak_nits(project, item));
@@ -75,7 +84,10 @@ pub fn decode(project: &Project, item: ItemId, frame: &VideoFrame, n: usize, pip
     }
     // RGB stills/generators carry full-range code values; YUV carries its own range flag
     let range = match frame.data {
-        filmcraft_frame::PixelData::Rgba8(_) | filmcraft_frame::PixelData::RgbaF32(_) => Range::Full,
+        filmcraft_frame::PixelData::Rgba8(_)
+        | filmcraft_frame::PixelData::Rgba16(_)
+        | filmcraft_frame::PixelData::RgbaF32(_)
+        | filmcraft_frame::PixelData::External(_) => Range::Full,
         _ => frame.color.range,
     };
     let t = input_transform(cs, range, pipe, source_peak_nits(project, item));

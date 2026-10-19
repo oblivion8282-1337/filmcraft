@@ -357,7 +357,7 @@ fn spaces(_: &mut Session, _: &Value) -> Result<Value> {
 fn color_info(s: &mut Session, p: &Value) -> Result<Value> {
     let id = item_p(p, "item").ok_or_else(|| bad("media.colorInfo", "need `item`"))?;
     let Some(ItemKind::Media(m)) = s.project.item(id).map(|i| &i.kind) else { return Err(bad("media.colorInfo", "not a media item")) };
-    let detected = m.info.video.as_ref().map(|v| ColorSpace::from_info(&v.color));
+    let detected = m.info.video.as_ref().map(|v| v.color_space.unwrap_or_else(|| ColorSpace::from_info(&v.color)));
     let effective = m.interpret.color_space.or(detected);
     Ok(json!({
         "detected": detected.map(|c| c.id()),

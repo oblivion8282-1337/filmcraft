@@ -197,6 +197,7 @@ impl Y4mSource {
                 has_alpha: layout.alpha,
                 bitrate,
                 hdr: None,
+                color_space: None,
             }),
             audio_streams: Vec::new(),
             container: "Y4M".into(),

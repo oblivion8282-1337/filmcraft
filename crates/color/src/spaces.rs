@@ -34,6 +34,10 @@ pub enum Gamut {
     Awg4,
     /// DJI D-Gamut.
     DGamut,
+    /// Blackmagic Wide Gamut (Generation 4 and 5 colour science).
+    BmdWideGamut,
+    /// RED REDWideGamutRGB.
+    RedWideGamutRgb,
 }
 
 impl Gamut {
@@ -51,6 +55,8 @@ impl Gamut {
             Gamut::Awg3 => [[0.6840, 0.3130], [0.2210, 0.8480], [0.0861, -0.1020]],
             Gamut::Awg4 => [[0.7347, 0.2653], [0.1424, 0.8576], [0.0991, -0.0308]],
             Gamut::DGamut => [[0.71, 0.31], [0.21, 0.88], [0.09, -0.08]],
+            Gamut::BmdWideGamut => [[0.7177, 0.3171], [0.2280, 0.8616], [0.1006, -0.0820]],
+            Gamut::RedWideGamutRgb => [[0.780_308, 0.304_253], [0.121_595, 1.493_994], [0.095_612, -0.084_589]],
         }
     }
 
@@ -167,10 +173,14 @@ pub enum ColorSpace {
     DLogDGamut,
     /// Linear light with BT.709 primaries (EXR-style float sources).
     Linear709,
+    /// Blackmagic Design Film (Gen 5) / Blackmagic Wide Gamut: Blackmagic RAW as decoded.
+    BmdFilm5Bmdwg,
+    /// RED Log3G10 / REDWideGamutRGB: R3D as decoded (IPP2).
+    Log3G10Rwg,
 }
 
 impl ColorSpace {
-    pub const ALL: [ColorSpace; 16] = [
+    pub const ALL: [ColorSpace; 18] = [
         ColorSpace::Rec709,
         ColorSpace::Srgb,
         ColorSpace::Rec2020,
@@ -187,6 +197,8 @@ impl ColorSpace {
         ColorSpace::AppleLog,
         ColorSpace::DLogDGamut,
         ColorSpace::Linear709,
+        ColorSpace::BmdFilm5Bmdwg,
+        ColorSpace::Log3G10Rwg,
     ];
 
     /// Stable id used in commands and project files.
@@ -208,6 +220,8 @@ impl ColorSpace {
             ColorSpace::AppleLog => "applelog",
             ColorSpace::DLogDGamut => "dlog-dgamut",
             ColorSpace::Linear709 => "linear709",
+            ColorSpace::BmdFilm5Bmdwg => "bmdfilm5-bmdwg",
+            ColorSpace::Log3G10Rwg => "log3g10-rwg",
         }
     }
 
@@ -229,6 +243,8 @@ impl ColorSpace {
             ColorSpace::AppleLog => "Apple Log / Rec. 2020",
             ColorSpace::DLogDGamut => "DJI D-Log / D-Gamut",
             ColorSpace::Linear709 => "Linear (Rec. 709 primaries)",
+            ColorSpace::BmdFilm5Bmdwg => "Blackmagic Film Gen 5 / Blackmagic Wide Gamut",
+            ColorSpace::Log3G10Rwg => "RED Log3G10 / REDWideGamutRGB",
         }
     }
 
@@ -251,6 +267,8 @@ impl ColorSpace {
             ColorSpace::LogC3Awg3 => Gamut::Awg3,
             ColorSpace::LogC4Awg4 => Gamut::Awg4,
             ColorSpace::DLogDGamut => Gamut::DGamut,
+            ColorSpace::BmdFilm5Bmdwg => Gamut::BmdWideGamut,
+            ColorSpace::Log3G10Rwg => Gamut::RedWideGamutRgb,
         }
     }
 
@@ -269,6 +287,8 @@ impl ColorSpace {
             ColorSpace::LogC4Awg4 => Curve::Log(LogCurve::LogC4),
             ColorSpace::AppleLog => Curve::Log(LogCurve::AppleLog),
             ColorSpace::DLogDGamut => Curve::Log(LogCurve::DLog),
+            ColorSpace::BmdFilm5Bmdwg => Curve::Log(LogCurve::BmdFilmGen5),
+            ColorSpace::Log3G10Rwg => Curve::Log(LogCurve::Log3G10),
         }
     }
 
@@ -364,6 +384,20 @@ impl ColorPipeline {
 
 #[cfg(test)]
 mod tests {
+
+    /// REDWideGamutRGB → Rec. 709 from the primaries matches the matrix RED publishes in its
+    /// white paper (which also documents the primaries used here).
+    #[test]
+    fn rwg_to_rec709_matches_reds_white_paper() {
+        let m = gamut_matrix(Gamut::RedWideGamutRgb, Gamut::Bt709);
+        let paper = [[1.981_880, -0.900_388, -0.081_540], [-0.178_143, 1.500_467, -0.322_325], [-0.101_811, -0.535_343, 1.637_304]];
+        for (r, row) in paper.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                // (RED rounded its own Rec. 709 / D65 constants: within 0.03 %)
+                assert!((m[r][c] - v).abs() < 5e-4, "[{r}][{c}] {} vs {v}", m[r][c]);
+            }
+        }
+    }
     use super::*;
 
     #[test]

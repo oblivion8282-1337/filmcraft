@@ -48,6 +48,9 @@ impl Chroma {
 pub enum PixelData {
     /// Straight-alpha, sRGB/709-encoded RGBA, 8 bits per channel.
     Rgba8(Arc<Vec<u8>>),
+    /// Straight-alpha RGBA, 16 bits per channel, encoded with the frame's transfer (or the media's
+    /// colour space: camera RAW comes as log this way).
+    Rgba16(Arc<Vec<u16>>),
     /// Premultiplied, linear-light RGBA f32 (compositor working format).
     RgbaF32(Arc<Vec<f32>>),
     /// 8-bit planar Y'CbCr (optionally with an alpha plane).
@@ -123,6 +126,7 @@ impl VideoFrame {
     pub fn format_label(&self) -> String {
         match &self.data {
             PixelData::Rgba8(_) => "RGBA 8-bit".into(),
+            PixelData::Rgba16(_) => "RGBA 16-bit".into(),
             PixelData::RgbaF32(_) => "RGBA 32-bit float".into(),
             PixelData::Yuv8 { chroma, .. } => format!("YUV {} 8-bit", chroma.label()),
             PixelData::Yuv16 { chroma, bits, .. } => format!("YUV {} {bits}-bit", chroma.label()),
@@ -134,6 +138,7 @@ impl VideoFrame {
     pub fn byte_size(&self) -> usize {
         match &self.data {
             PixelData::Rgba8(d) => d.len(),
+            PixelData::Rgba16(d) => d.len() * 2,
             PixelData::RgbaF32(d) => d.len() * 4,
             PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len()),
             PixelData::Yuv16 { planes, alpha, .. } => (planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len())) * 2,
@@ -145,7 +150,7 @@ impl VideoFrame {
     /// through its CPU fallback (fetched once, then shared), any other frame as it is.
     pub fn cpu_frame(&self) -> std::borrow::Cow<'_, VideoFrame> {
         match &self.data {
-            PixelData::External(e) => std::borrow::Cow::Owned(VideoFrame { data: PixelData::Rgba8(e.rgba8(self.width, self.height)), ..self.clone() }),
+            PixelData::External(e) => std::borrow::Cow::Owned(VideoFrame { data: e.cpu(self.width, self.height), ..self.clone() }),
             _ => std::borrow::Cow::Borrowed(self),
         }
     }
@@ -190,7 +195,7 @@ impl VideoFrame {
                     alpha: alpha.as_ref().map(|a| Arc::new(box_plane(a, w, h, ow, oh, n))),
                 }
             }
-            PixelData::Rgba8(_) | PixelData::RgbaF32(_) | PixelData::External(_) => return None,
+            PixelData::Rgba8(_) | PixelData::Rgba16(_) | PixelData::RgbaF32(_) | PixelData::External(_) => return None,
         };
         Some(VideoFrame { width: ow as u32, height: oh as u32, data, color: self.color, par: self.par, pts: self.pts })
     }
@@ -203,7 +208,7 @@ impl VideoFrame {
         let (w, h) = (self.width as usize, self.height as usize);
         let (sx, sy) = match &self.data {
             PixelData::Yuv8 { chroma, .. } | PixelData::Yuv16 { chroma, .. } => chroma.shifts(),
-            PixelData::Rgba8(_) | PixelData::RgbaF32(_) => (0, 0),
+            PixelData::Rgba8(_) | PixelData::Rgba16(_) | PixelData::RgbaF32(_) => (0, 0),
             PixelData::External(_) => return self.cpu_frame().cropped(region),
         };
         let (mx, my) = ((1usize << sx) - 1, (1usize << sy) - 1);
@@ -217,6 +222,7 @@ impl VideoFrame {
         };
         let data = match &self.data {
             PixelData::Rgba8(d) => PixelData::Rgba8(Arc::new(crop_plane(d, w, h, 4, r))),
+            PixelData::Rgba16(d) => PixelData::Rgba16(Arc::new(crop_plane(d, w, h, 4, r))),
             PixelData::RgbaF32(d) => PixelData::RgbaF32(Arc::new(crop_plane(d, w, h, 4, r))),
             PixelData::Yuv8 { planes, chroma, alpha } => {
                 let (cw, ch) = (w.div_ceil(1 << sx), h.div_ceil(1 << sy));
@@ -264,6 +270,7 @@ impl VideoFrame {
         let (w, h) = (self.width as usize, self.height as usize);
         let data = match &self.data {
             PixelData::Rgba8(d) => PixelData::Rgba8(Arc::new(rotate_plane(d, w, h, 4, q))),
+            PixelData::Rgba16(d) => PixelData::Rgba16(Arc::new(rotate_plane(d, w, h, 4, q))),
             PixelData::RgbaF32(d) => PixelData::RgbaF32(Arc::new(rotate_plane(d, w, h, 4, q))),
             PixelData::Yuv8 { planes, chroma, alpha } => {
                 let (c, chroma) = rotate_chroma(planes, *chroma, w, h, q);
@@ -421,6 +428,40 @@ impl VideoFrame {
                     }
                 });
             }
+            PixelData::Rgba16(d) => {
+                // every 16-bit code through the curve once (the decode table, or the transfer)
+                let lut: Vec<f32> = (0..=u16::MAX)
+                    .map(|v| {
+                        let x = v as f32 / 65535.0;
+                        match decode {
+                            Some(t) => t.lookup(x),
+                            None => to_linear(x, info.transfer),
+                        }
+                    })
+                    .collect();
+                out.par_chunks_mut(r.w * 4).enumerate().for_each(|(ry, row)| {
+                    let oy = r.y + ry;
+                    for rx in 0..r.w {
+                        let ox = r.x + rx;
+                        let mut acc = [0f32; 4];
+                        for dy in 0..n {
+                            let y = (oy * n + dy).min(h - 1);
+                            for dx in 0..n {
+                                let x = (ox * n + dx).min(w - 1);
+                                let Some(s) = d.get((y * w + x) * 4..(y * w + x) * 4 + 4) else { continue };
+                                let a = s[3] as f32 / 65535.0;
+                                acc[0] += lut[s[0] as usize] * a;
+                                acc[1] += lut[s[1] as usize] * a;
+                                acc[2] += lut[s[2] as usize] * a;
+                                acc[3] += a;
+                            }
+                        }
+                        for k in 0..4 {
+                            row[rx * 4 + k] = acc[k] * inv;
+                        }
+                    }
+                });
+            }
             PixelData::Yuv8 { planes, chroma, alpha } => {
                 let (sx, sy) = chroma.shifts();
                 let cw = w.div_ceil(1 << sx);
@@ -531,7 +572,7 @@ impl VideoFrame {
         let (w, h) = (self.width as usize, self.height as usize);
         match &self.data {
             PixelData::Rgba8(d) => d.as_ref().clone(),
-            PixelData::External(e) => e.rgba8(self.width, self.height).as_ref().clone(),
+            PixelData::External(_) => self.cpu_frame().to_rgba8(),
             PixelData::Yuv8 { planes, chroma, alpha: None }
                 if matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb) =>
             {
@@ -869,7 +910,7 @@ mod tests {
                 0,
                 256,
                 ExternalLayout::Rgba8,
-                Box::new(move || Some(px.clone())),
+                Box::new(move || Some(PixelData::Rgba8(Arc::new(px.clone())))),
                 None,
             ))),
             ..host.clone()
@@ -884,6 +925,25 @@ mod tests {
         assert_eq!(ext.to_linear_f32_region(1, None, r), host.to_linear_f32_region(1, None, r));
         assert!(ext.box_decimated(2).is_none());
         assert_eq!(ext.byte_size(), 256 * 4, "a GPU frame counts its buffer rows while it holds them");
+    }
+
+    /// A 16-bit RGBA frame converts like the same picture in 8 bits (each code × 257 is the very
+    /// same value), crops and turns like it, and keeps its 16 bits through the turn.
+    #[test]
+    fn rgba16_converts_like_its_8_bit_picture() {
+        let (w, h) = (6u32, 4u32);
+        let px8: Vec<u8> = (0..w * h * 4).map(|i| if i % 4 == 3 { (200 + i % 50) as u8 } else { (i * 37 % 251) as u8 }).collect();
+        let f8 = VideoFrame::rgba8(w, h, px8.clone());
+        let f16 = VideoFrame { data: PixelData::Rgba16(Arc::new(px8.iter().map(|v| u16::from(*v) * 257).collect())), ..f8.clone() };
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(close(&f16.to_linear_f32(), &f8.to_linear_f32()));
+        assert!(close(&f16.to_linear_f32_decimated(2).2, &f8.to_linear_f32_decimated(2).2));
+        assert_eq!(f16.to_rgba8(), f8.to_rgba8());
+        let r = Region { x: 1, y: 1, w: 3, h: 2 };
+        assert_eq!(f16.cropped(r).to_rgba8(), f8.cropped(r).to_rgba8());
+        assert_eq!(f16.rotated(1).to_rgba8(), f8.rotated(1).to_rgba8());
+        assert!(matches!(f16.rotated(1).data, PixelData::Rgba16(_)));
+        assert_eq!(f16.byte_size(), (w * h * 8) as usize);
     }
 
     #[test]

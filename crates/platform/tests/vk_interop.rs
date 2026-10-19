@@ -52,20 +52,15 @@ fn real_gpu_frames_composite_like_host_frames() {
         let via_gpu = composite(&mut c, gpu.clone());
         assert_eq!(c.external_copies(), copies + 1, "frame {k}: imported and copied on the GPU");
         let host = Arc::new(gpu.cpu_frame().into_owned());
-        assert!(matches!(host.data, PixelData::Rgba8(_)));
+        assert!(matches!(host.data, PixelData::Rgba8(_) | PixelData::Rgba16(_)));
         let via_host = composite(&mut c, host);
         assert_eq!(via_gpu.len(), via_host.len());
         let diff = via_gpu.iter().zip(&via_host).filter(|(a, b)| a != b).count();
         let max = via_gpu.iter().zip(&via_host).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
         eprintln!("frame {k} at {scale} ({}×{}, {layout:?}): {diff} differing bytes, at most {max}", gpu.width, gpu.height);
-        if layout == filmcraft_frame::ExternalLayout::RgbaF16 {
-            // the 16-bit decode against the SDK's own 8-bit rendering: R3D's 8 bits round its
-            // 16 (within 1), the BRAW SDK's 8-bit output sits up to 1.7 steps below its 16-bit
-            // one (within 2)
-            assert!(max <= 2, "frame {k}: 16-bit GPU path within 2 of the 8-bit host path");
-        } else {
-            assert_eq!(diff, 0, "frame {k}: GPU path and host path composite alike");
-        }
+        // both come as the same encoded values (half floats of the 16-bit codes on the GPU, the
+        // 16-bit codes over the host; 8 bits both ways from an 8-bit bridge)
+        assert_eq!(diff, 0, "frame {k}: GPU path and host path composite alike");
     }
 
     // Time decode + composite of 24 full-resolution frames per path (fresh frames each).

@@ -260,38 +260,39 @@ impl InputTransform {
         self.apply(rgb.map(|v| self.table.lookup(v)))
     }
 
-    /// The transform as plain numbers for a shader, which evaluates the curve and the BT.2390
-    /// EETF directly instead of sampling the tables. `None` for what a shader does not do: log
-    /// curves and the camera-gamut compression.
+    /// The transform as plain numbers for a shader. Display curves and the BT.2390 EETF are
+    /// evaluated directly; a log curve is sampled from [`InputTransform::table`] (the shader gets
+    /// its values as a texture and interpolates them as [`DecodeTable::lookup`] does).
     pub fn gpu_params(&self) -> Option<GpuInputParams> {
         let curve = match self.source.curve() {
             Curve::Sdr | Curve::Srgb => GpuCurve::Sdr,
             Curve::Linear => GpuCurve::Linear,
             Curve::Pq => GpuCurve::Pq,
             Curve::Hlg => GpuCurve::Hlg,
-            Curve::Log(_) => return None,
+            Curve::Log(_) => GpuCurve::Table,
         };
-        if self.compress {
-            return None;
-        }
         Some(GpuInputParams {
             curve,
+            table: (curve == GpuCurve::Table).then_some((self.table.lo, self.table.hi, self.table.values.len() as u32)),
             hlg: self.hlg,
             matrix: (!self.identity_matrix).then_some(self.matrix),
             tone: self.tone.as_ref().map(|t| (t.src_peak_nits as f32, t.dst_peak_nits as f32)),
+            compress: self.compress,
             desaturate: self.desaturate,
         })
     }
 }
 
-/// How a shader decodes a channel ([`decode_channel`] without the table): SDR with the sRGB curve,
-/// linear, PQ in working units (cd/m² over [`REFERENCE_WHITE_NITS`]), HLG to scene light.
+/// How a shader decodes a channel ([`decode_channel`]): SDR with the sRGB curve, linear, PQ in
+/// working units (cd/m² over [`REFERENCE_WHITE_NITS`]), HLG to scene light, or — log curves —
+/// through the sampled decode table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuCurve {
     Sdr,
     Linear,
     Pq,
     Hlg,
+    Table,
 }
 
 /// [`InputTransform`] for a shader ([`InputTransform::gpu_params`]), stage by stage as
@@ -299,12 +300,16 @@ pub enum GpuCurve {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuInputParams {
     pub curve: GpuCurve,
+    /// The signal range the decode table covers (lo, hi) and its entries, for [`GpuCurve::Table`].
+    pub table: Option<(f32, f32, u32)>,
     /// HLG OOTF: BT.2020 luma weights and the scale to working units.
     pub hlg: Option<([f32; 3], f32)>,
     /// Into the working primaries (row-major), when they differ.
     pub matrix: Option<[[f32; 3]; 3]>,
     /// BT.2390 tone mapping (source peak, target peak) in cd/m², on max(R,G,B) as a ratio.
     pub tone: Option<(f32, f32)>,
+    /// The camera-gamut compression ([`gamut_compress`]) after tone mapping.
+    pub compress: bool,
     /// Luma weights to desaturate into the working gamut with ([`desaturate_into_gamut`]).
     pub desaturate: Option<[f32; 3]>,
 }
@@ -511,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_params_cover_display_referred_media_only() {
+    fn gpu_params_cover_every_source_space() {
         // HLG / PQ / BT.2020 into Rec. 709: every stage the shader has (#965)
         let p = |cs| InputTransform::new(cs, Range::Limited, &ColorPipeline::REC709, None).gpu_params();
         let hlg = p(ColorSpace::Rec2100Hlg).unwrap();
@@ -523,9 +528,12 @@ mod tests {
         let sdr2020 = p(ColorSpace::Rec2020).unwrap();
         assert_eq!((sdr2020.curve, sdr2020.tone), (GpuCurve::Sdr, None));
         assert!(sdr2020.matrix.is_some() && sdr2020.desaturate.is_some());
-        // log curves and camera-gamut compression stay on the CPU
+        // log curves: the decode table (sampled by the shader over its range) and the camera-gamut
+        // compression
         for cs in ColorSpace::ALL.into_iter().filter(|c| c.is_log()) {
-            assert_eq!(p(cs), None, "{cs:?}");
+            let g = p(cs).unwrap_or_else(|| panic!("{cs:?}: on the GPU"));
+            assert_eq!((g.curve, g.table, g.compress), (GpuCurve::Table, Some((-0.1, 1.1, 8192)), true), "{cs:?}");
+            assert!(g.matrix.is_some() && g.tone.is_some(), "{cs:?}");
         }
     }
 

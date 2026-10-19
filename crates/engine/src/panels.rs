@@ -221,7 +221,7 @@ pub fn metadata_fields(p: &Project, id: ItemId) -> Vec<Field> {
     if let Some(v) = media.and_then(|m| m.info.video.as_ref()) {
         add("Clip", "Video Info", format!("{} x {} ({:.4})", v.width, v.height, v.par.0 as f64 / v.par.1.max(1) as f64), false);
         add("Clip", "Video Codec", v.codec.clone(), false);
-        let detected = filmcraft_color::ColorSpace::from_info(&v.color);
+        let detected = v.color_space.unwrap_or_else(|| filmcraft_color::ColorSpace::from_info(&v.color));
         let cs = media.and_then(|m| m.interpret.color_space).unwrap_or(detected);
         add("Clip", "Color Space", cs.label().to_string(), false);
     }

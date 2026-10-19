@@ -11,17 +11,18 @@ struct U {
     m0: vec4<f32>,   // a b c d
     m1: vec4<f32>,   // e f out_w out_h
     src: vec4<f32>,  // src_w src_h chroma_w chroma_h
-    p0: vec4<f32>,   // opacity, kind (0 rgba8 srgb straight, 1 rgba16f premul linear, 2 yuv), taps, transfer (0 srgb, 1 linear, 2 pq, 3 hlg)
+    p0: vec4<f32>,   // opacity, kind (0 rgba8 srgb straight, 1 rgba16f premul linear, 2 yuv, 3 rgba encoded straight), taps, transfer (0 srgb, 1 linear, 2 pq, 3 hlg)
     p1: vec4<f32>,   // y_off y_scale c_off c_scale (code units)
     p2: vec4<f32>,   // kr kb code_scale footprint
     p3: vec4<f32>,   // blend mode, alpha-plane scale (0: none), effect-source integer decimation, unused
-    // Colour management of HDR / wide-gamut Y'CbCr (`filmcraft_color::InputTransform`, #965):
-    q0: vec4<f32>,   // on, curve (0 sdr, 1 linear, 2 pq, 3 hlg), HLG OOTF scale (0: none), reference white cd/m²
+    // Colour management (`filmcraft_color::InputTransform`, #965): HDR / wide-gamut / log media
+    q0: vec4<f32>,   // on, curve (0 sdr, 1 linear, 2 pq, 3 hlg, 4 decode table), HLG OOTF scale (0: none), reference white cd/m²
     q1: vec4<f32>,   // HLG OOTF luma weights, gamut matrix on
     q2: vec4<f32>,   // gamut matrix row 0, tone mapping on
     q3: vec4<f32>,   // gamut matrix row 1, tone-mapping source peak cd/m²
     q4: vec4<f32>,   // gamut matrix row 2, tone-mapping target peak cd/m²
     q5: vec4<f32>,   // desaturation luma weights, desaturation on
+    q6: vec4<f32>,   // decode table signal range lo, hi; camera-gamut compression on; table entries - 1
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -32,6 +33,9 @@ struct U {
 @group(0) @binding(4) var backdrop: texture_2d<f32>;
 // The alpha plane of a Y'CbCr source (ProRes 4444, ...); a dummy texture when `u.p3.y` is 0.
 @group(0) @binding(5) var tex3: texture_2d<f32>;
+// A log curve's decode table (`DecodeTable::values`, row after row of `textureDimensions().x`);
+// a dummy texture unless the curve is 4.
+@group(0) @binding(6) var lut: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -122,8 +126,43 @@ fn eetf(nits: f32, s: f32, d: f32) -> f32 {
     return pq1(e2 * smax) * 10000.0;
 }
 
+// One entry of the decode table.
+fn lut_at(i: u32) -> f32 {
+    let wd = textureDimensions(lut).x;
+    return textureLoad(lut, vec2<i32>(i32(i % wd), i32(i / wd)), 0).r;
+}
+
+// `DecodeTable::lookup`: linear interpolation over [lo, hi], the signal clamped to it.
+fn table1(v: f32) -> f32 {
+    let n = u.q6.w;
+    let p = clamp((v - u.q6.x) / (u.q6.y - u.q6.x), 0.0, 1.0) * n;
+    let i = min(u32(p), u32(n) - 1u);
+    let f = p - f32(i);
+    let a = lut_at(i);
+    return a + (lut_at(i + 1u) - a) * f;
+}
+
+// `filmcraft_color::gamut_compress`: out-of-gamut colours towards the achromatic axis.
+fn gamut_compress(c: vec3<f32>) -> vec3<f32> {
+    let th = 0.8; let lim = 1.25; let pw = 1.2;
+    let ach = max(max(c.r, c.g), c.b);
+    if ach <= 1e-9 { return max(c, vec3(0.0)); }
+    let s = (lim - th) / pow(pow((lim - th) / (1.0 - th), pw) - 1.0, 1.0 / pw);
+    var o = c;
+    for (var k = 0; k < 3; k++) {
+        let d = (ach - c[k]) / ach;
+        if d >= th {
+            let x = (d - th) / s;
+            let dc = th + s * x / pow(1.0 + pow(x, pw), 1.0 / pw);
+            o[k] = ach - dc * ach;
+        }
+    }
+    return o;
+}
+
 // Signal → working linear: `InputTransform::convert` (curve, HLG OOTF, gamut matrix, tone
-// mapping, desaturation into the working gamut). The CPU's decode tables clamp the signal to 0..1.
+// mapping, camera-gamut compression, desaturation into the working gamut). The display curves
+// clamp the signal to 0..1 as the CPU's tables do; a log table covers its own range.
 fn managed(rgb: vec3<f32>) -> vec3<f32> {
     let v = clamp(rgb, vec3(0.0), vec3(1.0));
     let curve = u32(u.q0.y);
@@ -132,6 +171,7 @@ fn managed(rgb: vec3<f32>) -> vec3<f32> {
     if curve == 0u { c = srgb_to_linear(v); }
     if curve == 2u { c = vec3(pq1(v.r), pq1(v.g), pq1(v.b)) * (10000.0 / white); }
     if curve == 3u { c = hlg_inv(v); }
+    if curve == 4u { c = vec3(table1(rgb.r), table1(rgb.g), table1(rgb.b)); }
     if u.q0.z > 0.0 {
         let ys = max(dot(u.q1.xyz, c), 0.0);
         var g = 0.0;
@@ -153,6 +193,9 @@ fn managed(rgb: vec3<f32>) -> vec3<f32> {
             }
             c = c * k;
         }
+    }
+    if u.q6.z > 0.5 {
+        c = gamut_compress(c);
     }
     if u.q5.w > 0.5 {
         let mn = min(min(c.r, c.g), c.b);
@@ -178,6 +221,14 @@ fn sample(p: vec2<f32>) -> vec4<f32> {
     }
     if kind == 1u {
         return load4(tex0, p);
+    }
+    if kind == 3u {
+        // encoded RGBA (16-bit and camera RAW frames), straight alpha: the transfer or the
+        // colour management decodes it
+        let c = load4(tex0, p);
+        var lin = to_linear(c.rgb);
+        if u.q0.x > 0.5 { lin = managed(c.rgb); }
+        return vec4(lin * c.a, c.a);
     }
     let cs = u.p2.z;
     let yc = load4(tex0, p).r * cs;

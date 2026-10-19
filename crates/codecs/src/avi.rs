@@ -321,6 +321,7 @@ impl AviSource {
                 has_alpha: false,
                 bitrate,
                 hdr: None,
+                color_space: None,
             });
             vcodec = codec;
         }

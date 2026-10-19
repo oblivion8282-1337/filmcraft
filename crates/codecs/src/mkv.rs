@@ -405,6 +405,7 @@ impl MkvSource {
                 has_alpha: v.alpha_mode != 0,
                 bitrate,
                 hdr: v.colour.as_ref().and_then(hdr_metadata),
+                color_space: None,
             }
         });
         let audio_streams: Vec<AudioStreamInfo> = atracks

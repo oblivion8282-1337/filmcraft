@@ -42,11 +42,25 @@ pub enum LogCurve {
     AppleLog,
     /// DJI D-Log.
     DLog,
+    /// Blackmagic Design Film, Generation 5 colour science (Blackmagic RAW, Pyxis/URSA Cine).
+    BmdFilmGen5,
+    /// RED Log3G10 (IPP2).
+    Log3G10,
 }
 
 impl LogCurve {
-    pub const ALL: [LogCurve; 8] =
-        [LogCurve::SLog3, LogCurve::VLog, LogCurve::CLog2, LogCurve::CLog3, LogCurve::LogC3, LogCurve::LogC4, LogCurve::AppleLog, LogCurve::DLog];
+    pub const ALL: [LogCurve; 10] = [
+        LogCurve::SLog3,
+        LogCurve::VLog,
+        LogCurve::CLog2,
+        LogCurve::CLog3,
+        LogCurve::LogC3,
+        LogCurve::LogC4,
+        LogCurve::AppleLog,
+        LogCurve::DLog,
+        LogCurve::BmdFilmGen5,
+        LogCurve::Log3G10,
+    ];
 
     pub fn domain(self) -> Domain {
         match self {
@@ -65,6 +79,8 @@ impl LogCurve {
             LogCurve::LogC4 => "ARRI LogC4",
             LogCurve::AppleLog => "Apple Log",
             LogCurve::DLog => "DJI D-Log",
+            LogCurve::BmdFilmGen5 => "Blackmagic Film Gen 5",
+            LogCurve::Log3G10 => "RED Log3G10",
         }
     }
 
@@ -79,6 +95,8 @@ impl LogCurve {
             LogCurve::LogC4 => logc4_encode(x),
             LogCurve::AppleLog => apple_log_encode(x),
             LogCurve::DLog => dlog_encode(x),
+            LogCurve::BmdFilmGen5 => bmd_film_gen5_encode(x),
+            LogCurve::Log3G10 => log3g10_encode(x),
         }
     }
 
@@ -93,6 +111,8 @@ impl LogCurve {
             LogCurve::LogC4 => logc4_decode(y),
             LogCurve::AppleLog => apple_log_decode(y),
             LogCurve::DLog => dlog_decode(y),
+            LogCurve::BmdFilmGen5 => bmd_film_gen5_decode(y),
+            LogCurve::Log3G10 => log3g10_decode(y),
         }
     }
 
@@ -262,9 +282,52 @@ pub fn dlog_decode(y: f64) -> f64 {
     if y <= 0.14 { (y - 0.0929) / 6.025 } else { (10f64.powf(3.896_16 * y - 2.277_52) - 0.0108) / 0.9892 }
 }
 
+// ---------------------------------------------------------------- Blackmagic Film Gen 5
+// Blackmagic Design, "Blackmagic Generation 5 Color Science" (2021): Blackmagic Design Film,
+// a linear toe below 0.005 and a natural-log curve above; 18 % grey → 0.3836.
+
+const BMD_FILM5: (f64, f64, f64, f64, f64, f64) =
+    (0.086_928_760_654_912_24, 0.005_494_072_432_257_808, 0.530_013_339_229_193_9, 8.283_605_932_402_494, 0.092_465_753_424_657_53, 0.005);
+
+pub fn bmd_film_gen5_encode(x: f64) -> f64 {
+    let (a, b, c, d, e, cut) = BMD_FILM5;
+    if x < cut { d * x + e } else { a * (x + b).ln() + c }
+}
+pub fn bmd_film_gen5_decode(y: f64) -> f64 {
+    let (a, b, c, d, e, cut) = BMD_FILM5;
+    if y < d * cut + e { (y - e) / d } else { ((y - c) / a).exp() - b }
+}
+
+// ---------------------------------------------------------------- RED Log3G10
+// RED Digital Cinema, "White Paper on REDWideGamutRGB and Log3G10" (Form 915-0187 Rev B, 2017):
+// 18 % grey → 1/3, 10 stops above grey → 1.0; a linear extension below −0.01.
+
+const LOG3G10: (f64, f64, f64, f64) = (0.224_282, 155.975_327, 0.01, 15.1927);
+
+pub fn log3g10_encode(x: f64) -> f64 {
+    let (a, b, c, g) = LOG3G10;
+    let x = x + c;
+    if x < 0.0 { x * g } else { a * (x * b + 1.0).log10() }
+}
+pub fn log3g10_decode(y: f64) -> f64 {
+    let (a, b, c, g) = LOG3G10;
+    if y < 0.0 { y / g - c } else { (10f64.powf(y / a) - 1.0) / b - c }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published anchor points of the two camera-RAW curves.
+    #[test]
+    fn camera_raw_curves_hit_their_published_anchors() {
+        assert!((bmd_film_gen5_encode(0.18) - 0.3836).abs() < 5e-4, "{}", bmd_film_gen5_encode(0.18));
+        // the toe and the log section meet at the cut
+        assert!((bmd_film_gen5_encode(0.005 - 1e-12) - bmd_film_gen5_encode(0.005)).abs() < 1e-6);
+        assert!((log3g10_encode(0.18) - 1.0 / 3.0).abs() < 1e-3, "{}", log3g10_encode(0.18));
+        assert!((log3g10_encode(0.18 * 1024.0) - 1.0).abs() < 1e-3, "{}", log3g10_encode(184.32));
+        assert!((log3g10_decode(0.0) + 0.01).abs() < 1e-9, "signal 0 is linear −c");
+    }
 
     #[test]
     fn roundtrip_every_curve() {

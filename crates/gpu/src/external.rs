@@ -29,14 +29,14 @@ fn importer() -> Option<Arc<dyn ExternalImporter>> {
     IMPORTER.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// The texture format an external layout is sampled as (8-bit layouts sRGB-encoded like `Rgba8`
-/// frames, half floats as they are), and the compositor's source kind for it (0: RGBA, 1:
-/// premultiplied linear float).
+/// The texture format an external layout is copied into, and the compositor's source kind for
+/// it: every layout holds encoded values with straight alpha (kind 3), which the shader decodes
+/// with the frame's transfer or its colour management.
 fn texture_format(layout: ExternalLayout) -> (wgpu::TextureFormat, u32) {
     match layout {
-        ExternalLayout::Rgba8 => (wgpu::TextureFormat::Rgba8UnormSrgb, 0),
-        ExternalLayout::Bgra8 => (wgpu::TextureFormat::Bgra8UnormSrgb, 0),
-        ExternalLayout::RgbaF16 => (wgpu::TextureFormat::Rgba16Float, 1),
+        ExternalLayout::Rgba8 => (wgpu::TextureFormat::Rgba8Unorm, 3),
+        ExternalLayout::Bgra8 => (wgpu::TextureFormat::Bgra8Unorm, 3),
+        ExternalLayout::RgbaF16 => (wgpu::TextureFormat::Rgba16Float, 3),
     }
 }
 

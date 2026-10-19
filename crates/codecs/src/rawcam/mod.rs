@@ -401,6 +401,17 @@ fn showable(f: &VideoFrame) -> bool {
     !matches!(&f.data, filmcraft_frame::PixelData::External(img) if img.is_spent())
 }
 
+/// A host reply's pixels as a frame's data: 16-bit RGBA kept in 16 bits, every other layout as
+/// RGBA8.
+fn host_pixel_data(reply: bridge::FrameBytes) -> filmcraft_frame::PixelData {
+    match reply.format {
+        bridge::FrameFormat::Rgba16 => {
+            filmcraft_frame::PixelData::Rgba16(Arc::new(reply.data.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect()))
+        }
+        _ => filmcraft_frame::PixelData::Rgba8(Arc::new(host_rgba(reply))),
+    }
+}
+
 /// A host reply's pixels as RGBA8 rows (R3D's BGRA swapped in place, a legacy `rgb24` bridge's
 /// pixels widened).
 fn host_rgba(reply: bridge::FrameBytes) -> Vec<u8> {
@@ -421,18 +432,17 @@ fn host_rgba(reply: bridge::FrameBytes) -> Vec<u8> {
             }
             rgba
         }
-        // (bridges send half floats only into GPU memory; read one that came anyway)
+        // (bridges send half floats only into GPU memory; read one that came anyway: the same
+        // encoded values in 8 bits)
         bridge::FrameFormat::RgbaF16 => {
             let mut rgba = Vec::with_capacity(reply.data.len() / 2);
             for px in reply.data.as_chunks::<8>().0 {
                 let ch = |i: usize| half_to_f32(u16::from_le_bytes([px[i * 2], px[i * 2 + 1]]));
-                let a = ch(3).clamp(0.0, 1.0);
-                let straight = |v: f32| if a > 0.0 { v / a } else { 0.0 };
-                rgba.extend([ch(0), ch(1), ch(2)].map(|v| filmcraft_color::linear_to_srgb_u8(straight(v))));
-                rgba.push((a * 255.0).round() as u8);
+                rgba.extend([ch(0), ch(1), ch(2), ch(3)].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
             }
             rgba
         }
+        bridge::FrameFormat::Rgba16 => reply.data.as_chunks::<2>().0.iter().map(|b| (u16::from_le_bytes(*b) >> 8) as u8).collect(),
     }
 }
 
@@ -762,11 +772,13 @@ impl RawCamSource {
                 frame_rate: rate,
                 par: (1, 1),
                 codec: format.label().into(),
-                pixel_format: "Debayered RGB 8-bit".into(),
+                pixel_format: if meta.caps.gpu_export { "Debayered RGB 16-bit" } else { "Debayered RGB 8-bit" }.into(),
                 color: ColorInfo::SRGB_FULL,
                 has_alpha: false,
                 bitrate,
                 hdr: None,
+                // the camera log encoding the bridge decodes to (an unknown id: display RGB)
+                color_space: meta.color.as_deref().and_then(filmcraft_color::ColorSpace::parse),
             }),
             audio_streams,
             container: format.label().into(),
@@ -868,9 +880,11 @@ impl RawCamSource {
         self.open_own(tier)
     }
 
-    /// The bytes of this clip's full-resolution RGBA frame (the shared bridge's slot size).
+    /// The bytes of this clip's full-resolution frame (the shared bridge's slot size): 16-bit
+    /// RGBA for a bridge that hands out 16 bits, 8-bit otherwise.
     fn frame_bytes(&self) -> u64 {
-        self.info.video.as_ref().map_or(0, |v| u64::from(v.width).saturating_mul(u64::from(v.height)).saturating_mul(4))
+        let bpp = if self.gpu_export && f16_frames_enabled() { 8 } else { 4 };
+        self.info.video.as_ref().map_or(0, |v| u64::from(v.width).saturating_mul(u64::from(v.height)).saturating_mul(bpp))
     }
 
     /// A bridge process of this clip's own (single-clip `--persistent`), within the process cap.
@@ -1076,21 +1090,22 @@ impl RawCamSource {
                 let layout = match reply.format {
                     bridge::FrameFormat::Bgra8 => filmcraft_frame::ExternalLayout::Bgra8,
                     bridge::FrameFormat::RgbaF16 => filmcraft_frame::ExternalLayout::RgbaF16,
-                    bridge::FrameFormat::Rgba8 | bridge::FrameFormat::Rgb24 => filmcraft_frame::ExternalLayout::Rgba8,
+                    // (GPU frames come as rgba8 / bgra8 / rgbaf16 only: the reader refuses others)
+                    bridge::FrameFormat::Rgba8 | bridge::FrameFormat::Rgb24 | bridge::FrameFormat::Rgba16 => filmcraft_frame::ExternalLayout::Rgba8,
                 };
                 let me = self.self_ref.get().cloned().unwrap_or_default();
                 let fetch: filmcraft_frame::external::CpuFallback = Box::new(move || me.upgrade()?.host_pixels(idx, tier));
                 let image = filmcraft_frame::ExternalImage::new(gpu.memory, 0, gpu.pitch, layout, fetch, Some(Box::new(gpu.release)));
                 VideoFrame { width, height, data: filmcraft_frame::PixelData::External(Arc::new(image)), color: ColorInfo::SRGB_FULL, par: (1, 1), pts }
             }
-            None => VideoFrame::rgba8(width, height, host_rgba(reply)).with_pts(pts),
+            None => VideoFrame { width, height, data: host_pixel_data(reply), color: ColorInfo::SRGB_FULL, par: (1, 1), pts },
         }
     }
 
     /// Frame `idx` at `tier` decoded over the host path, not cached: the CPU fallback of a frame
     /// that lives in GPU memory (only CPU code paths ask). Waits for a decode slot like any
     /// request; `None` when the bridge cannot deliver it.
-    fn host_pixels(&self, idx: u64, tier: u32) -> Option<Vec<u8>> {
+    fn host_pixels(&self, idx: u64, tier: u32) -> Option<filmcraft_frame::PixelData> {
         let started = Instant::now();
         let (key, mut session, lease) = loop {
             let mut state = self.video.lock().unwrap_or_else(|e| e.into_inner());
@@ -1125,7 +1140,7 @@ impl RawCamSource {
             Ok(Ok(reply)) => {
                 lease.succeed(key, session);
                 // a host request never comes back in GPU memory, but if it did it is no pixels
-                reply.gpu.is_none().then(|| host_rgba(reply))
+                reply.gpu.is_none().then(|| host_pixel_data(reply))
             }
             Ok(Err(e)) => {
                 lease.keep(key, session);
@@ -2671,7 +2686,7 @@ args = sys.argv[1:]
 def err(s):
     sys.stderr.write(s + "\n"); sys.stderr.flush()
 CAPS = "scale,frame-errors,multi,gpu-export"
-META = '"timecode":"01:02:03:04","fps_num":24,"fps_den":1,"width":16,"height":8,"frame_count":8'
+META = '"timecode":"01:02:03:04","fps_num":24,"fps_den":1,"width":16,"height":8,"frame_count":8,"color":"bmdfilm5-bmdwg"'
 if "--probe-only" in args:
     err('{"type":"metadata",' + META + ',"protocol":2,"caps":"' + CAPS + '"}'); err('{"type":"done"}'); sys.exit(0)
 if "--multi" not in args:
@@ -2682,7 +2697,8 @@ if "--gpu-export" in args:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(args[args.index("--gpu-export") + 1])
 gpu = ',"gpu_uuid":"000102030405060708090a0b0c0d0e0f"' if sock else ""
 F16 = False
-err('{"type":"ready","protocol":3,"caps":"' + CAPS + (",gpu" + (",f16" if F16 else "") if sock else "") + '"' + gpu + "}")
+RGBA16 = False
+err('{"type":"ready","protocol":3,"caps":"' + CAPS + (",rgba16" if RGBA16 else "") + (",gpu" + (",f16" if F16 else "") if sock else "") + '"' + gpu + "}")
 fds, free, nxt = {}, [], 1
 for line in sys.stdin:
     log.write(line); log.flush()
@@ -2700,8 +2716,7 @@ for line in sys.stdin:
             f16 = len(w) > 5 and w[5] == "f16"
             if f16:
                 x = ((i + 1) % 256) / 255.0
-                lin = x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
-                px = struct.pack("<eeee", lin, lin, lin, 1.0)
+                px = struct.pack("<eeee", x, x, x, 1.0)
                 head = head.replace('"rgba8"', '"rgbaf16"')
             if free:
                 b = free.pop()
@@ -2712,6 +2727,9 @@ for line in sys.stdin:
             for y in range(H):
                 os.pwrite(fds[b], px * W, y * 256)
             err(head + ',"gpu":%d,"pitch":256}' % b); err(tail)
+        elif len(w) > 4 and w[4] == "rgba16" and RGBA16:
+            v = ((i + 1) % 256) * 257
+            err(head.replace('"rgba8"', '"rgba16"') + "}"); sys.stdout.buffer.write(struct.pack("<HHHH", v, v, v, 65535) * (W * H)); sys.stdout.flush(); err(tail)
         else:
             err(head + "}"); sys.stdout.buffer.write(px * (W * H)); sys.stdout.flush(); err(tail)
     elif w[0] == "release-gpu":
@@ -2721,7 +2739,7 @@ for line in sys.stdin:
 "#;
 
     /// A half-float frame that comes over the host after all reads as the same 8-bit picture:
-    /// half floats decoded exactly (normal, subnormal, zero), unpremultiplied, sRGB-encoded.
+    /// half floats decoded exactly (normal, subnormal, zero), the encoded values rounded.
     #[test]
     fn half_float_host_frames_read_as_rgba8() {
         assert_eq!(half_to_f32(0x3c00), 1.0);
@@ -2730,7 +2748,7 @@ for line in sys.stdin:
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
         assert!((half_to_f32(0x1376) - 0.000_911).abs() < 1e-6);
         let px = |v: u16, a: u16| [v, v, v, a].iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<u8>>();
-        let data = [px(0x1376, 0x3c00), px(0x3c00, 0x3c00), px(0x0000, 0x0000)].concat();
+        let data = [px(0x2206, 0x3c00), px(0x3c00, 0x3c00), px(0x0000, 0x0000)].concat();
         let rgba = host_rgba(bridge::FrameBytes { data, width: 3, height: 1, format: bridge::FrameFormat::RgbaF16, gpu: None });
         assert_eq!(rgba, vec![3, 3, 3, 255, 255, 255, 255, 255, 0, 0, 0, 0]);
     }
@@ -2749,7 +2767,7 @@ for line in sys.stdin:
         }
         let (dir, paths) = clips("gpuf16", &["placeholder"]);
         let bridge = dir.join("gpu-bridge");
-        std::fs::write(&bridge, FAKE_GPU_BRIDGE.replace("F16 = False", "F16 = True")).ok();
+        std::fs::write(&bridge, FAKE_GPU_BRIDGE.replace("F16 = False", "F16 = True").replace("RGBA16 = False", "RGBA16 = True")).ok();
         std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).ok();
         // (process-wide, and never withdrawn: tests run side by side; only bridges announcing
         // `gpu-export` are affected)
@@ -2765,11 +2783,18 @@ for line in sys.stdin:
         let mut mem = Vec::new();
         std::fs::File::from(fd).read_to_end(&mut mem).ok();
         let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
-        // 3/255 sRGB-encoded is 0.000911 linear: 0x1376 as a half float; alpha 1.0 is 0x3c00
-        assert_eq!(mem.get(0..8).map(|p| (half(&p[0..2]), half(&p[6..8]))), Some((0x1376, 0x3c00)));
-        assert_eq!(f.cpu_frame().to_rgba8(), [3u8, 3, 3, 255].repeat(16 * 8), "the CPU fallback reads the same picture");
+        // the encoded value 3/255 as a half float (no transfer applied); alpha 1.0 is 0x3c00
+        assert_eq!(mem.get(0..8).map(|p| (half(&p[0..2]), half(&p[6..8]))), Some((0x2206, 0x3c00)));
+        // the CPU fallback: the same picture over the host, in 16 bits
+        assert!(matches!(&f.cpu_frame().data, filmcraft_frame::PixelData::Rgba16(d) if d.get(0..4) == Some(&[771, 771, 771, 65535][..])));
+        // the colour space the bridge decodes to is the clip's detected one
+        assert_eq!(src.info().video.as_ref().and_then(|v| v.color_space), Some(filmcraft_color::ColorSpace::BmdFilm5Bmdwg));
+        // and host frames for everyone else come in 16 bits too
+        let host = src.video_frame(FrameRequest { time: Tick::from_rational(5, 1, 24), scale: 1.0 }).unwrap_or_else(|e| panic!("host frame: {e:?}"));
+        assert!(matches!(&host.data, filmcraft_frame::PixelData::Rgba16(d) if d.get(0..4) == Some(&[1542, 1542, 1542, 65535][..])), "{}", host.format_label());
         let log = std::fs::read_to_string(bridge.with_extension("cmds")).unwrap_or_default();
         assert!(log.lines().any(|l| l.starts_with("frame ") && l.ends_with(" gpu f16")), "asked for 16 bits:\n{log}");
+        assert!(log.lines().any(|l| l.starts_with("frame ") && l.ends_with(" rgba16")), "host frames in 16 bits:\n{log}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

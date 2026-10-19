@@ -45,13 +45,25 @@ stays, unchanged, as the fallback for everything else.
   256, as wgpu requires for buffer → texture copies), starting at offset 0. All GPU work writing
   the buffer has completed (stream synchronised) before the event is written.
 - **16 bits (`f16`):** a bridge whose decode has more than 8 bits (R3D: REDCuda's 16-bit RGB;
-  BRAW: the SDK's `RGBAU16` output of its 12-bit raw)
-  lists `f16` in the `ready` caps and answers `frame <h> <i> <scale> gpu f16` with
-  `"format":"rgbaf16"`: four IEEE 754 half floats per pixel (8 bytes, little-endian), linear
-  light — the sRGB EOTF applied to the very values the 8-bit path rounds — premultiplied by
-  alpha. That is the compositor's working precision (`Rgba16Float`), so the decode reaches it
-  uncut. FilmCraft asks for it whenever the bridge offers it (`FILMCRAFT_RAWCAM_F16=0` keeps 8
-  bits); the CPU fallback of such a frame still reads 8-bit pixels.
+  BRAW: the SDK's `RGBAU16` output of its 12-bit raw) lists `f16` in the `ready` caps and answers
+  `frame <h> <i> <scale> gpu f16` with `"format":"rgbaf16"`: four IEEE 754 half floats per pixel
+  (8 bytes, little-endian) holding the SDK's **encoded** 16-bit values normalised (`v / 65535`) —
+  no transfer function applied — and straight alpha (1.0). The values are in the clip's
+  colour space (below); FilmCraft's colour management decodes them, on the GPU. FilmCraft asks for
+  it whenever the bridge offers it (`FILMCRAFT_RAWCAM_F16=0` keeps 8 bits). A frame that cannot be
+  exported comes over the host as `rgba16` when the bridge has it.
+- **16 bits over the host (`rgba16`):** a multi-clip bridge listing `rgba16` in its `ready` caps
+  answers `frame <h> <i> <scale> rgba16` with `"format":"rgba16"`: four little-endian `u16` per
+  pixel (R, G, B, A; 8 bytes), the SDK's encoded values, straight alpha (65535), through a
+  shared-memory slot or stdout like any host frame. CPU code paths read camera RAW in 16 bits
+  this way (CPU effects, CPU colour management, the CPU fallback of GPU frames).
+- **Colour (`color`):** the bridges set their SDKs to deliver one known log encoding and say which
+  in every `metadata` event (probe and per handle): `"color":"bmdfilm5-bmdwg"` (BRAW: gamma
+  Blackmagic Design Film, colour science Gen 5, Blackmagic Wide Gamut, gamut compression off, no
+  post LUT) or `"color":"log3g10-rwg"` (R3D: IPP2 primary development — Log3G10,
+  REDWideGamutRGB). White balance, ISO and exposure stay as shot. FilmCraft tags the media with
+  that colour space (it becomes the clip's detected space; Interpret Footage still overrides it)
+  and converts it like any camera log media.
 - **Ownership:** a buffer named in a reply is the client's until it sends `release-gpu <B>`;
   the bridge never writes it meanwhile. A frame the bridge cannot (or will not) export — no
   buffer free under its export budget, an allocation failure — comes the old way; the client

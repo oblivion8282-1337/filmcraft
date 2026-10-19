@@ -272,6 +272,7 @@ impl Mp4Source {
                 has_alpha: matches!(&entry.codec, CodecConfig::Apv(a) if a.chroma_format_idc == 4),
                 bitrate,
                 hdr: entry.video.as_ref().and_then(|v| hdr_metadata(v.mastering_display.as_ref(), v.content_light)),
+                color_space: None,
             };
             if rotation % 2 == 1 {
                 (info.width, info.height) = (info.height, info.width);

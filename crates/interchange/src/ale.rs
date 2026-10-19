@@ -222,6 +222,7 @@ mod tests {
                 has_alpha: false,
                 bitrate: None,
                 hdr: None,
+                color_space: None,
             }),
             audio_streams: (audio > 0)
                 .then(|| AudioStreamInfo { sample_rate: 48_000, channels: audio, codec: "aac".into(), bits_per_sample: None })

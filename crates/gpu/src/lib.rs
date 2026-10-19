@@ -97,6 +97,9 @@ pub struct GpuCompositor {
     pub uploaded_bytes: u64,
     /// Buffers of external (other-process GPU) frames imported into this device.
     imports: external::Imports,
+    /// Log decode tables as textures, by input transform (the transforms are cached and shared,
+    /// so there are a handful at most).
+    luts: HashMap<usize, (Arc<filmcraft_color::InputTransform>, wgpu::TextureView)>,
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -233,6 +236,19 @@ fn code_table(bits: u32) -> &'static [[u8; 2]] {
     })
 }
 
+/// `code / 65535` as half floats (16-bit unorm samples, e.g. RGBA16), through a per-code table.
+fn unorm16_to_f16_bytes(v: &[u16]) -> Vec<u8> {
+    static TABLE: std::sync::OnceLock<Vec<[u8; 2]>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| (0..=u16::MAX as u32).map(|c| f32_to_f16(c as f32 / 65535.0).to_le_bytes()).collect());
+    let mut out = vec![0u8; v.len() * 2];
+    out.par_chunks_mut(CHUNK * 2).zip(v.par_chunks(CHUNK)).for_each(|(o, s)| {
+        for (o, c) in o.as_chunks_mut::<2>().0.iter_mut().zip(s) {
+            *o = table[*c as usize];
+        }
+    });
+    out
+}
+
 /// `code / 2^bits` as half floats, through a per-code table (same values as converting each sample).
 fn codes_to_f16_bytes(v: &[u16], bits: u32) -> Vec<u8> {
     let table = code_table(bits);
@@ -252,6 +268,7 @@ pub fn prepare_frame(f: &VideoFrame) -> Option<Prepared> {
         PixelData::Yuv16 { planes, bits, alpha, .. } => {
             Some(Prepared { planes: planes.iter().chain(alpha.as_ref()).map(|p| codes_to_f16_bytes(p, *bits)).collect() })
         }
+        PixelData::Rgba16(d) => Some(Prepared { planes: vec![unorm16_to_f16_bytes(d)] }),
         PixelData::Rgba8(_) | PixelData::Yuv8 { .. } | PixelData::External(_) => None,
     }
 }
@@ -297,6 +314,7 @@ impl GpuCompositor {
                 tex_entry(2),
                 tex_entry(3),
                 tex_entry(5),
+                tex_entry(6),
             ],
         });
         let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -313,6 +331,7 @@ impl GpuCompositor {
                 tex_entry(3),
                 tex_entry(4),
                 tex_entry(5),
+                tex_entry(6),
             ],
         });
         let final_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -431,7 +450,43 @@ impl GpuCompositor {
             cpu_transitions: 0,
             uploaded_bytes: 0,
             imports: external::Imports::default(),
+            luts: HashMap::new(),
         }
+    }
+
+    /// The decode-table texture of a layer's input transform (binding 6), or the dummy texture
+    /// when it has none or decodes analytically. Rows of 1024 values, as the shader reads them.
+    fn lut_view(&mut self, input: Option<&Arc<filmcraft_color::InputTransform>>) -> wgpu::TextureView {
+        let Some(t) = input.filter(|t| t.gpu_params().is_some_and(|p| p.curve == filmcraft_color::GpuCurve::Table)) else { return self.dummy.clone() };
+        let key = Arc::as_ptr(t) as usize;
+        if let Some((_, v)) = self.luts.get(&key) {
+            return v.clone();
+        }
+        const ROW: usize = 1024;
+        let values = &t.table.values;
+        let rows = values.len().div_ceil(ROW).max(1);
+        let mut data = vec![0f32; rows * ROW];
+        data[..values.len()].copy_from_slice(values);
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("filmcraft-decode-table"),
+            size: wgpu::Extent3d { width: ROW as u32, height: rows as u32, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(ROW as u32 * 4), rows_per_image: Some(rows as u32) },
+            wgpu::Extent3d { width: ROW as u32, height: rows as u32, depth_or_array_layers: 1 },
+        );
+        let view = tex.create_view(&Default::default());
+        self.luts.insert(key, (t.clone(), view.clone()));
+        view
     }
 
     /// External frames copied on the GPU instead of uploaded (stats).
@@ -496,6 +551,7 @@ impl GpuCompositor {
     fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> (usize, u32, u32) {
         let id = match &f.data {
             PixelData::Rgba8(d) => Arc::as_ptr(d) as *const u8 as usize,
+            PixelData::Rgba16(d) => Arc::as_ptr(d) as *const u8 as usize,
             PixelData::RgbaF32(d) => Arc::as_ptr(d) as *const u8 as usize,
             PixelData::Yuv8 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
             PixelData::Yuv16 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
@@ -529,14 +585,39 @@ impl GpuCompositor {
                 let (v, kind) = match self.imports.texture(&self.device, &self.queue, e, w, h) {
                     Some(t) => t,
                     None => {
+                        // the host pixels, encoded RGBA like the buffer (8 or 16 bits)
                         self.imports.fallbacks += 1;
-                        let px = e.rgba8(w, h);
-                        (self.plane_texture(w, h, wgpu::TextureFormat::Rgba8UnormSrgb, &px, 4), 0)
+                        match e.cpu(w, h) {
+                            PixelData::Rgba16(d) => (self.plane_texture(w, h, wgpu::TextureFormat::Rgba16Float, &unorm16_to_f16_bytes(&d), 8), 3),
+                            PixelData::Rgba8(d) => (self.plane_texture(w, h, wgpu::TextureFormat::Rgba8Unorm, &d, 4), 3),
+                            // (the fallback only ever hands out RGBA)
+                            _ => (d0.clone(), 3),
+                        }
                     }
                 };
                 Uploaded {
                     views: [v, dummy(), dummy(), dummy()],
                     kind,
+                    code_scale: 1.0,
+                    alpha_scale: 0.0,
+                    chroma: (w, h),
+                    last_used: self.clock,
+                    _pixels: f.data.clone(),
+                }
+            }
+            PixelData::Rgba16(d) => {
+                let owned;
+                let half = match prep {
+                    Some(p) => &p.planes[0],
+                    None => {
+                        owned = unorm16_to_f16_bytes(d);
+                        &owned
+                    }
+                };
+                let v = self.plane_texture(w, h, wgpu::TextureFormat::Rgba16Float, half, 8);
+                Uploaded {
+                    views: [v, dummy(), dummy(), dummy()],
+                    kind: 3,
                     code_scale: 1.0,
                     alpha_scale: 0.0,
                     chroma: (w, h),
@@ -664,14 +745,16 @@ impl GpuCompositor {
         let footprint = (1.0 / sx.min(sy).max(1e-6)) as f32;
         let taps = if footprint > 1.25 { footprint.ceil().min(4.0) } else { 1.0 };
         let _ = Matrix::Bt709;
-        // colour management (q0..q5), stage by stage as `InputTransform::apply`
-        let q = src.input.map_or([0.0; 24], |p| {
+        // colour management (q0..q6), stage by stage as `InputTransform::apply`
+        let q = src.input.map_or([0.0; 28], |p| {
             let curve = match p.curve {
                 filmcraft_color::GpuCurve::Sdr => 0.0,
                 filmcraft_color::GpuCurve::Linear => 1.0,
                 filmcraft_color::GpuCurve::Pq => 2.0,
                 filmcraft_color::GpuCurve::Hlg => 3.0,
+                filmcraft_color::GpuCurve::Table => 4.0,
             };
+            let (lo, hi, n) = p.table.unwrap_or((0.0, 1.0, 2));
             let (hl, hk) = p.hlg.unwrap_or(([0.0; 3], 0.0));
             let mx = p.matrix.unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
             let (sp, dp) = p.tone.unwrap_or((0.0, 0.0));
@@ -685,6 +768,7 @@ impl GpuCompositor {
                 mx[1][0], mx[1][1], mx[1][2], sp,
                 mx[2][0], mx[2][1], mx[2][2], dp,
                 dl[0], dl[1], dl[2], on(p.desaturate.is_some()),
+                lo, hi, on(p.compress), n.saturating_sub(1) as f32,
             ];
             q
         });
@@ -822,8 +906,10 @@ impl GpuCompositor {
                 color: l.frame.color,
                 input: None,
             });
-            // HDR / wide-gamut Y'CbCr: the planner's input transform, in the shader (#965)
-            let src = SrcInfo { input: l.input.as_ref().filter(|_| src.kind == 2).and_then(|t| t.gpu_params()), ..src };
+            // HDR / wide-gamut / log media: the planner's input transform, in the shader (#965), for
+            // Y'CbCr and encoded RGBA sources
+            let src = SrcInfo { input: l.input.as_ref().filter(|_| src.kind == 2 || src.kind == 3).and_then(|t| t.gpu_params()), ..src };
+            let lut = if src.input.is_some() { self.lut_view(l.input.as_ref()) } else { self.dummy.clone() };
             let views = self.uploads.get(k).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
             let job = match &l.fx {
                 Some(lfx) => {
@@ -843,6 +929,7 @@ impl GpuCompositor {
                             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
                             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
                             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
+                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&lut) },
                         ],
                     });
                     match self.fx.as_mut() {
@@ -853,6 +940,7 @@ impl GpuCompositor {
                 None => None,
             };
             // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
+            let lut = if job.is_some() { self.dummy.clone() } else { lut };
             let (u, tex) = match &job {
                 Some(j) => {
                     let s =
@@ -881,6 +969,7 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&tex[1]) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&tex[2]) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex[3]) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&lut) },
             ];
             let (layout, region) = match (&backdrop_view, l.blend.reads_destination()) {
                 (Some(b), true) => {
@@ -1039,6 +1128,7 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.dummy) },
             ],
         });
         let stage = self.fx.as_mut()?;
@@ -1210,7 +1300,7 @@ struct SrcInfo {
 }
 
 /// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
-const UNIFORM_FLOATS: usize = 52;
+const UNIFORM_FLOATS: usize = 56;
 
 /// Poll a future once: wgpu's native error scopes resolve immediately. `None` if it is still
 /// pending (then the caller assumes the worst).
