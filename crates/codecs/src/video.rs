@@ -787,7 +787,10 @@ impl VideoDecoder for ProResDecoder {
         // A GPU compositor decodes ProRes itself: it gets the bitstream (megabytes) instead of the
         // planes (tens of megabytes), and every CPU consumer decodes it here through the fallback.
         if filmcraft_media::cancel::gpu_frames() {
-            let h = filmcraft_prores::probe(sample).map_err(|e| CodecError::Decode(e.to_string()))?;
+            // the structure checked as the CPU decoder checks it (headers, slice tables, slice
+            // headers): a frame that does not parse fails here, and the picture's size is bound to
+            // the data it really has
+            let h = filmcraft_prores::frame_layout(sample).map_err(|e| CodecError::Decode(e.to_string()))?.header;
             let (chroma, bits) = match h.chroma {
                 filmcraft_prores::ChromaFormat::Yuv422 => (filmcraft_frame::Chroma::C422, 10),
                 filmcraft_prores::ChromaFormat::Yuv444 => (filmcraft_frame::Chroma::C444, 12),
@@ -1341,5 +1344,37 @@ impl VideoDecoder for RawVideoDecoder {
     }
     fn intra_only(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod prores_gpu_frame_tests {
+    use super::*;
+
+    fn sample() -> Vec<u8> {
+        let f = filmcraft_prores::Frame::new(64, 32, filmcraft_prores::ChromaFormat::Yuv422, 10, false);
+        filmcraft_prores::Encoder::new(filmcraft_prores::Profile::Hq, 64, 32).encode(&f).unwrap()
+    }
+
+    #[test]
+    fn gpu_monitors_get_the_bitstream_and_cpu_code_the_planes() {
+        let s = sample();
+        let coded = filmcraft_media::cancel::with_gpu_frames(true, || ProResDecoder.decode(&s, 0)).unwrap();
+        let filmcraft_frame::PixelData::Coded(img) = &coded[0].frame.data else { panic!("coded frame") };
+        assert_eq!(img.data(), &s[..]);
+        let planes = ProResDecoder.decode(&s, 0).unwrap();
+        assert!(matches!(planes[0].frame.data, filmcraft_frame::PixelData::Yuv16 { .. }));
+        assert_eq!(coded[0].frame.cpu_frame().to_rgba8(), planes[0].frame.to_rgba8());
+    }
+
+    /// Regression: the coded path used to check only the frame header, so a header claiming
+    /// 65535×65535 over a few bytes became a coded frame whose failed CPU decode allocated a
+    /// full-size placeholder (8.6 GB).
+    #[test]
+    fn a_header_bigger_than_its_data_is_a_decode_error() {
+        let mut s = sample();
+        s[16..20].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert!(filmcraft_media::cancel::with_gpu_frames(true, || ProResDecoder.decode(&s, 0)).is_err());
+        assert!(ProResDecoder.decode(&s, 0).is_err());
     }
 }

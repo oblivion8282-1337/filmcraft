@@ -13,6 +13,11 @@ use std::sync::{Arc, OnceLock};
 
 use crate::Chroma;
 
+/// Largest picture a failed decode is replaced by a black one of its size (the largest texture a
+/// GPU compositor takes); a larger one gets empty planes, which every consumer shows transparent.
+/// The size comes from the bitstream: a hostile one must not make us allocate gigabytes.
+const MAX_PLACEHOLDER_SAMPLES: usize = 8192 * 8192;
+
 /// The codec a [`CodedImage`] is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CodedFormat {
@@ -91,7 +96,8 @@ impl CodedImage {
     }
 
     /// The decoded planes in host memory, decoded once through the fallback; a black picture of
-    /// the right geometry when it fails (a corrupt frame) or delivers anything else.
+    /// the right geometry when it fails (a corrupt frame) or delivers anything else (empty planes
+    /// above [`MAX_PLACEHOLDER_SAMPLES`]).
     pub fn cpu(&self, width: u32, height: u32) -> crate::PixelData {
         self.cpu
             .get_or_init(|| {
@@ -116,6 +122,7 @@ impl CodedImage {
                             if other.is_some() { "delivered the wrong geometry" } else { "failed" }
                         );
                         let s = self.bits.saturating_sub(8).min(8);
+                        let (n, cn) = if n <= MAX_PLACEHOLDER_SAMPLES { (n, cn) } else { (0, 0) };
                         crate::PixelData::Yuv16 {
                             planes: [Arc::new(vec![16u16 << s; n]), Arc::new(vec![128u16 << s; cn]), Arc::new(vec![128u16 << s; cn])],
                             chroma: self.chroma,
@@ -131,5 +138,23 @@ impl CodedImage {
     /// Whether the CPU decode has been made already.
     pub fn has_cpu_pixels(&self) -> bool {
         self.cpu.get().is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_decode_of_a_huge_claimed_picture_allocates_nothing() {
+        // a header can claim 65535×65535 (8.6 GB of planes): the placeholder must not follow it
+        let img = CodedImage::new(CodedFormat::ProRes, Arc::from(&[0u8; 16][..]), Chroma::C422, 10, false, Box::new(|_| None));
+        let crate::PixelData::Yuv16 { planes, .. } = img.cpu(65535, 65535) else { panic!("planes") };
+        assert!(planes.iter().all(|p| p.is_empty()));
+        // a normal-sized one is black
+        let img = CodedImage::new(CodedFormat::ProRes, Arc::from(&[0u8; 16][..]), Chroma::C422, 10, false, Box::new(|_| None));
+        let crate::PixelData::Yuv16 { planes, .. } = img.cpu(64, 32) else { panic!("planes") };
+        assert_eq!((planes[0].len(), planes[1].len()), (64 * 32, 32 * 32));
+        assert!(planes[0].iter().all(|&v| v == 64));
     }
 }
