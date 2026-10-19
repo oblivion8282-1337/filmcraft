@@ -86,6 +86,9 @@ const PARALLEL_DECODES: u32 = 4;
 const NEAREST_FRAME_TOLERANCE: u64 = 12;
 /// Frames the read-ahead thread decodes past the playhead (≈ 250 ms at 24 fps).
 const PREFETCH_FRAMES: u64 = 6;
+/// The read-ahead stops this long after the newest interactive request: it serves the clip in
+/// use, not every clip ever shown.
+const READ_AHEAD_IDLE: Duration = Duration::from_secs(2);
 /// A quiet spell this long retires a source's sessions (its own bridge process, or its handle on
 /// the shared one — which exits with the last handle).
 const IDLE_SESSIONS_AFTER: Duration = Duration::from_secs(20);
@@ -705,6 +708,8 @@ pub struct RawCamSource {
     last_tier: AtomicU32,
     /// Whether the newest interactive request welcomed GPU frames (the read-ahead follows it).
     last_gpu: AtomicBool,
+    /// When the newest interactive request came: the read-ahead stops [`READ_AHEAD_IDLE`] after.
+    steered_at: Mutex<Instant>,
     /// The width interactive requests want their frames fitted to (steers the read-ahead).
     /// Bumped by every interactive cache miss; the read-ahead yields when it changes mid-run.
     demand: AtomicU64,
@@ -798,6 +803,7 @@ impl RawCamSource {
             last: AtomicU64::new(0),
             last_tier: AtomicU32::new(1),
             last_gpu: AtomicBool::new(false),
+            steered_at: Mutex::new(Instant::now()),
             demand: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             prefetch_started: AtomicBool::new(false),
@@ -995,8 +1001,11 @@ impl RawCamSource {
             // A scrub burst owns the decoder: each of its seeks must find the bridge idle, and
             // frames around a moving playhead are wasted work.
             let scrubbing = this.scrub.lock().unwrap_or_else(|e| e.into_inner()).active(Instant::now());
-            // No steering yet (tier 0 = no interactive request ever): nothing to read ahead of.
-            let decoded = tier != 0 && !scrubbing && {
+            // No steering yet (tier 0 = no interactive request ever), or none for a while (the clip
+            // is not in use: its frames may have left the cache for other clips): nothing to
+            // read ahead of.
+            let in_use = this.steered_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < READ_AHEAD_IDLE;
+            let decoded = tier != 0 && in_use && !scrubbing && {
                 // What is missing ahead of the playhead, nearest first: one batch fills a
                 // pipelined bridge (reads overlap the running decode) and caches the frames as
                 // they stream back, in order — a waiting request picks each up as it lands.
@@ -1304,6 +1313,7 @@ impl RawCamSource {
                     self.last.store(idx, Ordering::Relaxed);
                     self.last_tier.store(hit_tier, Ordering::Relaxed);
                     self.last_gpu.store(filmcraft_media::cancel::gpu_frames(), Ordering::Relaxed);
+                    *self.steered_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                     self.ensure_prefetch();
                 }
                 if hit_tier != tier {
@@ -1367,6 +1377,7 @@ impl RawCamSource {
                 self.last.store(idx, Ordering::Relaxed);
                 self.last_tier.store(serve_tier, Ordering::Relaxed);
                 self.demand.fetch_add(1, Ordering::Relaxed);
+                *self.steered_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             }
             state.leased += 1;
             let lease = Lease::new(&self.video);
@@ -2850,6 +2861,36 @@ for line in sys.stdin:
         assert!(released, "the buffer goes back with the last reference:\n{log}");
         assert!(log.lines().any(|l| l.starts_with("frame ") && l.ends_with(" gpu")), "asked for a GPU frame:\n{log}");
         assert!(log.lines().any(|l| l.starts_with("frame ") && !l.ends_with(" gpu")), "and host frames:\n{log}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read-ahead serves the clip in use: a clip nobody has asked for in a while reads nothing
+    /// ahead, even when its frames left the cache. It refilled them for as long as the source
+    /// lived, and with every source sharing one cache budget the clips of a timeline evicted each
+    /// other's frames and decoded them again without end (hundreds of frames a second, with the
+    /// monitors paused).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_idle_clip_reads_nothing_ahead() {
+        let (dir, paths) = clips("idle-readahead", &["placeholder"]);
+        let bridge = fake_bridge_v3(&dir);
+        let src = paths.first().map(|p| open_quiet(p, &bridge, &dir)).unwrap_or_else(|| panic!("clip"));
+        src.prefetch_started.store(false, Ordering::Relaxed); // with its read-ahead
+        src.video_frame(FrameRequest { time: Tick::ZERO, scale: 1.0 }).unwrap_or_else(|e| panic!("frame: {e:?}"));
+        let cmds = bridge.with_extension("cmds");
+        let frames = || std::fs::read_to_string(&cmds).unwrap_or_default().lines().filter(|l| l.starts_with("frame ")).count();
+        // it reads ahead while in use…
+        let filled = (0..300).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            src.cache.lock().unwrap_or_else(|e| e.into_inner()).len() > 1
+        });
+        assert!(filled, "the read-ahead fills the cache while the clip is in use");
+        // …then the clip rests, and its frames leave the cache (another clip needed the room)
+        std::thread::sleep(READ_AHEAD_IDLE + Duration::from_millis(300));
+        let before = frames();
+        src.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(frames(), before, "an idle clip decoded its frames again");
         std::fs::remove_dir_all(&dir).ok();
     }
 
