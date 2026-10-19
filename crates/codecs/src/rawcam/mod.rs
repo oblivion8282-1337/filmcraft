@@ -63,6 +63,9 @@ const MAX_SLOT_WAIT: Duration = Duration::from_secs(150);
 const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 /// Decoded frames kept around a seek point (scrubbing back and forth).
 const CACHE_FRAMES: usize = 24;
+/// Bytes of decoded frames all sources cache together (a 6K full-tier frame is ~62–75 MB: one
+/// clip's [`CACHE_FRAMES`] alone came to ~1.8 GB).
+const CACHE_BUDGET: usize = 1 << 30;
 /// Live decode sessions kept at once for a bridge without per-command scale (one per debayer
 /// tier in use), most recently used last. A protocol 2 bridge needs only one.
 const TIERS: usize = 2;
@@ -970,14 +973,55 @@ impl RawCamSource {
         }
     }
 
-    /// Store a decoded frame in the cache, trimmed to a window around the current position.
+    /// Store a decoded frame in the cache, trimmed to a window around the current position and
+    /// to the [`CACHE_BUDGET`] all sources share.
     fn cache_frame(&self, key: (u64, u32), frame: Arc<VideoFrame>) {
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(key, frame);
-        if cache.len() > CACHE_FRAMES {
-            let farthest = cache.keys().copied().max_by_key(|k| k.0.abs_diff(key.0)).filter(|k| *k != key).unwrap_or(key);
-            cache.remove(&farthest);
+        self.cache_frame_within(key, frame, &live_sources(), CACHE_BUDGET);
+    }
+
+    /// [`Self::cache_frame`] against the given sources and budget: past the budget, frames go
+    /// from the source idle longest first, farthest from its playhead first; the frame just
+    /// stored stays.
+    fn cache_frame_within(&self, key: (u64, u32), frame: Arc<VideoFrame>, sources: &[Arc<Self>], budget: usize) {
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(key, frame);
+            if cache.len() > CACHE_FRAMES {
+                let farthest = cache.keys().copied().max_by_key(|k| k.0.abs_diff(key.0)).filter(|k| *k != key).unwrap_or(key);
+                cache.remove(&farthest);
+            }
         }
+        // One cache lock at a time (never nested), so sources trimming each other cannot deadlock.
+        let mut total: usize =
+            sources.iter().filter(|s| !std::ptr::eq(Arc::as_ptr(s), self)).map(|s| s.cached_bytes()).fold(self.cached_bytes(), usize::saturating_add);
+        if total <= budget {
+            return;
+        }
+        let mut victims: Vec<(Instant, &Self)> =
+            sources.iter().map(|s| (*s.activity.lock().unwrap_or_else(|e| e.into_inner()), &**s)).filter(|(_, s)| !std::ptr::eq(*s, self)).collect();
+        victims.sort_by_key(|v| v.0);
+        victims.push((Instant::now(), self)); // our own frames last
+        for (_, victim) in victims {
+            while total > budget {
+                let Some(freed) = victim.evict_farthest(key, self) else { break };
+                total = total.saturating_sub(freed);
+            }
+        }
+    }
+
+    /// Drop this source's cached frame farthest from its playhead (never `keep` when `owner` is
+    /// this source); the bytes freed, or `None` when there is nothing to drop.
+    fn evict_farthest(&self, keep: (u64, u32), owner: &Self) -> Option<usize> {
+        let at = self.last.load(Ordering::Relaxed);
+        let mine = std::ptr::eq(self, owner);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let farthest = cache.keys().copied().filter(|k| !mine || *k != keep).max_by_key(|k| k.0.abs_diff(at))?;
+        cache.remove(&farthest).map(|f| f.byte_size())
+    }
+
+    /// Bytes of the frames this source caches.
+    fn cached_bytes(&self) -> usize {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).values().map(|f| f.byte_size()).fold(0, usize::saturating_add)
     }
 
     /// Frame `idx` as an sRGB RGBA frame, decoded through the tier's persistent bridge session:
@@ -1692,6 +1736,50 @@ echo '{"type":"done"}' >&2
         assert_eq!(sessions.lines().count(), 1, "one session for all four tiers: {sessions}");
         let keys: Vec<u32> = src.video.lock().unwrap_or_else(|e| e.into_inner()).sessions.iter().map(|s| s.tier).collect();
         assert_eq!(keys, vec![ANY_TIER]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The frames all sources cache share one byte budget: inserting past it takes frames from
+    /// the source idle longest first (farthest from its playhead), never the frame just stored.
+    /// Each source kept up to 24 full-tier frames on its own (~1.8 GB for a 6K clip) with
+    /// nothing bounding a timeline of them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_frames_of_all_sources_share_one_budget() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-rawcam-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let bridge = fake_bridge_v2(&dir);
+        let open = |name: &str| {
+            let clip = dir.join(name);
+            std::fs::write(&clip, b"placeholder").ok();
+            let src = RawCamSource::open(&clip, Format::Braw, bridge.clone(), Some(dir.join("cache"))).unwrap_or_else(|e| panic!("{name} must open: {e}"));
+            src.prefetch_started.store(true, Ordering::Relaxed);
+            src
+        };
+        let (old, mid, new) = (open("old.braw"), open("mid.braw"), open("new.braw"));
+        let all = vec![old.clone(), mid.clone(), new.clone()];
+        let frame = || Arc::new(VideoFrame::rgba8(10, 25, vec![0; 1000])); // 1000 bytes
+        let now = Instant::now();
+        for (src, ago) in [(&old, 30), (&mid, 20), (&new, 0)] {
+            *src.activity.lock().unwrap_or_else(|e| e.into_inner()) = now.checked_sub(Duration::from_secs(ago)).unwrap_or(now);
+        }
+        for i in 0..4 {
+            old.cache_frame_within((i, 1), frame(), &all, 10_000);
+            mid.cache_frame_within((i, 1), frame(), &all, 10_000);
+        }
+        old.last.store(0, Ordering::Relaxed);
+        for i in 0..4 {
+            new.cache_frame_within((i, 1), frame(), &all, 9_000);
+        }
+        let keys = |s: &Arc<RawCamSource>| s.cache.lock().unwrap_or_else(|e| e.into_inner()).keys().map(|k| k.0).collect::<Vec<_>>();
+        let total: usize = all.iter().map(|s| s.cached_bytes()).sum();
+        assert!(total <= 9_000, "over budget: {total}");
+        assert_eq!(keys(&new), vec![0, 1, 2, 3], "the source in use keeps its frames");
+        assert_eq!(keys(&mid), vec![0, 1, 2, 3], "the source idle for less long is untouched");
+        assert_eq!(keys(&old), vec![0], "the longest idle gives up frames, farthest from its playhead first");
+        // a budget smaller than one frame still keeps the frame just stored
+        new.cache_frame_within((9, 1), frame(), std::slice::from_ref(&new), 10);
+        assert_eq!(keys(&new), vec![9]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
