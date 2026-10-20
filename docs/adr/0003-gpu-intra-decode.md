@@ -28,8 +28,9 @@ The GPU compositor decodes ProRes itself, in WGSL compute shaders, from the bits
   `box_decimated` leaves it whole: decoding it on the GPU costs less than the CPU decode a
   reduction needs.
 - **Who gets coded frames:** the `ProResDecoder` (`filmcraft-codecs`) hands them out under the
-  `with_gpu_frames` hint, which the monitors' plan jobs set when they composite on the GPU.
-  Everything else (thumbnails, export, CPU effects, scopes) gets planes as before.
+  `with_gpu_frames` hint, which the monitors' plan jobs set when they composite on the GPU, and
+  (since 2026-10-20) the export pipeline around its GPU frame renderer. Everything else
+  (thumbnails, CPU export rendering, CPU effects, scopes) gets planes as before.
 - **Parsing stays on the CPU and in the codec crate:** `filmcraft_prores::frame_layout` parses
   and checks the frame and picture headers, the slice tables and every slice header with the CPU
   decoder's own code (factored out of `decode_frame_into`). A frame that does not parse is decoded
@@ -119,3 +120,15 @@ instead of ProRes' ~4000.
   writes VC-3 alpha, so our encoder now does (DCT and lossless, `AlphaCoding`): the GPU matches
   the CPU decoder on it (lossless bit-exact), which is the same reading of the standard on both
   sides, not a third party's.
+
+### Export (2026-10-20, later)
+
+The GPU export renderer composites with the monitors' compositor, so the export pipeline sets
+the hint around it too (frames it hands to the CPU renderer are decoded there as before). One
+difference: a monitor shows a picture the GPU found corrupt from the next composite on, but an
+exported frame is final, so the renderer waits for the GPU's report after each frame and hands a
+frame with a corrupt coded picture to the CPU renderer instead. Encoding dominates an export, so
+the gain is modest (4K, 48 frames, RTX 4090 / Ryzen 7 7800X3D): ProRes HQ → ProRes HQ 5.63 →
+5.50 s, DNxHR HQX → DNxHR HQX 8.37 → 7.61 s, DNxHR HQX → H.264 4.25 → 3.51 s; the decode no
+longer competes with the encoder for the CPU. `tests/export_pipeline.rs` exports ProRes, DNxHR
+HQX, 444 RGB and alpha media and a clip with a corrupt frame both ways and compares the frames.

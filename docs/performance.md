@@ -570,6 +570,10 @@ corner, the worst case for lossless alpha (a matte without the gradient: 5.9 ms)
 | DNxHR HQX 10-bit 3840×2160 + DCT alpha | 5.5 MB | 23.55 ms | **6.37 ms** | 3.7× |
 | DNxHR HQX 10-bit 3840×2160 + lossless alpha | 5.5 MB | 21.18 ms | **17.49 ms** | 1.2× |
 
+Exports decode ProRes / DNx on the GPU too when they render there (Export ▸ GPU Rendering): 48
+4K frames of our encoder's media, whole export: ProRes HQ → ProRes HQ 5.63 → 5.50 s, DNxHR HQX →
+DNxHR HQX 8.37 → 7.61 s, DNxHR HQX → H.264 4.25 → 3.51 s (the encoders dominate).
+
 ## Results (#847: AV1 in-loop filters in parallel row bands, before → after)
 
 The AV1 decoder ran deblocking, CDEF and loop restoration on one thread per frame. A single-tile

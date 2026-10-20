@@ -239,7 +239,10 @@ impl Pipeline {
                 let asked = web_time::Instant::now();
                 pool.with(|r| {
                     crate::note_lock_wait(asked.elapsed());
-                    r.render(&self.project, self.seq, t, self.opts, sources)
+                    // a GPU renderer: decoders may hand it pictures still in GPU form (ProRes / DNx
+                    // bitstreams it decodes in compute shaders, camera RAW in GPU memory), as the
+                    // monitors get them
+                    filmcraft_media::cancel::with_gpu_frames(true, || r.render(&self.project, self.seq, t, self.opts, sources))
                 })
                 .flatten()
             }
