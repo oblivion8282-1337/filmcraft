@@ -34,32 +34,41 @@ pub fn decode_frame(data: &[u8]) -> Result<Frame> {
 
 /// Decode one compressed frame with options.
 pub fn decode_frame_with(data: &[u8], opts: &DecodeOptions) -> Result<Frame> {
-    let h1 = header::parse(data)?;
-    let field_coded = h1.interlaced && !h1.frame_encoding;
-    if !field_coded {
-        let planes = decode_unit(&h1, data, opts)?;
-        let mut f = Frame::new_like(&h1, h1.width, h1.lines);
+    let units = coding_units(data)?;
+    let [(r1, h1), rest @ ..] = units.as_slice() else { return Err(Error::Truncated) };
+    let Some((r2, h2)) = rest.first() else {
+        let planes = decode_unit(h1, data.get(r1.clone()).ok_or(Error::Truncated)?, opts)?;
+        let mut f = Frame::new_like(h1, h1.width, h1.lines);
         f.interlace = if h1.interlaced { Interlace::TopFieldFirst } else { Interlace::Progressive };
         planes.copy_into(&mut f, 0, 1);
         return Ok(f);
-    }
-    // field encoding: two coding units, field 1 (top) then field 2
-    let off = second_unit_offset(&h1, data)?;
-    let h2 = header::parse(&data[off..])?;
-    if h2.cid != h1.cid || h2.width != h1.width || h2.lines != h1.lines || h2.chroma != h1.chroma || h2.alpha != h1.alpha {
-        return Err(Error::Invalid("field coding units differ"));
-    }
-    let (p1, p2) = if opts.threads {
-        join(|| decode_unit(&h1, &data[..off], opts), || decode_unit(&h2, &data[off..], opts))
-    } else {
-        (decode_unit(&h1, &data[..off], opts), decode_unit(&h2, &data[off..], opts))
     };
-    let mut f = Frame::new_like(&h1, h1.width, h1.lines * 2);
+    // field encoding: two coding units, field 1 (top) then field 2
+    let (d1, d2) = (data.get(r1.clone()).ok_or(Error::Truncated)?, data.get(r2.clone()).ok_or(Error::Truncated)?);
+    let (p1, p2) =
+        if opts.threads { join(|| decode_unit(h1, d1, opts), || decode_unit(h2, d2, opts)) } else { (decode_unit(h1, d1, opts), decode_unit(h2, d2, opts)) };
+    let mut f = Frame::new_like(h1, h1.width, h1.lines * 2);
     f.interlace = Interlace::TopFieldFirst;
     let (top, bottom) = if h1.field == FieldCode::Field2 { (p2?, p1?) } else { (p1?, p2?) };
     top.copy_into(&mut f, 0, 2);
     bottom.copy_into(&mut f, 1, 2);
     Ok(f)
+}
+
+/// The coding units of a frame in coded order, as (byte range, header): one, or two for a
+/// field-coded interlaced frame (checked to agree on everything but the field).
+pub(crate) fn coding_units(data: &[u8]) -> Result<Vec<(std::ops::Range<usize>, FrameHeader)>> {
+    let h1 = header::parse(data)?;
+    let field_coded = h1.interlaced && !h1.frame_encoding;
+    if !field_coded {
+        return Ok(vec![(0..data.len(), h1)]);
+    }
+    let off = second_unit_offset(&h1, data)?;
+    let h2 = header::parse(data.get(off..).ok_or(Error::Truncated)?)?;
+    if h2.cid != h1.cid || h2.width != h1.width || h2.lines != h1.lines || h2.chroma != h1.chroma || h2.alpha != h1.alpha {
+        return Err(Error::Invalid("field coding units differ"));
+    }
+    Ok(vec![(0..off, h1), (off..data.len(), h2)])
 }
 
 #[cfg(feature = "threads")]
@@ -89,6 +98,29 @@ fn second_unit_offset(h: &FrameHeader, data: &[u8]) -> Result<usize> {
         .map(|p| p + start)
         .filter(|&p| header::parse(&data[p..]).is_ok())
         .ok_or(Error::Invalid("second field coding unit not found"))
+}
+
+/// Byte range (within the coding unit's `data`) of every macroblock scan line: from its scan
+/// index to the next line's (or the end of the unit).
+pub(crate) fn row_ranges(h: &FrameHeader, data: &[u8]) -> Result<Vec<(usize, usize)>> {
+    let ns = h.mb_rows as usize;
+    let hs = h.header_size as usize;
+    let mut starts = Vec::with_capacity(ns);
+    for s in 0..ns {
+        let o = SCAN_INDEX_OFFSET + 4 * s;
+        let b = data.get(o..o + 4).ok_or(Error::Truncated)?;
+        let idx = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        let st = hs.checked_add(idx).filter(|&v| v < data.len()).ok_or(Error::Truncated)?;
+        starts.push(st);
+    }
+    Ok(starts
+        .iter()
+        .enumerate()
+        .map(|(s, &st)| {
+            let end = starts.get(s + 1).copied().filter(|&e| e > st).unwrap_or(data.len());
+            (st, end)
+        })
+        .collect())
 }
 
 /// Decoded planes of one coding unit at the coded (macroblock-aligned) size.
@@ -191,21 +223,7 @@ fn decode_unit(h: &FrameHeader, data: &[u8], opts: &DecodeOptions) -> Result<Cod
         max: ((1u32 << h.bit_depth) - 1) as f32,
     };
     // scan line byte ranges
-    let hs = h.header_size as usize;
-    let mut starts = Vec::with_capacity(ns);
-    for s in 0..ns {
-        let o = SCAN_INDEX_OFFSET + 4 * s;
-        let idx = u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
-        let st = hs.checked_add(idx).filter(|&v| v < data.len()).ok_or(Error::Truncated)?;
-        starts.push(st);
-    }
-    let ranges: Vec<(usize, usize)> = (0..ns)
-        .map(|s| {
-            let st = starts[s];
-            let end = starts.get(s + 1).copied().filter(|&e| e > st).unwrap_or(data.len());
-            (st, end)
-        })
-        .collect();
+    let ranges = row_ranges(h, data)?;
 
     let alpha = h.alpha;
     let mut planes: [Vec<u16>; 4] = [
