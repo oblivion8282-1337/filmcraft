@@ -285,6 +285,26 @@ pub fn prepare_frame(f: &VideoFrame) -> Option<Prepared> {
     }
 }
 
+/// Whether texels converted beforehand hold what `f`'s size needs (they replace its pixels, which
+/// may then be empty).
+fn prepared_fits(f: &VideoFrame, p: &Prepared) -> bool {
+    let n = (f.width as usize).saturating_mul(f.height as usize);
+    let len = |i: usize| p.planes.get(i).map_or(0, Vec::len);
+    match &f.data {
+        PixelData::RgbaF32(_) | PixelData::Rgba16(_) => len(0) >= n.saturating_mul(8),
+        PixelData::Yuv16 { chroma, alpha, .. } => {
+            let (sx, sy) = chroma.shifts();
+            let cn = (f.width as usize).div_ceil(1 << sx).saturating_mul((f.height as usize).div_ceil(1 << sy));
+            len(0) >= n.saturating_mul(2)
+                && len(1) >= cn.saturating_mul(2)
+                && len(2) >= cn.saturating_mul(2)
+                && (alpha.is_none() || len(3) >= n.saturating_mul(2))
+        }
+        // uploaded as they are
+        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } | PixelData::External(_) | PixelData::Coded(_) => f.data_fits(),
+    }
+}
+
 /// Convert every layer of a plan for upload. Thread-safe and GPU-free: run it on a worker.
 pub fn prepare(plan: &FramePlan) -> PreparedPlan {
     match plan {
@@ -605,7 +625,11 @@ impl GpuCompositor {
         // a frame whose host pixels are shorter than its size says (a failed decode's empty
         // placeholder) or larger than a texture: transparent, not a GPU validation error
         let max_side = self.device.limits().max_texture_dimension_2d;
-        if !matches!(f.data, PixelData::Coded(_)) && (!f.data_fits() || w == 0 || h == 0 || w > max_side || h > max_side) {
+        let fits = match prep {
+            Some(p) => prepared_fits(f, p),
+            None => f.data_fits(),
+        };
+        if !matches!(f.data, PixelData::Coded(_)) && (!fits || w == 0 || h == 0 || w > max_side || h > max_side) {
             let v = self.plane_texture(1, 1, wgpu::TextureFormat::Rgba8UnormSrgb, &[0; 4], 4);
             let up = Uploaded {
                 views: [v, dummy(), dummy(), dummy()],
