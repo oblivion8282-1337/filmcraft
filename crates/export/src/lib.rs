@@ -632,8 +632,12 @@ impl ExportSettings {
             let codec = if self.audio_codec() == AudioCodec::Flac { "FLAC" } else { self.format.label() };
             return Err(ExportError::Unsupported(format!("{codec} audio has no {} samples: choose 16, 24 or 32 bit", sample_format.label())));
         }
-        if self.field_order != FieldOrder::Progressive && self.has_video() {
-            return Err(ExportError::Unsupported(format!("{} field order: FilmCraft's encoders write progressive frames", self.field_order.label())));
+        // (an interlaced DNxHD id is coded upper field first, which the setting may say)
+        if self.field_order != FieldOrder::Progressive && !(self.dnx_field_coded() && self.field_order == FieldOrder::UpperFirst) && self.has_video() {
+            return Err(ExportError::Unsupported(format!(
+                "{} field order: FilmCraft's encoders write progressive frames (and DNxHD 1080i upper field first)",
+                self.field_order.label()
+            )));
         }
         if self.effects.image_overlay.enabled && self.effects.image_overlay.path.trim().is_empty() {
             return Err(ExportError::Unsupported("image overlay: no image file chosen".into()));
@@ -1339,19 +1343,65 @@ fn prores_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
     })
 }
 
-/// The DNxHR profile named by [`ExportSettings::dnx_profile`].
-pub fn dnx_profile(name: &str) -> filmcraft_dnx::Profile {
-    use filmcraft_dnx::Profile;
-    match name.to_ascii_lowercase().as_str() {
-        "lb" => Profile::Lb,
-        "sq" => Profile::Sq,
-        "hqx" => Profile::Hqx,
-        _ => Profile::Hq,
+/// DNxHD compression IDs offered for export (Table C.1), lowest data rate first: the full
+/// 1920 / 1280 rasters, progressive and interlaced, and 4:4:4. (The thin 1440 / 960 rasters would
+/// need anamorphic output, and CID 1260 macroblock-adaptive field coding.)
+pub const DNXHD_EXPORT_CIDS: [u32; 11] = [1253, 1237, 1238, 1235, 1242, 1243, 1241, 1252, 1251, 1250, 1256];
+
+/// The DNx coding [`ExportSettings::dnx_profile`] names for a `w`×`h` output: a DNxHR profile at
+/// that size — `lb`, `sq`, `hq` (the default), `hqx` (10-bit), `hqx12`, `444` (10-bit 4:4:4),
+/// `44412` — or a DNxHD compression ID at its own raster, `dnxhd-<cid>` (one of
+/// [`DNXHD_EXPORT_CIDS`]).
+pub fn dnx_config(name: &str, w: u32, h: u32) -> filmcraft_dnx::EncoderConfig {
+    use filmcraft_dnx::{EncoderConfig, Profile};
+    let key = name.to_ascii_lowercase();
+    let hd = key.strip_prefix("dnxhd-").and_then(|c| c.parse::<u32>().ok()).filter(|c| DNXHD_EXPORT_CIDS.contains(c));
+    if let Some(cfg) = hd.and_then(EncoderConfig::dnxhd) {
+        return cfg;
+    }
+    let (profile, bit_depth) = match key.as_str() {
+        "lb" => (Profile::Lb, 8),
+        "sq" => (Profile::Sq, 8),
+        "hqx" => (Profile::Hqx, 10),
+        "hqx12" => (Profile::Hqx, 12),
+        "444" => (Profile::R444, 10),
+        "44412" => (Profile::R444, 12),
+        _ => (Profile::Hq, 8),
+    };
+    EncoderConfig { bit_depth, ..EncoderConfig::new(profile, w, h) }
+}
+
+/// The output raster a DNx profile fixes (DNxHD), whatever the export's frame size.
+pub fn dnx_fixed_raster(name: &str) -> Option<(u32, u32)> {
+    let c = dnx_config(name, 0, 0);
+    c.hd_cid.map(|_| (c.width, c.height))
+}
+
+/// A DNx profile's name for the export UI and summaries, with its data rate at `fps` ("DNxHR
+/// HQX 12-bit", "DNxHD 1080i 8-bit, 121 Mb/s").
+pub fn dnx_label(name: &str, fps: f64) -> String {
+    let c = dnx_config(name, 1920, 1080);
+    match c.hd_cid {
+        Some(cid) => {
+            let raster = format!("{}{}", c.height, if dnx_interlaced(cid) { "i" } else { "p" });
+            let chroma = if c.chroma() == filmcraft_dnx::ChromaFormat::Yuv444 { " 4:4:4" } else { "" };
+            let rate = filmcraft_dnx::Encoder::with_config(c.clone()).map(|e| f64::from(e.frame_size()) * 8.0 * fps / 1e6).unwrap_or(0.0);
+            format!("DNxHD {raster}{chroma} {}-bit, {rate:.0} Mb/s", c.bit_depth)
+        }
+        None => match (c.profile, c.bit_depth) {
+            (filmcraft_dnx::Profile::Hqx | filmcraft_dnx::Profile::R444, bits) => format!("{} {bits}-bit", c.profile.name()),
+            (p, _) => p.name().to_string(),
+        },
     }
 }
 
-/// DNxHR encoder (RGBA8 or HDR floats → BT.709 / BT.2020 limited-range 4:2:2; 8-bit for
-/// LB/SQ/HQ, 10-bit for HQX).
+/// Whether a DNxHD compression ID is interlaced (field-coded).
+pub(crate) fn dnx_interlaced(cid: u32) -> bool {
+    matches!(cid, 1241..=1244 | 1260)
+}
+
+/// DNxHR / DNxHD encoder: RGBA8 or HDR floats → BT.709 / BT.2020 limited-range Y'CbCr 4:2:2, or
+/// 4:4:4 for DNxHR 444 / DNxHD 444, at 10 bits (the encoder rescales to the coded depth).
 struct DnxEncoder {
     enc: filmcraft_dnx::Encoder,
     w: u32,
@@ -1364,19 +1414,30 @@ impl VideoEncoder for DnxEncoder {
     fn sample_entry(&self) -> SampleEntry {
         let mut e = SampleEntry::dnx(filmcraft_isobmff::FourCc(*b"AVdh"), self.w as u16, self.h as u16);
         self.signal.apply_to(&mut e, true);
+        if let Some(v) = e.video.as_mut().filter(|_| self.enc.config().hd_cid.is_some_and(dnx_interlaced)) {
+            // two fields, top first (DNxHD codes them as two coding units)
+            v.field_info = Some(filmcraft_isobmff::FieldInfo { fields: 2, detail: 1 });
+        }
         e
     }
     fn timescale(&self) -> u32 {
         self.rate.num as u32
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
-        let mut fr = filmcraft_dnx::Frame::new(f.width, f.height, filmcraft_dnx::ChromaFormat::Yuv422, 10, false);
-        match f.hdr {
-            Some(rgb) => {
-                let (kr, kb) = self.signal.kr_kb();
-                rgbf_to_yuv422_10(rgb, f.width as usize, f.height as usize, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr)
+        let chroma = self.enc.config().chroma();
+        let mut fr = filmcraft_dnx::Frame::new(f.width, f.height, chroma, 10, false);
+        let (w, h) = (f.width as usize, f.height as usize);
+        match (chroma, f.hdr) {
+            (filmcraft_dnx::ChromaFormat::Yuv444, hdr) => {
+                // Y'CbCr 4:4:4 (every macroblock flagged so), as for ProRes 4444
+                let (kr, kb) = if hdr.is_some() { self.signal.kr_kb() } else { (0.2126, 0.0722) };
+                to_yuv444_10(f.rgba, hdr, w, h, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr, None)
             }
-            None => rgba_to_yuv422_10(f.rgba, f.width as usize, f.height as usize, &mut fr.y, &mut fr.cb, &mut fr.cr),
+            (_, Some(rgb)) => {
+                let (kr, kb) = self.signal.kr_kb();
+                rgbf_to_yuv422_10(rgb, w, h, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr)
+            }
+            (_, None) => rgba_to_yuv422_10(f.rgba, w, h, &mut fr.y, &mut fr.cb, &mut fr.cr),
         }
         // the encoder rescales 10-bit input to its coded depth
         let data = self.enc.encode(&fr).map_err(|e| ExportError::Encode(e.to_string()))?;
@@ -1389,7 +1450,7 @@ impl VideoEncoder for DnxEncoder {
 
 fn dnx_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
     (format == Format::DnxHr).then(|| {
-        let mut cfg = filmcraft_dnx::EncoderConfig::new(dnx_profile(&s.dnx_profile), w, h);
+        let mut cfg = dnx_config(&s.dnx_profile, w, h);
         if s.signal.primaries == 9 {
             cfg.color_volume = filmcraft_dnx::ColorVolume::Bt2020Ncl;
         }

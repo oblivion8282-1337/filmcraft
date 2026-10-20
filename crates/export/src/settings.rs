@@ -514,6 +514,17 @@ impl ExportSettings {
         }
     }
 
+    /// The field order the output has: the setting's, except for an interlaced DNxHD compression
+    /// ID, which is always coded upper field first.
+    pub fn output_field_order(&self) -> FieldOrder {
+        if self.dnx_field_coded() { FieldOrder::UpperFirst } else { self.field_order }
+    }
+
+    /// Whether the video is an interlaced DNxHD compression ID (two fields per frame).
+    pub fn dnx_field_coded(&self) -> bool {
+        self.video_format() == Format::DnxHr && crate::dnx_config(&self.dnx_profile, 0, 0).hd_cid.is_some_and(crate::dnx_interlaced)
+    }
+
     /// Whether the exported frames keep their alpha channel instead of being flattened over black.
     pub fn keeps_alpha(&self) -> bool {
         self.alpha && self.supports_alpha()
@@ -533,6 +544,12 @@ impl ExportSettings {
         if !self.is_image_sequence() && self.format != Format::Gif {
             w &= !1;
             h &= !1;
+        }
+        // DNxHD codes one raster per compression ID: the sequence is fitted into it
+        if self.video_format() == Format::DnxHr
+            && let Some((fw, fh)) = crate::dnx_fixed_raster(&self.dnx_profile)
+        {
+            (w, h) = (fw, fh);
         }
         let rate = self.frame_rate.filter(|r| r.num > 0 && r.den > 0).unwrap_or(seq_rate);
         let fps = rate.num as f64 / rate.den as f64;
@@ -605,14 +622,9 @@ impl ExportSettings {
             Format::H264 | Format::Hevc | Format::Av1 => r.target_kbps as f64 * 1000.0,
             Format::ProRes => crate::prores_profile(&self.prores_profile).nominal_mbps_1080p30() * 1e6 * px / (1920.0 * 1080.0) * fps / 29.97,
             Format::DnxHr => {
-                // nominal 1080p29.97 data rates of the DNxHR profiles (Mb/s)
-                let mbps = match self.dnx_profile.to_ascii_lowercase().as_str() {
-                    "lb" => 45.0,
-                    "sq" => 145.0,
-                    "hqx" => 220.0,
-                    _ => 220.0,
-                };
-                mbps * 1e6 * px / (1920.0 * 1080.0) * fps / 29.97
+                // CBR: the coding's frame size at every frame
+                let c = crate::dnx_config(&self.dnx_profile, r.width, r.height);
+                filmcraft_dnx::Encoder::with_config(c).map_or(0.0, |e| f64::from(e.frame_size()) * 8.0 * fps)
             }
             Format::Apv => {
                 let bpp = match crate::apv_profile(&self.apv_profile) {
@@ -672,7 +684,7 @@ impl ExportSettings {
             "No video".to_string()
         } else {
             let par = self.pixel_aspect.map(|(n, d)| format!("{:.2}", n.max(1) as f64 / d.max(1) as f64)).unwrap_or_else(|| "1.0".into());
-            let mut v = format!("{}x{} ({par}), {} fps, {}", r.width, r.height, r.rate.label(), self.field_order.label());
+            let mut v = format!("{}x{} ({par}), {} fps, {}", r.width, r.height, r.rate.label(), self.output_field_order().label());
             match self.video_format() {
                 Format::H264 => {
                     v += &format!(
@@ -717,7 +729,7 @@ impl ExportSettings {
                         Profile::P4444Xq => ", ProRes 4444 XQ",
                     }
                 }
-                Format::DnxHr => v += &format!(", DNxHR {}", if self.dnx_profile.is_empty() { "HQ".into() } else { self.dnx_profile.to_ascii_uppercase() }),
+                Format::DnxHr => v += &format!(", {}", crate::dnx_label(&self.dnx_profile, r.rate.num as f64 / r.rate.den.max(1) as f64)),
                 Format::Apv => v += &format!(", {}", crate::apv_profile(&self.apv_profile).name()),
                 Format::Mjpeg | Format::JpegSequence => v += &format!(", quality {}", self.quality),
                 Format::DpxSequence => v += ", 10-bit RGB",

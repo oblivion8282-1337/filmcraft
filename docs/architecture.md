@@ -50,7 +50,7 @@ and `filmcraft-cli`.
 | `h264`, `h264enc` | L0 | H.264 decoder; H.264 encoder |
 | `hevc` | L0 | H.265 Main/Main 10 decoder |
 | `prores` | L0 | ProRes decoder and encoder |
-| `dnx` | L0 | DNxHD / DNxHR (SMPTE ST 2019-1 VC-3) decoder and DNxHR encoder |
+| `dnx` | L0 | DNxHD / DNxHR (SMPTE ST 2019-1 VC-3) decoder and encoder |
 | `apv` | L0 | Advanced Professional Video (IETF RFC 9924) decoder and encoder ([README](../crates/apv/README.md)) |
 | `dng` | L0 | DNG / CinemaDNG camera RAW decoder: TIFF container, uncompressed and lossless JPEG raw data, DNG processing to linear Rec. 709 ([README](../crates/dng/README.md)) |
 | `av1` | L0 | AV1 decoder (Main profile; bit-exact with libdav1d; see its README for the stage table) |
@@ -665,7 +665,7 @@ file.exportMedia {path, preset?, settings?, format?, range?, …}     export.qui
 |---|---|---|
 | `h264` | `filmcraft-h264enc` (profile, level, CBR / VBR 1-pass / VBR 2-pass, keyframe distance) + `filmcraft-aac` | MP4 or QuickTime (`isobmff`, the Multiplexer setting) |
 | `prores` | `filmcraft-prores` (Proxy / LT / 422 / HQ) | MOV |
-| `dnxhr` | `filmcraft-dnx` (LB / SQ / HQ / HQX) | MOV (`AVdh`) |
+| `dnxhr` | `filmcraft-dnx`: DNxHR LB / SQ / HQ / HQX (10 or 12-bit) / 444 (10 or 12-bit, Y'CbCr) at the output size, or DNxHD `dnxhd-<cid>` (1080p / 1080i upper field first / 720p / 444) at its fixed raster | MOV (`AVdh`) |
 | `mjpeg` | built in | MOV |
 | `aac` | `filmcraft-aac` (AAC-LC, the audio settings' bitrate) | audio only: MPEG-4 audio `.m4a` (`isobmff`, priming in an edit list), or raw ADTS when the path ends in `.aac` |
 | `mxf-op1a` | DNxHR (default), ProRes or H.264 (Annex B, long GOP), `mxfVideoCodec`; PCM 16/24/32-bit integer | MXF OP1a (`filmcraft-mxf` writer: frame-wrapped, index with temporal offsets, start timecode) |

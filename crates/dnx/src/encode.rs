@@ -1,4 +1,5 @@
-//! DNxHR encoder (RI profile, CBR, progressive).
+//! DNxHR (RI profile) and DNxHD (HD profile) encoder, CBR; interlaced DNxHD IDs are
+//! field-coded (two coding units, top field first).
 //!
 //! Every macroblock is transformed once (orthonormal 8×8 FDCT). Quantisation follows equation
 //! 8.2 exactly (`X̂ = ⌊p·|X| / (qsf·W)⌋`, which the decoder reconstructs at the interval
@@ -29,6 +30,9 @@ pub struct EncoderConfig {
     pub par: (u16, u16),
     /// Code the frame's alpha, and how (`None`: no alpha).
     pub alpha: Option<AlphaCoding>,
+    /// A DNxHD (HD profile) compression ID to code instead of the profile's DNxHR one: its
+    /// raster, depth and frame size are fixed (Table C.1). See [`EncoderConfig::dnxhd`].
+    pub hd_cid: Option<u32>,
 }
 
 /// How alpha is coded (§7.3.1.2).
@@ -46,19 +50,42 @@ impl EncoderConfig {
             Profile::Hqx | Profile::R444 => 10,
             _ => 8,
         };
-        EncoderConfig { profile, width, height, bit_depth, color_volume: ColorVolume::Bt709, par: (0, 0), alpha: None }
+        EncoderConfig { profile, width, height, bit_depth, color_volume: ColorVolume::Bt709, par: (0, 0), alpha: None, hd_cid: None }
+    }
+
+    /// DNxHD compression ID `cid` at its raster and depth (`None` for an RI or unknown ID, and
+    /// for CID 1260, whose macroblock-adaptive field coding the encoder does not write).
+    pub fn dnxhd(cid: u32) -> Option<EncoderConfig> {
+        let crate::tables::Kind::Hd { width, height, depth, .. } = cid_info(cid)?.kind else { return None };
+        (cid != 1260).then(|| EncoderConfig {
+            bit_depth: depth,
+            hd_cid: Some(cid),
+            ..EncoderConfig::new(if depth > 8 { Profile::Hqx } else { Profile::Hq }, u32::from(width), u32::from(height))
+        })
+    }
+
+    /// The compression ID coded.
+    pub fn cid(&self) -> u32 {
+        self.hd_cid.unwrap_or(self.profile.cid())
     }
 
     pub fn chroma(&self) -> ChromaFormat {
-        if self.profile == Profile::R444 { ChromaFormat::Yuv444 } else { ChromaFormat::Yuv422 }
+        if self.profile == Profile::R444 && self.hd_cid.is_none() || self.hd_cid == Some(1256) { ChromaFormat::Yuv444 } else { ChromaFormat::Yuv422 }
+    }
+
+    /// The name of what is coded ("DNxHR HQ", "DNxHD 1080i 8-bit (CID 1242)"…).
+    pub fn name(&self) -> String {
+        crate::cid_name(self.cid())
     }
 }
 
-/// DNxHR encoder.
+/// DNxHR / DNxHD encoder.
 pub struct Encoder {
     cfg: EncoderConfig,
     info: &'static CidInfo,
     frame_size: u32,
+    /// Field-coded: two coding units of half the frame size and lines.
+    fields: bool,
     header_size: u32,
     last_q: u32,
 }
@@ -92,17 +119,30 @@ impl Encoder {
         if cfg.chroma() == ChromaFormat::Yuv422 && !cfg.width.is_multiple_of(2) {
             return Err(Error::Input("4:2:2 needs an even width".into()));
         }
-        let ok_depth = match cfg.profile {
-            Profile::Hqx | Profile::R444 => matches!(cfg.bit_depth, 10 | 12),
-            _ => cfg.bit_depth == 8,
+        let info = cid_info(cfg.cid()).ok_or_else(|| Error::Input(format!("no compression table for {}", cfg.name())))?;
+        let (frame_size, fields) = match (cfg.hd_cid, info.kind) {
+            (None, _) => {
+                let ok_depth = match cfg.profile {
+                    Profile::Hqx | Profile::R444 => matches!(cfg.bit_depth, 10 | 12),
+                    _ => cfg.bit_depth == 8,
+                };
+                if !ok_depth {
+                    return Err(Error::Input(format!("{} does not support {}-bit", cfg.profile.name(), cfg.bit_depth)));
+                }
+                (crate::tables::ri_frame_size(cfg.width, cfg.height, cfg.profile.c0(), cfg.alpha.is_some()), false)
+            }
+            (Some(cid), crate::tables::Kind::Hd { width, height, interlaced, depth, frame_size }) if cid != 1260 => {
+                if (cfg.width, cfg.height, cfg.bit_depth) != (u32::from(width), u32::from(height), depth) {
+                    return Err(Error::Input(format!("{} codes {width}x{height} at {depth} bits", cfg.name())));
+                }
+                // (Amendment 1: alpha adds half the frame size)
+                (if cfg.alpha.is_some() { frame_size + frame_size / 2 } else { frame_size }, interlaced)
+            }
+            (Some(_), _) => return Err(Error::Input(format!("the encoder does not code {}", cfg.name()))),
         };
-        if !ok_depth {
-            return Err(Error::Input(format!("{} does not support {}-bit", cfg.profile.name(), cfg.bit_depth)));
-        }
-        let info = cid_info(cfg.profile.cid()).ok_or_else(|| Error::Input(format!("no compression table for {}", cfg.profile.name())))?;
-        let frame_size = crate::tables::ri_frame_size(cfg.width, cfg.height, cfg.profile.c0(), cfg.alpha.is_some());
-        let header_size = header::header_size_for(cfg.height);
-        Ok(Encoder { cfg, info, frame_size, header_size, last_q: 8 })
+        let lines = if fields { cfg.height / 2 } else { cfg.height };
+        let header_size = header::header_size_for(lines);
+        Ok(Encoder { cfg, info, frame_size, fields, header_size, last_q: 8 })
     }
 
     pub fn config(&self) -> &EncoderConfig {
@@ -135,11 +175,26 @@ impl Encoder {
         if cfg.alpha.is_some() && f.alpha.as_ref().is_none_or(|a| a.len() != n) {
             return Err(Error::Input("alpha coding needs an alpha plane of the frame's size".into()));
         }
+        if !self.fields {
+            return self.encode_unit(f, FieldCode::Frame, self.frame_size);
+        }
+        // field coding: field 1 (the top field, the even lines), then field 2, each a coding unit
+        // of half the frame size
+        if !f.height.is_multiple_of(2) {
+            return Err(Error::Input("a field-coded frame needs an even height".into()));
+        }
+        let mut out = self.encode_unit(&field(f, 0), FieldCode::Field1, self.frame_size / 2)?;
+        out.extend(self.encode_unit(&field(f, 1), FieldCode::Field2, self.frame_size / 2)?);
+        Ok(out)
+    }
+
+    /// One coding unit of `size` bytes for the picture `f` (a frame, or a field of one).
+    fn encode_unit(&mut self, f: &Frame, code: FieldCode, size: u32) -> Result<Vec<u8>> {
         let prep = self.prepare(f);
         let vlc = vlc(self.info.vlc);
-        let budget_bits = (self.frame_size as u64 - self.header_size as u64 - 4) * 8;
+        let budget_bits = (u64::from(size).saturating_sub(u64::from(self.header_size) + 4)) * 8;
         let q = self.rate_control(&prep, vlc, budget_bits);
-        self.write(&prep, vlc, &q, f.rgb)
+        self.write(&prep, vlc, &q, f, code, size)
     }
 
     fn mb_layout(&self) -> &'static [(u8, u8, u8)] {
@@ -153,8 +208,8 @@ impl Encoder {
 
     fn prepare(&self, f: &Frame) -> Prepared {
         let cfg = &self.cfg;
-        let nw = cfg.width.div_ceil(16) as usize;
-        let ns = cfg.height.div_ceil(16) as usize;
+        let nw = f.width.div_ceil(16) as usize;
+        let ns = f.height.div_ceil(16) as usize;
         let ncol = self.mb_layout().len();
         // DCT-coded alpha: four more blocks per macroblock (plane 3, coded after the colour)
         let layout: Vec<(u8, u8, u8)> = if cfg.alpha == Some(AlphaCoding::Dct) {
@@ -334,7 +389,8 @@ impl Encoder {
         qs
     }
 
-    fn write(&self, prep: &Prepared, vlc: &VlcSet, qs: &[u32], rgb: bool) -> Result<Vec<u8>> {
+    fn write(&self, prep: &Prepared, vlc: &VlcSet, qs: &[u32], f: &Frame, code: FieldCode, size: u32) -> Result<Vec<u8>> {
+        let rgb = f.rgb;
         let cfg = &self.cfg;
         let p_bits = if cfg.bit_depth == 8 { 4 } else { 6 };
         let max_amp = if p_bits == 4 { 1024 } else { 4096 };
@@ -394,21 +450,22 @@ impl Encoder {
 
         let h = FrameHeader {
             header_size: self.header_size,
-            version: 3,
+            // (HVN 1 for the HD profile, as Table C.1's IDs are written; 3 for RI)
+            version: if cfg.hd_cid.is_some() { 1 } else { 3 },
             cid: self.info.cid,
             vbr: false,
-            field: FieldCode::Frame,
+            field: code,
             macf: false,
             crc: false,
             alpha: cfg.alpha.is_some(),
             lossless_alpha: cfg.alpha == Some(AlphaCoding::Lossless),
             premultiplied_alpha: false,
             width: cfg.width,
-            lines: cfg.height,
+            lines: f.height,
             par: cfg.par,
             bit_depth: cfg.bit_depth,
-            interlaced: false,
-            frame_encoding: true,
+            interlaced: self.fields,
+            frame_encoding: !self.fields,
             chroma: cfg.chroma(),
             rgb: ycbcr444,
             color_volume: cfg.color_volume,
@@ -416,7 +473,7 @@ impl Encoder {
             mb_rows: prep.ns as u32,
         };
         let mut out = header::write(&h);
-        out.reserve(self.frame_size as usize - out.len());
+        out.reserve((size as usize).saturating_sub(out.len()));
         let mut off = 0u32;
         for (s, r) in rows.iter().enumerate() {
             let o = SCAN_INDEX_OFFSET + 4 * s;
@@ -426,7 +483,7 @@ impl Encoder {
         for r in rows {
             out.extend_from_slice(&r);
         }
-        let end = self.frame_size as usize - 4;
+        let end = (size as usize).saturating_sub(4);
         if out.len() > end {
             return Err(Error::Input("rate control overflow".into()));
         }
@@ -434,6 +491,19 @@ impl Encoder {
         out.extend_from_slice(&EOF_SIGNATURE);
         Ok(out)
     }
+}
+
+/// Field `parity` of `f` (its even lines for 0, odd for 1) as a frame of half the height.
+fn field(f: &Frame, parity: u32) -> Frame {
+    let mut out = f.clone();
+    out.height = f.height / 2;
+    let pick = |p: &[u16], w: usize| -> Vec<u16> { p.chunks(w.max(1)).skip(parity as usize).step_by(2).flatten().copied().collect() };
+    let (w, cw) = (f.width as usize, f.chroma_width() as usize);
+    out.y = pick(&f.y, w);
+    out.cb = pick(&f.cb, cw);
+    out.cr = pick(&f.cr, cw);
+    out.alpha = f.alpha.as_ref().map(|a| pick(a, w));
+    out
 }
 
 /// Lossless alpha of one macroblock (its 256 samples in serpentine order, §7.3.1.2 and §8.3; the

@@ -133,9 +133,23 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
         p("Avid DNxHR HQ", bc, "QuickTime, DNxHR HQ (8-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::DnxHr, "hq")),
         p("Avid DNxHR SQ", bc, "QuickTime, DNxHR SQ (8-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::DnxHr, "sq")),
         p("Avid DNxHR LB", bc, "QuickTime, DNxHR LB (8-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::DnxHr, "lb")),
+        p("Avid DNxHR HQX", bc, "QuickTime, DNxHR HQX (10-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::DnxHr, "hqx")),
+        p("Avid DNxHR 444", bc, "QuickTime, DNxHR 444 (10-bit 4:4:4), 24-bit 48 kHz PCM", mov(Format::DnxHr, "444")),
         p("APV 422-10", bc, "QuickTime, APV 422-10 (10-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::Apv, "422-10")),
         p("APV 422-12", bc, "QuickTime, APV 422-12 (12-bit 4:2:2), 24-bit 48 kHz PCM", mov(Format::Apv, "422-12")),
         p("MXF OP1a DNxHR HQ", bc, "MXF OP1a, DNxHR HQ (8-bit 4:2:2), 24-bit 48 kHz PCM, start timecode", mxf(Format::MxfOp1a, MxfVideoCodec::Dnxhr, "hq")),
+        p(
+            "MXF OP1a DNxHD 1080i 8-bit",
+            bc,
+            "MXF OP1a, DNxHD 1080i CID 1242 (8-bit 4:2:2, upper field first; 121 Mb/s at 25 fps, 145 at 29.97), 24-bit 48 kHz PCM, start timecode",
+            mxf(Format::MxfOp1a, MxfVideoCodec::Dnxhr, "dnxhd-1242"),
+        ),
+        p(
+            "MXF OP1a DNxHD 1080p 10-bit",
+            bc,
+            "MXF OP1a, DNxHD 1080p CID 1235 (10-bit 4:2:2; 184 Mb/s at 25 fps, 220 at 29.97), 24-bit 48 kHz PCM, start timecode",
+            mxf(Format::MxfOp1a, MxfVideoCodec::Dnxhr, "dnxhd-1235"),
+        ),
         p("MXF OP1a ProRes 422 HQ", bc, "MXF OP1a, ProRes 422 HQ, 24-bit 48 kHz PCM, start timecode", mxf(Format::MxfOp1a, MxfVideoCodec::ProRes, "hq")),
         p("MXF OP1a H.264", bc, "MXF OP1a, H.264 High long GOP (0.3 bits per pixel), 24-bit 48 kHz PCM", mxf(Format::MxfOp1a, MxfVideoCodec::H264, "")),
         p(

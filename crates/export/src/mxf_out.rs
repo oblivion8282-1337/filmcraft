@@ -52,9 +52,14 @@ fn picture(settings: &ExportSettings, w: u32, h: u32) -> PictureDesc {
             },
             intra: false,
         },
-        _ => PictureCoding::Vc3 { cid: crate::dnx_profile(&settings.dnx_profile).cid() },
+        _ => PictureCoding::Vc3 { cid: crate::dnx_config(&settings.dnx_profile, w, h).cid() },
     };
     let mut d = PictureDesc::new(coding, w, h);
+    if settings.video_format() == Format::DnxHr {
+        let c = crate::dnx_config(&settings.dnx_profile, w, h);
+        d.depth = u32::from(c.bit_depth);
+        d.interlaced = settings.dnx_field_coded();
+    }
     d.color = match settings.signal {
         s if s == ColorSignal::PQ => ColorSpace::Rec2020Pq,
         s if s == ColorSignal::HLG => ColorSpace::Rec2020Hlg,

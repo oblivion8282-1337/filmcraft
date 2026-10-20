@@ -199,19 +199,55 @@ fn prores_4444_export_roundtrip() {
 #[test]
 fn dnxhr_export_roundtrip() {
     let (p, seq, m) = project();
-    for (profile, label) in [("hq", "DNxHR HQ"), ("hqx", "DNxHR HQX"), ("sq", "DNxHR SQ")] {
+    for (profile, label, size, chroma, bits) in [
+        ("hq", "DNxHR HQ", (320, 180), "4:2:2", 8),
+        ("hqx", "DNxHR HQX", (320, 180), "4:2:2", 10),
+        ("hqx12", "DNxHR HQX", (320, 180), "4:2:2", 12),
+        ("sq", "DNxHR SQ", (320, 180), "4:2:2", 8),
+        ("444", "DNxHR 444", (320, 180), "4:4:4", 10),
+        ("44412", "DNxHR 444", (320, 180), "4:4:4", 12),
+        // DNxHD: the sequence fitted into the compression ID's raster
+        ("dnxhd-1237", "DNxHD 1080p 8-bit (CID 1237)", (1920, 1080), "4:2:2", 8),
+        ("dnxhd-1242", "DNxHD 1080i 8-bit (CID 1242)", (1920, 1080), "4:2:2", 8),
+        ("dnxhd-1250", "DNxHD 720p 10-bit (CID 1250)", (1280, 720), "4:2:2", 10),
+        ("dnxhd-1256", "DNxHD 444 10-bit (CID 1256)", (1920, 1080), "4:4:4", 10),
+    ] {
         let path = tmp(&format!("dnx_{profile}.mov"));
-        let s = ExportSettings { format: Format::DnxHr, path: path.clone(), dnx_profile: profile.into(), ..Default::default() };
+        let mut s = ExportSettings { format: Format::DnxHr, path: path.clone(), dnx_profile: profile.into(), ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(3)));
         export(&p, seq, &s, &m, &Progress::default()).unwrap();
         let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
         let src = filmcraft_codecs::open_bytes("dnx.mov", bytes).unwrap();
         let info = src.info().video.clone().unwrap();
-        assert_eq!(info.codec, label);
-        let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 3))).unwrap();
-        assert!(f.format_label().contains("4:2:2"), "{}", f.format_label());
+        assert_eq!(info.codec, label, "{profile}");
+        let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 24))).unwrap();
+        assert_eq!((f.width, f.height), size, "{profile}: frame size");
+        assert!(f.format_label().contains(chroma), "{profile}: {}", f.format_label());
+        assert!(f.format_label().contains(&format!("{bits}")), "{profile}: {}", f.format_label());
         let px = f.to_rgba8();
-        assert!(px[0] > 240 && px[1] < 15 && px[2] < 15, "{profile}: {:?}", &px[..4]);
+        let mid = ((size.1 / 2 * size.0 + size.0 / 2) * 4) as usize;
+        assert!(px[mid] > 240 && px[mid + 1] < 15 && px[mid + 2] < 15, "{profile}: {:?}", &px[mid..mid + 4]);
     }
+}
+
+#[test]
+fn dnxhd_1080i_is_upper_field_first() {
+    let (p, seq, m) = project();
+    let base = ExportSettings { format: Format::DnxHr, dnx_profile: "dnxhd-1242".into(), ..Default::default() };
+    assert_eq!(base.output_field_order(), FieldOrder::UpperFirst);
+    assert!(base.summary(320, 180, FrameRate::FPS_25, 48_000, Tick(TICKS_PER_SECOND)).video.contains("Upper First, DNxHD 1080i 8-bit, 121 Mb/s"));
+    // the setting may say so; lower field first cannot be coded
+    let path = tmp("dnx_1242_upper.mov");
+    let mut s = ExportSettings { path: path.clone(), field_order: FieldOrder::UpperFirst, ..base.clone() };
+    s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(2)));
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    let data = std::fs::read(&path).unwrap();
+    assert!(data.windows(4).any(|w| w == b"fiel"), "the movie says it is interlaced");
+    let lower = ExportSettings { field_order: FieldOrder::LowerFirst, path: tmp("dnx_1242_lower.mov"), ..s.clone() };
+    assert!(export(&p, seq, &lower, &m, &Progress::default()).is_err());
+    // progressive DNx stays progressive
+    let hq = ExportSettings { field_order: FieldOrder::UpperFirst, dnx_profile: "hq".into(), path: tmp("dnx_hq_upper.mov"), ..s };
+    assert!(export(&p, seq, &hq, &m, &Progress::default()).is_err());
 }
 
 /// Burn-in: an H.264 export of a dark-blue matte with a caption, decoded by ffmpeg (external test
@@ -515,5 +551,50 @@ impl FrameRenderer for FakeRenderer {
         _sources: &dyn SourceProvider,
     ) -> Option<filmcraft_render::Image> {
         Some(filmcraft_render::Image::new(320, 180))
+    }
+}
+
+/// DNxHD 1080i and DNxHR 444 12-bit in QuickTime, MXF OP1a and OP-Atom: ffmpeg (an external
+/// test oracle only) decodes every frame and reads the field order, and so does our reader.
+#[test]
+fn dnxhd_exports_ffprobe_oracle() {
+    let find =
+        |name: &str| ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].into_iter().map(|d| format!("{d}/{name}")).find(|p| std::path::Path::new(p).exists());
+    let (Some(ffmpeg), Some(ffprobe)) = (find("ffmpeg"), find("ffprobe")) else {
+        eprintln!("ffmpeg not found; skipping oracle test");
+        return;
+    };
+    let (p, seq, m) = project();
+    for (format, ext) in [(Format::DnxHr, "mov"), (Format::MxfOp1a, "mxf"), (Format::MxfOpAtom, "mxf")] {
+        for (profile, size, pix, field_order) in [
+            ("dnxhd-1242", (1920, 1080), "yuv422p", "tt"),
+            ("dnxhd-1235", (1920, 1080), "yuv422p10le", "progressive"),
+            ("44412", (320, 180), "yuv444p12le", "progressive"),
+        ] {
+            let path = tmp(&format!("dnx_oracle_{profile}_{format:?}.{ext}"));
+            let mut s = ExportSettings { format, path: path.clone(), dnx_profile: profile.into(), mxf_video_codec: MxfVideoCodec::Dnxhr, ..Default::default() };
+            s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(3)));
+            export(&p, seq, &s, &m, &Progress::default()).unwrap();
+            let what = format!("{profile} {format:?}");
+            let probe = std::process::Command::new(&ffprobe)
+                .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,pix_fmt,field_order", "-of", "compact=p=0"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let probe = String::from_utf8_lossy(&probe.stdout);
+            assert!(probe.contains("codec_name=dnxhd") && probe.contains(&format!("width={}|height={}", size.0, size.1)), "{what}: {probe}");
+            assert!(probe.contains(&format!("pix_fmt={pix}")), "{what}: {probe}");
+            // (QuickTime has no progressive marker: ffmpeg reports a progressive movie unknown)
+            assert!(probe.contains(&format!("field_order={field_order}")) || ext == "mov" && field_order == "progressive", "{what}: {probe}");
+            let dec = std::process::Command::new(&ffmpeg).args(["-v", "error", "-xerror", "-i"]).arg(&path).args(["-f", "null", "-"]).output().unwrap();
+            assert!(dec.status.success() && dec.stderr.is_empty(), "{what}: {}", String::from_utf8_lossy(&dec.stderr));
+            // and our reader: the frame at its size, still red
+            let src = filmcraft_codecs::open_bytes(&format!("x.{ext}"), std::fs::read(&path).unwrap().into()).unwrap();
+            let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 24))).unwrap();
+            assert_eq!((f.width, f.height), size, "{what}: our reader");
+            let px = f.to_rgba8();
+            let mid = ((size.1 / 2 * size.0 + size.0 / 2) * 4) as usize;
+            assert!(px[mid] > 240 && px[mid + 1] < 15, "{what}: {:?}", &px[mid..mid + 4]);
+        }
     }
 }

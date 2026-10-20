@@ -175,6 +175,14 @@ fn gpu_dnx_matches_the_cpu_decoder_on_our_frames() {
             check(&mut stage, &dev, &q, &format!("{name} mixed"), &mixed(&sample), &mut failures);
         }
     }
+    // DNxHD from our encoder: 4:4:4 (CID 1256, which no other encoder we can run writes) and
+    // field-coded 1080i
+    for cid in [1256, 1242, 1241] {
+        let cfg = EncoderConfig::dnxhd(cid).unwrap();
+        let (w, h, bits, chroma) = (cfg.width, cfg.height, cfg.bit_depth, cfg.chroma());
+        let sample = Encoder::with_config(cfg).unwrap().encode(&busy(w, h, bits, chroma, false)).unwrap();
+        check(&mut stage, &dev, &q, &format!("DNxHD CID {cid}"), &sample, &mut failures);
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

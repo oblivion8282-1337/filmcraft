@@ -18,7 +18,8 @@ only as an external fixture generator and test oracle.
 |---|---|
 | Header (§7.2): all fields, HVN 1–4, RI header growth above 1088 lines, time code | done |
 | DNxHD (HD profile) CIDs 1235, 1237, 1238, 1241–1244, 1250–1253, 1258, 1259 | done, oracle-tested |
-| CID 1256 (HD RGB 4:4:4) and 1260 (macroblock-adaptive field/frame, 1440×1080i) | done, not oracle-tested (ffmpeg can't encode them) |
+| CID 1256 (HD 4:4:4) | done; ffmpeg can't encode it, but decodes our encoder's |
+| CID 1260 (macroblock-adaptive field/frame, 1440×1080i) | done, not oracle-tested (ffmpeg can't encode it) |
 | DNxHR (RI profile) 1270–1274: LB, SQ, HQ, HQX, 444; any raster 1…16384 | done, oracle-tested |
 | 8-, 10-, 12-bit; 4:2:2, 4:4:4; Y′CbCr and RGB (per-macroblock ACF) | done (12-bit: our encoder's streams, compared with ffmpeg's decode) |
 | 4:2:0 (RI only) | done, not oracle-tested (ffmpeg can't encode it) |
@@ -27,7 +28,8 @@ only as an external fixture generator and test oracle.
 | CBR padding, VBR, scan-line indices, EOF signature / CRC flag | done |
 | Encoder: DNxHR LB, SQ, HQ (8-bit), HQX (10/12-bit), 444 (10/12-bit); CBR | done |
 | Encoder: alpha, DCT-coded or lossless (`EncoderConfig::alpha`) | done |
-| Encoder: DNxHD (HD CIDs), interlaced, VBR | not yet |
+| Encoder: DNxHD (`EncoderConfig::dnxhd`): every HD CID but 1260, interlaced IDs field-coded | done, oracle-tested (ffmpeg decodes all 14) |
+| Encoder: CID 1260 (macroblock-adaptive), VBR | not yet |
 
 ## API
 
@@ -96,6 +98,10 @@ the prose of §7.3.1.2; we follow the prose (normative text takes precedence).
 - DNxHR LB/SQ/HQ (8-bit 4:2:2), HQX (10- or 12-bit 4:2:2) and 444 (10- or 12-bit 4:4:4,
   Y′CbCr or RGB), progressive, CBR at exactly the equation 7.1 frame size (e.g. 917 504 bytes
   for 1080p HQ, 606 208 for SQ). Input at any depth 8–16 is rescaled to the coded depth.
+- DNxHD (`EncoderConfig::dnxhd(cid)`): the HD profile's compression IDs (Table C.1) at their
+  fixed raster, depth and frame size, header version 1. Interlaced IDs (1241–1244) are
+  field-coded: the even lines as field 1, the odd as field 2, each its own coding unit of half
+  the frame size. CID 1260 (macroblock-adaptive field coding) is not written.
 - Alpha (`EncoderConfig::alpha`): DCT-coded like luma with each macroblock's quantiser, or
   lossless — per macroblock the differential run lengths (each run with whichever predictor,
   previous sample or linear, extends it furthest) or the raw samples where those are shorter.
@@ -146,8 +152,8 @@ lower bounds by a factor of roughly 4–10:
 ## Gaps
 
 - Decode is within IDCT precision of ffmpeg, not bit-exact (see above).
-- Encoder: no DNxHD (HD CIDs), interlaced or VBR output; no RDO/trellis.
-- CIDs 1256/1260 and alpha decoding are implemented from the standard but have no oracle
-  fixtures, because no available encoder produces them (alpha round-trips with our encoder, which
-  shares our reading of the standard).
+- Encoder: no CID 1260 or VBR output; no RDO/trellis.
+- CID 1260 and alpha decoding are implemented from the standard but have no oracle fixtures,
+  because no available encoder produces them (alpha round-trips with our encoder, which shares
+  our reading of the standard; ffmpeg does not decode VC-3 alpha at all).
 - No MXF; DNx in MOV only (via `filmcraft-isobmff` / `filmcraft-codecs`).

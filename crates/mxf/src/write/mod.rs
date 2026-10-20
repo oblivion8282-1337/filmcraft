@@ -179,6 +179,9 @@ pub struct PictureDesc {
     /// Chroma subsampling: (2, 1) 4:2:2, (2, 2) 4:2:0, (1, 1) 4:4:4.
     pub subsampling: (u32, u32),
     pub color: ColorSpace,
+    /// Interlaced, stored as two fields per frame (top field first, SMPTE 274M line map): frame
+    /// layout SeparateFields, the stored and sampled heights a field's.
+    pub interlaced: bool,
 }
 
 impl PictureDesc {
@@ -201,6 +204,7 @@ impl PictureDesc {
             depth,
             subsampling,
             color: ColorSpace::Rec709,
+            interlaced: false,
         }
     }
 }
@@ -883,16 +887,19 @@ impl<W: Write + Seek> MxfWriter<W> {
                     let black = 16u32 << (depth - 8);
                     let white = 235u32 << (depth - 8);
                     let range = (225u32 << (depth - 8)) + 1;
+                    // frame layout FullFrame, or SeparateFields with field heights and the first
+                    // active line of each field (SMPTE 274M 1080i: 21 and 584)
+                    let (layout, stored_h, lines) = if p.interlaced { (1u8, p.height / 2, [21u32, 21 + p.height / 2 + 23]) } else { (0, p.height, [0, 0]) };
                     s.p(0x3004, &t.container)
-                        .u8(0x320C, 0)
+                        .u8(0x320C, layout)
                         .u32(0x3203, p.width)
-                        .u32(0x3202, p.height)
+                        .u32(0x3202, stored_h)
                         .u32(0x3205, p.width)
-                        .u32(0x3204, p.height)
+                        .u32(0x3204, stored_h)
                         .u32(0x3209, p.width)
-                        .u32(0x3208, p.height)
+                        .u32(0x3208, stored_h)
                         .rat(0x320E, p.aspect)
-                        .p(0x320D, &batch(&[&0u32.to_be_bytes(), &0u32.to_be_bytes()], 4))
+                        .p(0x320D, &batch(&[&lines[0].to_be_bytes(), &lines[1].to_be_bytes()], 4))
                         .p(0x3201, &p.coding.coding_label())
                         .p(0x3210, &tcl)
                         .p(0x321A, &ce)

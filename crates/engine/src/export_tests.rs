@@ -284,6 +284,7 @@ fn every_builtin_preset_exports_and_ffprobe_confirms() {
                 let mbps = match p.as_str() {
                     "LB" => 45.0,
                     "SQ" => 145.0,
+                    "444" => 440.0,
                     _ => 220.0,
                 };
                 assert!((vbr / (mbps * px) - 1.0).abs() < 0.25, "{name}: {vbr:.1} Mb/s vs nominal {:.1}", mbps * px);

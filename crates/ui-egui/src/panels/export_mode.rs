@@ -539,7 +539,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.add_space(8.0);
         let s = &mut ex.settings;
         if s.has_video() && section(ui, &mut reg, &mut ex.open_sections, "video", tl!("Video"), &t) {
-            video_section(ui, &mut reg, s, &t, seq_w, seq_h, seq_hdr);
+            video_section(ui, &mut reg, s, &t, seq_w, seq_h, seq_rate, seq_hdr);
         }
         if (s.has_audio()
             || !s.has_video()
@@ -631,7 +631,8 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     reg.flush(app);
 }
 
-fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq_w: u32, seq_h: u32, seq_hdr: bool) {
+#[allow(clippy::too_many_arguments)]
+fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_hdr: bool) {
     // frame size
     let mut match_size = s.frame_size.is_none();
     row(ui, t, tl!("Frame Size"), |ui| {
@@ -803,13 +804,23 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
         }
         Format::DnxHr => {
             row(ui, t, tl!("Profile"), |ui| {
-                let keys = ["lb", "sq", "hq", "hqx"];
-                let labels = ["DNxHR LB", "DNxHR SQ", "DNxHR HQ", "DNxHR HQX (10-bit)"];
+                // DNxHR at the output size, then DNxHD at its fixed rasters (with the data rate at
+                // the export's frame rate, which names DNxHD flavours)
+                let rate = s.frame_rate.filter(|r| r.num > 0 && r.den > 0).unwrap_or(seq_rate);
+                let fps = rate.num as f64 / rate.den.max(1) as f64;
+                let mut keys: Vec<String> = ["lb", "sq", "hq", "hqx", "hqx12", "444", "44412"].iter().map(|k| k.to_string()).collect();
+                keys.extend(filmcraft_export::DNXHD_EXPORT_CIDS.iter().map(|c| format!("dnxhd-{c}")));
+                let labels: Vec<(String, bool)> = keys.iter().map(|k| (filmcraft_export::dnx_label(k, fps), true)).collect();
                 let cur = keys.iter().position(|k| *k == s.dnx_profile).unwrap_or(2);
-                if let Some(i) = combo(ui, reg, "export.video.dnxProfile", labels[cur], &opts(&labels), 220.0) {
-                    s.dnx_profile = keys[i].into();
+                if let Some(i) = combo(ui, reg, "export.video.dnxProfile", &labels[cur].0, &labels, 260.0)
+                    && let Some(k) = keys.get(i)
+                {
+                    s.dnx_profile = k.clone();
                 }
             });
+            if let Some((w, h)) = filmcraft_export::dnx_fixed_raster(&s.dnx_profile) {
+                row(ui, t, "", |ui| ui.label(tlf!("DNxHD codes {w}×{h}: the sequence is fitted into it", w, h)));
+            }
         }
         Format::Apv => {
             row(ui, t, tl!("Profile"), |ui| {
