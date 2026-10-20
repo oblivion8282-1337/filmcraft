@@ -2033,6 +2033,7 @@ name = "filmcraft-gpu"
 version = "0.9.0"
 dependencies = [
  "filmcraft-color",
+ "filmcraft-dnx",
  "filmcraft-export",
  "filmcraft-frame",
  "filmcraft-geom",
