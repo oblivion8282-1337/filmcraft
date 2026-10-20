@@ -153,6 +153,27 @@ impl VideoFrame {
         }
     }
 
+    /// Whether the host-memory pixels hold at least what `width`×`height` needs (always true for
+    /// GPU-side data). A short buffer (a failed decode's empty placeholder, a corrupt file) is
+    /// shown transparent instead of being indexed past its end.
+    pub fn data_fits(&self) -> bool {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let n = w.saturating_mul(h);
+        let planar = |len: [usize; 3], chroma: Chroma, alpha: Option<usize>| {
+            let (sx, sy) = chroma.shifts();
+            let cn = w.div_ceil(1 << sx).saturating_mul(h.div_ceil(1 << sy));
+            len[0] >= n && len[1] >= cn && len[2] >= cn && alpha.is_none_or(|a| a >= n)
+        };
+        match &self.data {
+            PixelData::Rgba8(d) => d.len() >= n.saturating_mul(4),
+            PixelData::Rgba16(d) => d.len() >= n.saturating_mul(4),
+            PixelData::RgbaF32(d) => d.len() >= n.saturating_mul(4),
+            PixelData::Yuv8 { planes, chroma, alpha } => planar(planes.each_ref().map(|p| p.len()), *chroma, alpha.as_ref().map(|a| a.len())),
+            PixelData::Yuv16 { planes, chroma, alpha, .. } => planar(planes.each_ref().map(|p| p.len()), *chroma, alpha.as_ref().map(|a| a.len())),
+            PixelData::External(_) | PixelData::Coded(_) => true,
+        }
+    }
+
     /// The frame with its pixels in host memory: an [`PixelData::External`] picture read back
     /// through its CPU fallback (fetched once, then shared), a [`PixelData::Coded`] one decoded on
     /// the CPU (once), any other frame as it is.
@@ -362,6 +383,10 @@ impl VideoFrame {
         }
         if let PixelData::External(_) | PixelData::Coded(_) = &self.data {
             return self.cpu_frame().convert_region(n, decode, r, out);
+        }
+        if !self.data_fits() {
+            out.fill(0.0);
+            return;
         }
         if let PixelData::RgbaF32(d) = &self.data
             && n == 1
@@ -585,7 +610,7 @@ impl VideoFrame {
             PixelData::Rgba8(d) => d.as_ref().clone(),
             PixelData::External(_) | PixelData::Coded(_) => self.cpu_frame().to_rgba8(),
             PixelData::Yuv8 { planes, chroma, alpha: None }
-                if matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb) =>
+                if matches!(self.color.transfer, filmcraft_color::Transfer::Bt709 | filmcraft_color::Transfer::Srgb) && self.data_fits() =>
             {
                 // Direct display path: Y'CbCr → R'G'B' without linearisation.
                 let (sx, sy) = chroma.shifts();
@@ -788,6 +813,41 @@ fn rotate_chroma<T: Copy + Default + Send + Sync>(planes: &[Arc<Vec<T>>; 3], chr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_planes_show_transparent_instead_of_crashing() {
+        // a failed decode of a picture larger than the placeholder cap gives empty planes at the
+        // full size: every conversion has to cope (this panicked in convert_region)
+        let empty = |alpha: bool| VideoFrame {
+            width: 64,
+            height: 32,
+            data: PixelData::Yuv16 {
+                planes: [Arc::new(Vec::new()), Arc::new(Vec::new()), Arc::new(Vec::new())],
+                chroma: Chroma::C422,
+                bits: 10,
+                alpha: alpha.then(|| Arc::new(Vec::new())),
+            },
+            color: ColorInfo::REC709,
+            par: (1, 1),
+            pts: Tick::ZERO,
+        };
+        for f in [empty(false), empty(true)] {
+            assert!(!f.data_fits());
+            assert!(f.to_linear_f32().iter().all(|&v| v == 0.0));
+            assert!(f.to_rgba8().iter().all(|&v| v == 0));
+            assert_eq!(f.to_linear_f32_decimated(4).2.len(), 16 * 8 * 4);
+            let (_, region) = f.to_linear_f32_region(1, None, Region { x: 8, y: 8, w: 4, h: 4 });
+            assert!(region.iter().all(|&v| v == 0.0));
+            let _ = (f.cropped(Region { x: 2, y: 2, w: 8, h: 8 }), f.rotated(1), f.box_decimated(2), f.luma8());
+        }
+        let short8 = VideoFrame {
+            data: PixelData::Yuv8 { planes: [Arc::new(vec![16; 10]), Arc::new(vec![128; 3]), Arc::new(vec![128; 3])], chroma: Chroma::C420, alpha: None },
+            ..empty(false)
+        };
+        assert!(!short8.data_fits());
+        assert!(short8.to_rgba8().iter().all(|&v| v == 0));
+        let short_rgba = VideoFrame { data: PixelData::RgbaF32(Arc::new(vec![1.0; 12])), ..empty(false) };
+        assert!(short_rgba.to_linear_f32_decimated(2).2.iter().all(|&v| v == 0.0));
+    }
 
     #[test]
     fn cropping_cuts_every_plane_at_the_same_place() {

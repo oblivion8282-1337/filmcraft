@@ -602,6 +602,25 @@ impl GpuCompositor {
         let uploaded_before = self.uploaded_bytes;
         let d0 = self.dummy.clone();
         let dummy = || d0.clone();
+        // a frame whose host pixels are shorter than its size says (a failed decode's empty
+        // placeholder) or larger than a texture: transparent, not a GPU validation error
+        let max_side = self.device.limits().max_texture_dimension_2d;
+        if !matches!(f.data, PixelData::Coded(_)) && (!f.data_fits() || w == 0 || h == 0 || w > max_side || h > max_side) {
+            let v = self.plane_texture(1, 1, wgpu::TextureFormat::Rgba8UnormSrgb, &[0; 4], 4);
+            let up = Uploaded {
+                views: [v, dummy(), dummy(), dummy()],
+                kind: 0,
+                code_scale: 1.0,
+                alpha_scale: 0.0,
+                chroma: (1, 1),
+                last_used: self.clock,
+                bytes: 4,
+                _pixels: f.data.clone(),
+            };
+            self.uploads.insert(key, up);
+            self.trim_uploads();
+            return key;
+        }
         let up = match &f.data {
             PixelData::Coded(c) => return self.upload_coded(f, c, key),
             PixelData::Rgba8(d) => {
