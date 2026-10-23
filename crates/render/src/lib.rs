@@ -26,6 +26,7 @@ pub mod mask;
 pub mod mixer;
 pub mod multicam;
 pub mod offline;
+pub mod passthrough;
 pub mod plan;
 pub mod preview;
 pub mod remix;
@@ -269,7 +270,7 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
     canvas
 }
 
-fn is_adjustment(project: &Project, item: &TrackItem) -> bool {
+pub(crate) fn is_adjustment(project: &Project, item: &TrackItem) -> bool {
     project.item(item.item).is_some_and(|pi| matches!(pi.kind, ItemKind::AdjustmentLayer { .. }))
 }
 

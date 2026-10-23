@@ -26,6 +26,7 @@ mod pipeline;
 pub mod presets;
 mod raster;
 pub mod settings;
+mod smart;
 pub mod still;
 pub use audio_out::LoudnessReport;
 pub use job::{Exporter, Step, stepped};
@@ -378,6 +379,12 @@ pub struct ExportSettings {
     /// GPU rendering: Auto / Off, Off by default). Off = the CPU reference renderer exactly.
     #[serde(default)]
     pub gpu_rendering: GpuRendering,
+    /// Smart rendering (ProRes and DNx exports): a frame that shows one stored picture of a source
+    /// untouched, coded as the export codes its frames (same profile, size and colour), is copied
+    /// into the file instead of being encoded again — faster, and without another generation of
+    /// compression. On unless switched off.
+    #[serde(default = "default_true")]
+    pub smart_render: bool,
     /// VBR maximum bitrate (None = 1.5 × target).
     pub max_bitrate_kbps: Option<u32>,
     /// Adaptive bitrate (the Match Source presets): bits per pixel per frame; replaces
@@ -575,6 +582,7 @@ impl Default for ExportSettings {
             crf: DEFAULT_CRF,
             hardware_encoding: HardwareEncoding::default(),
             gpu_rendering: GpuRendering::Off,
+            smart_render: true,
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
             keyframe_distance: None,
@@ -597,6 +605,10 @@ pub const DEFAULT_CRF: f32 = 23.0;
 
 fn default_crf() -> f32 {
     DEFAULT_CRF
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ExportSettings {
@@ -716,6 +728,13 @@ pub struct Report {
     /// Further files written besides `path` (MXF OP-Atom audio files).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_files: Vec<String>,
+    /// Frames copied from their source instead of encoded ([`ExportSettings::smart_render`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub smart_frames: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A packet produced by a video encoder.
@@ -2058,7 +2077,15 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
         progress.finished.store(true, Ordering::Relaxed);
         progress.set_status(format!("Done in {secs:.1}s"));
     }
-    Ok(Report { path: settings.path.clone(), frames: nframes, seconds: secs, bytes, render_fps: nframes as f64 / secs.max(1e-6), extra_files: Vec::new() })
+    Ok(Report {
+        path: settings.path.clone(),
+        frames: nframes,
+        seconds: secs,
+        bytes,
+        render_fps: nframes as f64 / secs.max(1e-6),
+        extra_files: Vec::new(),
+        smart_frames: 0,
+    })
 }
 
 #[cfg(test)]
@@ -2078,3 +2105,6 @@ mod determinism_tests;
 
 #[cfg(test)]
 mod hdr_tests;
+
+#[cfg(test)]
+mod smart_tests;

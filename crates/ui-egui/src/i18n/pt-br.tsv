@@ -3578,3 +3578,5 @@
 
 # The native macOS application menu (Settings…).
 	Settings	Preferências
+	Smart Rendering	Renderização inteligente
+	Copy unchanged ProRes / DNx frames from the source	Copiar quadros ProRes / DNx inalterados da origem

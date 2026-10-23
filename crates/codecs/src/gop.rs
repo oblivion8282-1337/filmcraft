@@ -123,6 +123,12 @@ pub trait VideoSamples: Sync {
     fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>>;
 }
 
+/// The sample shown at `target` (track units): the one presented then, else the last one.
+fn sample_shown_at(s: &dyn VideoSamples, target: i64) -> Option<usize> {
+    let n = s.count();
+    s.sample_at(target.max(0)).or_else(|| (n > 0).then(|| n - 1))
+}
+
 /// The sync sample to start decoding at for sample `i`: its sync sample, or an earlier one when
 /// `i` is a leading picture of an open GOP (stored after its random-access picture, shown before
 /// it, like the RASL pictures after every HEVC CRA of iPhone video). Those are predicted from the
@@ -146,8 +152,10 @@ struct State {
     start: usize,
     /// Highest pts the running decoder has output since it started (pictures leave in pts order).
     out_max: i64,
-    /// Decoded frames by presentation pts (bounded).
-    frames: BTreeMap<i64, Arc<VideoFrame>>,
+    /// Decoded frames by presentation pts (bounded), each with the bytes `bytes` was charged for
+    /// it when it was stored. A coded picture grows once a CPU consumer decodes it
+    /// (`CodedImage::cpu`): giving back its size of now would take more than was charged.
+    frames: BTreeMap<i64, (Arc<VideoFrame>, usize)>,
     /// The cached frames that were decoded in draft mode: served to draft requests only.
     drafts: std::collections::BTreeSet<i64>,
     bytes: usize,
@@ -179,10 +187,10 @@ impl State {
     /// Evict frames, earliest first, while `more` says so.
     fn release_frames(&mut self, pool: &Pool, more: impl Fn() -> bool) {
         while more() {
-            let Some((pts, f)) = self.frames.pop_first() else { break };
+            let Some((pts, (f, charged))) = self.frames.pop_first() else { break };
             self.drafts.remove(&pts);
-            self.bytes = self.bytes.saturating_sub(f.byte_size());
-            pool.bytes.fetch_sub(f.byte_size(), Ordering::Relaxed);
+            self.bytes = self.bytes.saturating_sub(charged);
+            pool.bytes.fetch_sub(charged, Ordering::Relaxed);
             EVICTED.fetch_add(1, Ordering::Relaxed);
             filmcraft_frame::pool::recycle(f);
         }
@@ -190,12 +198,12 @@ impl State {
 
     /// The cached frame at `pts`, unless it is a draft frame and the request wants the exact one.
     fn cached(&self, pts: i64, draft_ok: bool) -> Option<&Arc<VideoFrame>> {
-        self.frames.get(&pts).filter(|_| draft_ok || !self.drafts.contains(&pts))
+        self.frames.get(&pts).map(|(f, _)| f).filter(|_| draft_ok || !self.drafts.contains(&pts))
     }
 
     /// The nearest usable frame at or before `pts` (robust to decoder pts quirks).
     fn at_or_before(&self, pts: i64, draft_ok: bool) -> Option<Arc<VideoFrame>> {
-        self.cached(pts, draft_ok).or_else(|| self.frames.range(..=pts).rev().find(|(p, _)| draft_ok || !self.drafts.contains(p)).map(|(_, f)| f)).cloned()
+        self.cached(pts, draft_ok).or_else(|| self.frames.range(..=pts).rev().find(|(p, _)| draft_ok || !self.drafts.contains(p)).map(|(_, (f, _))| f)).cloned()
     }
 }
 
@@ -536,6 +544,28 @@ impl GopCache {
         self
     }
 
+    /// The stored picture [`Self::frame`] shows at `target`, a `format` sample of a track whose
+    /// sample entry is `fourcc`, when frames are shown as stored: no clean-aperture cut and no
+    /// rotation (`MediaSource::coded_sample`). Its size, alpha and colour are read from its
+    /// headers (checked as the decoders check them), the colour the container states winning as
+    /// it does for decoded frames. `None` for an empty track, a failed read and a picture whose
+    /// headers do not parse.
+    pub fn coded_sample(
+        &self,
+        s: &dyn VideoSamples,
+        target: i64,
+        format: filmcraft_frame::CodedFormat,
+        fourcc: [u8; 4],
+    ) -> Option<filmcraft_media::CodedSample> {
+        if self.crop.is_some() || self.rotation != 0 {
+            return None;
+        }
+        let data = s.read(sample_shown_at(s, target)?).ok()?;
+        let (width, height, alpha, color) = crate::video::coded_picture(format, &data)?;
+        let color = self.explicit_color.unwrap_or(color);
+        Some(filmcraft_media::CodedSample { format, fourcc, data: data.into(), width, height, alpha, color })
+    }
+
     /// Colour signalled by the container wins over the bitstream's (YUV frames only); the
     /// container's clean aperture and then its display rotation are applied.
     fn finish(&self, mut f: VideoFrame) -> VideoFrame {
@@ -563,11 +593,12 @@ impl GopCache {
         } else {
             st.drafts.remove(&pts);
         }
-        let budget = self.budget.max(MIN_FRAMES * f.byte_size());
+        let size = f.byte_size();
+        let budget = self.budget.max(MIN_FRAMES.saturating_mul(size));
         let before = st.bytes;
-        st.bytes += f.byte_size();
-        if let Some(old) = st.frames.insert(pts, Arc::new(f)) {
-            st.bytes -= old.byte_size();
+        st.bytes = st.bytes.saturating_add(size);
+        if let Some((old, charged)) = st.frames.insert(pts, (Arc::new(f), size)) {
+            st.bytes = st.bytes.saturating_sub(charged);
             filmcraft_frame::pool::recycle(old);
         }
         // Evict frames far from the request (pin), not the newest decode. A frame-threaded
@@ -583,9 +614,9 @@ impl GopCache {
                     break;
                 }
             }
-            if let Some(v) = st.frames.remove(&victim) {
+            if let Some((v, charged)) = st.frames.remove(&victim) {
                 st.drafts.remove(&victim);
-                st.bytes -= v.byte_size();
+                st.bytes = st.bytes.saturating_sub(charged);
                 EVICTED.fetch_add(1, Ordering::Relaxed);
                 // its planes serve the next decoded pictures instead of going back to the allocator
                 filmcraft_frame::pool::recycle(v);
@@ -639,7 +670,7 @@ impl GopCache {
 
     fn frame_late_locked(&self, s: &dyn VideoSamples, target: i64, late_before: Option<i64>) -> crate::Result<Arc<VideoFrame>> {
         let n = s.count();
-        let i = s.sample_at(target.max(0)).or_else(|| (n > 0).then(|| n - 1)).ok_or_else(|| CodecError::Decode("empty track".into()))?;
+        let i = sample_shown_at(s, target).ok_or_else(|| CodecError::Decode("empty track".into()))?;
         let want_pts = s.pts(i);
         let me = self as *const Self as usize;
         if DecodingGuard::active(me) {
@@ -869,6 +900,52 @@ mod tests {
     use super::*;
     use crate::video::DecodedFrame;
     use std::collections::VecDeque;
+
+    /// A cached coded picture that a CPU consumer decodes grows by its planes after it was
+    /// charged; storing its pts again (two workers decoding the same sample) took its grown size
+    /// off the count, which underflowed (a panic with overflow checks, a wrapped count in release).
+    #[test]
+    fn a_coded_frame_decoded_after_it_was_cached_gives_back_what_it_was_charged() {
+        let pool = Arc::new(Pool::new(usize::MAX, Duration::ZERO, usize::MAX));
+        let c = GopCache::in_pool(None, pool.clone());
+        let (w, h) = (64u32, 32u32);
+        let planes = move |_: &[u8]| {
+            let n = (w * h) as usize;
+            Some(filmcraft_frame::PixelData::Yuv16 {
+                planes: [Arc::new(vec![64; n]), Arc::new(vec![512; n / 2]), Arc::new(vec![512; n / 2])],
+                chroma: filmcraft_frame::Chroma::C422,
+                bits: 10,
+                alpha: None,
+            })
+        };
+        let coded = Arc::new(filmcraft_frame::CodedImage::new(
+            filmcraft_frame::CodedFormat::ProRes,
+            Arc::from(&[0u8; 100][..]),
+            filmcraft_frame::Chroma::C422,
+            10,
+            false,
+            Box::new(planes),
+        ));
+        let frame = || VideoFrame {
+            width: w,
+            height: h,
+            data: filmcraft_frame::PixelData::Coded(coded.clone()),
+            color: ColorInfo::REC709,
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
+        };
+        let mut st = c.shared.state.lock().unwrap();
+        c.store_finished(&mut st, 0, frame(), false);
+        assert_eq!(st.bytes, 100);
+        // a CPU consumer decodes the cached picture
+        let _ = coded.cpu(w, h);
+        assert!(st.frames[&0].0.byte_size() > 100);
+        // the same picture stored again, still coded
+        c.store_finished(&mut st, 0, VideoFrame::rgba8(1, 1, vec![0; 4]), false);
+        assert_eq!(st.bytes, 4);
+        drop(st);
+        assert_eq!(pool.bytes.load(Ordering::Relaxed), 4);
+    }
 
     /// `n` samples, a sync sample every `gop`, pts = 1000 · index (no reordering).
     struct Samples {

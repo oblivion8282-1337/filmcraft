@@ -864,6 +864,13 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
             s.gpu_rendering = if on { GpuRendering::Auto } else { GpuRendering::Off };
         }
     });
+    // Smart rendering: unchanged frames of ProRes / DNx media in the export's own coding go into
+    // the file as stored instead of being encoded again
+    if matches!(s.video_format(), Format::ProRes | Format::DnxHr) {
+        row(ui, t, tl!("Smart Rendering"), |ui| {
+            check(ui, reg, "export.smartRender", &mut s.smart_render, tl!("Copy unchanged ProRes / DNx frames from the source"))
+        });
+    }
     row(ui, t, "", |ui| check(ui, reg, "export.video.maxDepth", &mut s.render_at_max_depth, tl!("Render at Maximum Depth")));
     row(ui, t, "", |ui| check(ui, reg, "export.video.maxQuality", &mut s.max_render_quality, tl!("Use Maximum Render Quality")));
 }

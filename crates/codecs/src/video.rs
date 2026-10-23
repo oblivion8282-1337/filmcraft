@@ -764,6 +764,21 @@ fn prores_color(c: &filmcraft_prores::ColorInfo) -> filmcraft_color::ColorInfo {
     color
 }
 
+/// Size, alpha and colour of a stored ProRes / DNx picture as its decoder shows it, its structure
+/// checked as the decoders check it (`MediaSource::coded_sample`); `None` when it does not parse.
+pub(crate) fn coded_picture(format: filmcraft_frame::CodedFormat, data: &[u8]) -> Option<(u32, u32, bool, filmcraft_color::ColorInfo)> {
+    match format {
+        filmcraft_frame::CodedFormat::ProRes => {
+            let h = filmcraft_prores::frame_layout(data).ok()?.header;
+            Some((u32::from(h.width), u32::from(h.height), h.alpha != filmcraft_prores::AlphaType::None, prores_color(&h.color)))
+        }
+        filmcraft_frame::CodedFormat::Dnx => {
+            let l = filmcraft_dnx::frame_layout(data).ok()?;
+            Some((l.width, l.height, l.header.alpha, dnx_color(l.header.color_volume)))
+        }
+    }
+}
+
 /// A decoded ProRes frame's planes.
 fn prores_planes(f: filmcraft_prores::Frame) -> filmcraft_frame::PixelData {
     use std::sync::Arc;

@@ -455,6 +455,21 @@ impl MediaSource for Mp4Source {
         Ok(f)
     }
 
+    fn coded_sample(&self, time: Tick) -> Option<filmcraft_media::CodedSample> {
+        let ti = self.vtrack?;
+        let track = self.file.tracks.get(ti)?;
+        // one sample description: every sample is coded as it says
+        let [entry] = track.entries.as_slice() else { return None };
+        let format = match &entry.codec {
+            CodecConfig::ProRes { .. } => filmcraft_frame::CodedFormat::ProRes,
+            CodecConfig::Dnx { .. } => filmcraft_frame::CodedFormat::Dnx,
+            _ => return None,
+        };
+        // the sample `video_at` decodes for this time
+        let target = time.max(Tick::ZERO).to_rational_round(1, track.timescale as i64);
+        self.video.coded_sample(&Mp4Video { src: self, track: ti }, target, format, entry.format.0)
+    }
+
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
         self.audio_stream(0, start, frames, sample_rate)
     }

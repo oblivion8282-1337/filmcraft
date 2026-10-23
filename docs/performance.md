@@ -574,6 +574,23 @@ Exports decode ProRes / DNx on the GPU too when they render there (Export ▸ GP
 4K frames of our encoder's media, whole export: ProRes HQ → ProRes HQ 5.63 → 5.50 s, DNxHR HQX →
 DNxHR HQX 8.37 → 7.61 s, DNxHR HQX → H.264 4.25 → 3.51 s (the encoders dominate).
 
+## Results (smart rendering of ProRes / DNx exports, Off → On)
+
+A ProRes or DNx export copies the frames that show one stored picture of a source untouched, in the
+export's own coding, instead of rendering and encoding them (`filmcraft_export::smart`,
+`filmcraft_render::passthrough`). 10 s of 3840×2160 25 fps ProRes 422 HQ (ffmpeg's prores_ks, 281
+MB) in a sequence of its own, exported to ProRes 422 HQ MOV with `filmcraft-cli export`, release
+build, 16 threads, no audio:
+
+| | CPU rendering | GPU rendering |
+|---|---:|---:|
+| Smart rendering off | 10.87 s | 7.20 s |
+| Smart rendering on (250 of 250 frames copied) | **0.13 s** | **0.13 s** |
+
+The copy is the source bit for bit: ffmpeg's framemd5 of the output equals the source's, and the
+CPU and GPU runs write the same file. A frame that changed (an effect, Motion, a transition, a
+clip over it) is rendered and encoded as before, so the gain follows the share of untouched frames.
+
 ## Results (#847: AV1 in-loop filters in parallel row bands, before → after)
 
 The AV1 decoder ran deblocking, CDEF and loop restoration on one thread per frame. A single-tile

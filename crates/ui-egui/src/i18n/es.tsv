@@ -3610,6 +3610,8 @@
 	Shows the version, community links and credits in a FilmCraft window.	Muestra la versión, los enlaces de la comunidad y los créditos en una ventana de FilmCraft.
 	Couldn't open your web browser	No se pudo abrir el navegador web
 	Open this address in your browser yourself:	Abre esta dirección tú mismo en el navegador:
+	Smart Rendering	Renderizado inteligente
+	Copy unchanged ProRes / DNx frames from the source	Copiar los fotogramas ProRes / DNx sin cambios desde el origen
 	Avid DNxHR 444	Avid DNxHR 444
 	Avid DNxHR HQX	Avid DNxHR HQX
 	MXF OP1a DNxHD 1080i 8-bit	MXF OP1a DNxHD 1080i 8 bits

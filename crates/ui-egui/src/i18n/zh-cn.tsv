@@ -3585,4 +3585,6 @@
 	Shows the version, community links and credits in a FilmCraft window.	在 FilmCraft 窗口中显示版本、社区链接和致谢。
 	Couldn't open your web browser	无法打开网页浏览器
 	Open this address in your browser yourself:	请自行在浏览器中打开此地址：
+	Smart Rendering	智能渲染
+	Copy unchanged ProRes / DNx frames from the source	从源素材复制未更改的 ProRes / DNx 帧
 	DNxHD codes {w}×{h}: the sequence is fitted into it	DNxHD 编码为 {w}×{h}：序列将适配到该尺寸

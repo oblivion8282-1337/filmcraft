@@ -539,6 +539,11 @@ impl MediaSource for UnsupportedAsSlate {
             r => r,
         }
     }
+    fn coded_sample(&self, time: filmcraft_time::Tick) -> Option<filmcraft_media::CodedSample> {
+        // a stored picture's headers are checked as the decoder checks them, and smart rendering
+        // only copies codings our decoders support, so the slate never stands in for one it copies
+        self.inner.coded_sample(time)
+    }
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
         self.inner.audio(start, frames, sample_rate)
     }

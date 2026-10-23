@@ -12,7 +12,16 @@ use filmcraft_time::FrameRate;
 use rayon::prelude::*;
 
 use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
+use crate::smart::{OutputPicture, SmartRender};
 use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
+
+/// One output frame of an encoded export.
+pub(crate) enum Frame {
+    /// The rendered picture: straight sRGB RGBA8, or for HDR exports the encoded R'G'B' floats.
+    Rendered(Vec<u8>, Vec<f32>),
+    /// A source's stored picture, coded as the export codes, to copy (smart rendering).
+    Stored(Arc<[u8]>),
+}
 
 /// Where the rendered picture lands in the output frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,6 +145,8 @@ pub(crate) struct Pipeline {
     /// Free the pool's float images when the export ends: a standalone export, not one part of a
     /// batch (`ExportSettings::part_of_batch`).
     trim_pool: bool,
+    /// Copies stored source pictures where it can (`ExportSettings::smart_render`).
+    smart: Option<SmartRender>,
 }
 
 impl Drop for Pipeline {
@@ -187,6 +198,12 @@ impl Pipeline {
         } else {
             None
         };
+        // the output frame is the sequence's picture as rendered: full size, not scaled or moved
+        let as_rendered = geom.render_scale == 1.0
+            && geom.offset == (0, 0)
+            && geom.content.is_none_or(|c| c == (r.width as usize, r.height as usize))
+            && (w, h) == (r.width, r.height);
+        let smart = SmartRender::new(settings, &OutputPicture { width: r.width, height: r.height, as_rendered, hdr: hdr_out });
         let renderer = if settings.gpu_rendering == GpuRendering::Off {
             None
         } else {
@@ -221,7 +238,18 @@ impl Pipeline {
             out_tf,
             effects,
             overlay,
+            smart,
         })
+    }
+
+    /// Output frame `f`: a source's stored picture when smart rendering copies it, else
+    /// [`Self::frame`].
+    pub fn output(&self, f: i64, sources: &dyn SourceProvider) -> Frame {
+        if let Some(data) = self.smart.as_ref().and_then(|s| s.stored(&self.project, self.seq, self.rate.tick_of(f), self.opts, sources)) {
+            return Frame::Stored(data);
+        }
+        let (rgba, hdr) = self.frame(f, sources);
+        Frame::Rendered(rgba, hdr)
     }
 
     /// Output frame `f` as straight sRGB RGBA8 at the output size, or for HDR exports the encoded

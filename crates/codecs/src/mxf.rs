@@ -457,6 +457,22 @@ impl MediaSource for MxfSource {
         Ok(frame)
     }
 
+    fn coded_sample(&self, time: Tick) -> Option<filmcraft_media::CodedSample> {
+        let ti = self.vtrack?;
+        if self.unsupported.is_some() || self.vcount == 0 {
+            return None;
+        }
+        let (format, fourcc) = match self.file.tracks.get(ti)?.codec {
+            // the profile only the coding label states: without it the flavour is unknown
+            Codec::ProRes { profile: Some(p) } => (filmcraft_frame::CodedFormat::ProRes, prores_fourcc(Some(p)).0),
+            Codec::Vc3 => (filmcraft_frame::CodedFormat::Dnx, *b"AVdh"),
+            _ => return None,
+        };
+        // the picture `video_frame` decodes for this time
+        let f = self.info.frame_rate().frame_at(time.max(Tick::ZERO)).clamp(0, self.vcount - 1);
+        self.video.coded_sample(&MxfVideo { src: self, track: ti }, self.vfirst.saturating_add(f), format, fourcc)
+    }
+
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
         let ainfo = self.info.audio().ok_or(MediaError::NoStream("audio"))?;
         let src_rate = ainfo.sample_rate;

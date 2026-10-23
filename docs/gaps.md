@@ -224,13 +224,14 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 - **Missing:** AV1 export (software or hardware), MPEG-2 / DVD / Blu-ray, DCP, JPEG 2000 MXF,
   AS-10 / AS-11, XDCAM HD MXF, P2, PIZ / PXR24 / B44 / DWA OpenEXR compression, MP3 audio,
-  interlaced encoding (beyond DNxHD 1080i), smart render, HEVC software encoder (HEVC exists
-  only where a hardware encoder does).
+  interlaced encoding (beyond DNxHD 1080i), smart render of long-GOP codecs (H.264 / HEVC), HEVC
+  software encoder (HEVC exists only where a hardware encoder does).
 - **Have:** PNG, TIFF, BMP, JPEG, Targa and DPX (10-bit) image sequences (#779); OpenEXR
   sequences (half float, linear; uncompressed, RLE, ZIPS or ZIP; #806, #874); AAC Audio
   (audio-only `.m4a`, or ADTS `.aac`; #814); ProRes 4444 / 4444 XQ in the export UI (#342);
   DNxHR HQX / 444 at 10 or 12 bits and DNxHD (1080p, 1080i upper field first, 720p, 444) in MOV
-  and MXF.
+  and MXF; smart rendering: unchanged ProRes / DNx 4:2:2 frames are copied into ProRes / DNx
+  exports in the same coding (MOV and MXF) instead of encoded again.
 - **Estimate:** 60–110 h. Doc: [file-format-parity.md](file-format-parity.md).
 
 ## G14. Localization: 8 of the 12 key languages missing

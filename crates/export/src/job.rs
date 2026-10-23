@@ -71,7 +71,7 @@ use rayon::prelude::*;
 
 use crate::audio_out::AudioOut;
 use crate::mxf_out::{MxfMux, MxfSetup};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Frame, Pipeline};
 use crate::settings::{AudioCodec, BitrateMode};
 use crate::{
     AudioEncoder, ColorSignal, EncodedPacket, EncoderFrame, ExportError, ExportSettings, Format, H264Pass, Out, Progress, Report, Result, Stage, VideoEncoder,
@@ -87,10 +87,7 @@ pub const INTERLEAVE: i64 = 16;
 /// the one being rendered), see [`overlap_batch`].
 pub const IN_FLIGHT_BUDGET: u64 = 1 << 29;
 
-/// One rendered picture: straight RGBA8, or for HDR exports the encoded R'G'B' floats.
-type Frame = (Vec<u8>, Vec<f32>);
-
-/// Bytes of one [`Frame`] of a `w` x `h` export (RGBA8, or three f32 per pixel for HDR).
+/// Bytes of one rendered [`Frame`] of a `w` x `h` export (RGBA8, or three f32 per pixel for HDR).
 pub(crate) fn frame_bytes(w: u32, h: u32, hdr: bool) -> u64 {
     u64::from(w).saturating_mul(u64::from(h)).saturating_mul(if hdr { 12 } else { 4 })
 }
@@ -118,7 +115,7 @@ fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider)
     let frames: Vec<Frame> = (f..end)
         .into_par_iter()
         .map(|fi| {
-            let frame = pipe.frame(fi, sources);
+            let frame = pipe.output(fi, sources);
             if filmcraft_media::pending::take() {
                 pending.store(true, Ordering::Relaxed);
             }
@@ -163,6 +160,8 @@ pub struct Exporter {
     ahead: Option<Ahead>,
     /// Steps that rendered a batch alongside the encoding of the previous one.
     overlapped_steps: u64,
+    /// Frames copied from their source (smart rendering) instead of encoded.
+    smart_frames: u64,
     brand: Brand,
     venc: Box<dyn VideoEncoder>,
     aenc: Option<Box<dyn AudioEncoder>>,
@@ -274,6 +273,7 @@ impl Exporter {
             budget: IN_FLIGHT_BUDGET,
             ahead: None,
             overlapped_steps: 0,
+            smart_frames: 0,
             brand,
             venc,
             aenc,
@@ -513,7 +513,10 @@ impl Exporter {
         let nframes = self.frames();
         if !self.settings.part_of_batch {
             progress.finished.store(true, Ordering::Relaxed);
-            progress.set_status(format!("Done in {secs:.1}s"));
+            progress.set_status(match self.smart_frames {
+                0 => format!("Done in {secs:.1}s"),
+                n => format!("Done in {secs:.1}s ({n} of {nframes} frames copied from their source)"),
+            });
         }
         Ok(Step::Done(Report {
             path: self.settings.path.clone(),
@@ -522,6 +525,7 @@ impl Exporter {
             bytes,
             render_fps: nframes as f64 / secs.max(1e-6),
             extra_files,
+            smart_frames: self.smart_frames,
         }))
     }
 
@@ -592,7 +596,7 @@ impl Exporter {
     fn encode_batch(&mut self, f: i64, frames: Vec<Frame>, sources: &dyn SourceProvider) -> Result<Encoded> {
         if self.first_pass {
             for (k, frame) in frames.into_iter().enumerate() {
-                timed(Stage::Encode, || self.encode(std::slice::from_ref(&frame), f + k as i64))?;
+                timed(Stage::Encode, || self.encode(&frame, f + k as i64))?;
             }
             return Ok(Encoded::Done);
         }
@@ -617,7 +621,7 @@ impl Exporter {
         let mut mixed = mixed.into_iter();
         for (k, frame) in frames.into_iter().enumerate() {
             let fi = f + k as i64;
-            let packets = timed(Stage::Encode, || self.encode(std::slice::from_ref(&frame), fi))?;
+            let packets = timed(Stage::Encode, || self.encode(&frame, fi))?;
             self.queued.extend(packets);
             if cuts.contains(&(fi + 1)) {
                 timed(Stage::Mux, || -> Result<()> {
@@ -634,19 +638,19 @@ impl Exporter {
         Ok(Encoded::Done)
     }
 
-    fn encode(&mut self, frames: &[(Vec<u8>, Vec<f32>)], f: i64) -> Result<Vec<EncodedPacket>> {
-        let mut packets = Vec::new();
-        for (k, (rgba, hdr)) in frames.iter().enumerate() {
-            let fr = EncoderFrame {
-                width: self.pipe.w,
-                height: self.pipe.h,
-                rgba,
-                hdr: self.pipe.hdr_out.then_some(hdr.as_slice()),
-                index: (f - self.f0) as u64 + k as u64,
-            };
-            packets.extend(self.venc.encode(&fr)?);
-        }
-        Ok(packets)
+    fn encode(&mut self, frame: &Frame, f: i64) -> Result<Vec<EncodedPacket>> {
+        let (rgba, hdr) = match frame {
+            Frame::Rendered(rgba, hdr) => (rgba, hdr),
+            Frame::Stored(data) => {
+                // copied as stored; every frame of these intra codecs is a sync sample one frame long
+                if !self.first_pass {
+                    self.smart_frames += 1;
+                }
+                return Ok(vec![EncodedPacket { data: data.to_vec(), key: true, duration: self.pipe.rate.den as u32, composition_offset: 0 }]);
+            }
+        };
+        let fr = EncoderFrame { width: self.pipe.w, height: self.pipe.h, rgba, hdr: self.pipe.hdr_out.then_some(hdr.as_slice()), index: (f - self.f0) as u64 };
+        self.venc.encode(&fr)
     }
 }
 

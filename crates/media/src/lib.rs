@@ -164,6 +164,15 @@ pub trait MediaSource: Send + Sync {
     fn info(&self) -> &MediaInfo;
     /// The frame displayed at media time `req.time`.
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
+    /// The stored bytes of the picture [`video_frame`](Self::video_frame) shows at media time
+    /// `time`, untouched, for an export that copies unchanged frames into its output instead of
+    /// encoding them again (smart rendering). Only intra-coded video whose samples stand alone
+    /// (ProRes, DNx) and is shown as stored (no rotation, no clean-aperture cut) has them; every
+    /// other source, and every wrapper that changes the picture, returns `None`. Nothing is
+    /// decoded, and nothing goes into a frame cache.
+    fn coded_sample(&self, _time: Tick) -> Option<CodedSample> {
+        None
+    }
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer>;
     /// Like [`audio`](Self::audio) for audio stream `stream` (an index into
@@ -175,6 +184,22 @@ pub trait MediaSource: Send + Sync {
 }
 
 pub type SharedSource = Arc<dyn MediaSource>;
+
+/// One stored picture of an intra-coded track ([`MediaSource::coded_sample`]).
+#[derive(Clone, Debug)]
+pub struct CodedSample {
+    pub format: filmcraft_frame::CodedFormat,
+    /// The track's sample-entry four-character code (`apch`, `AVdh`…; for MXF the one its
+    /// essence coding label stands for): the ProRes profile is only stated here.
+    pub fourcc: [u8; 4],
+    pub data: Arc<[u8]>,
+    /// The picture as `video_frame` shows it: size, whether it has alpha, and its colour (the
+    /// container's where it states one, else the bitstream's).
+    pub width: u32,
+    pub height: u32,
+    pub alpha: bool,
+    pub color: ColorInfo,
+}
 
 /// File extensions we recognise at import (the media browser filters on these).
 pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "tga", "dpx", "exr", "hdr", "dng"];

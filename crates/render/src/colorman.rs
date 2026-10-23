@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use filmcraft_color::{ColorPipeline, ColorSpace, InputTransform, OutputTransform, Range};
+use filmcraft_color::{ColorInfo, ColorPipeline, ColorSpace, InputTransform, OutputTransform, Range};
 use filmcraft_frame::VideoFrame;
 use filmcraft_project::{ItemId, Project};
 
@@ -31,12 +31,22 @@ pub fn detected_of(project: &Project, item: ItemId) -> Option<ColorSpace> {
 /// The colour space a frame of `item` is interpreted in: the Interpret Footage override, else
 /// what the source reports, else the frame's colour flags.
 pub fn source_space(project: &Project, item: ItemId, frame: &VideoFrame) -> ColorSpace {
-    override_of(project, item).or_else(|| detected_of(project, item)).unwrap_or_else(|| ColorSpace::from_info(&frame.color))
+    source_space_of(project, item, &frame.color)
+}
+
+/// [`source_space`] of a picture with colour flags `color`.
+pub fn source_space_of(project: &Project, item: ItemId, color: &ColorInfo) -> ColorSpace {
+    override_of(project, item).or_else(|| detected_of(project, item)).unwrap_or_else(|| ColorSpace::from_info(color))
 }
 
 /// Whether the frame needs more than the default (transfer-only) decode.
 pub fn needs_management(pipe: &ColorPipeline, cs: ColorSpace, frame: &VideoFrame) -> bool {
-    let default_decode = cs == ColorSpace::from_info(&frame.color) && matches!(cs, ColorSpace::Rec709 | ColorSpace::Srgb | ColorSpace::Linear709);
+    needs_management_of(pipe, cs, &frame.color)
+}
+
+/// [`needs_management`] of a picture with colour flags `color`.
+pub fn needs_management_of(pipe: &ColorPipeline, cs: ColorSpace, color: &ColorInfo) -> bool {
+    let default_decode = cs == ColorSpace::from_info(color) && matches!(cs, ColorSpace::Rec709 | ColorSpace::Srgb | ColorSpace::Linear709);
     !(pipe.is_plain() && default_decode)
 }
 
