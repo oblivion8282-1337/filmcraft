@@ -3610,3 +3610,12 @@
 	Shows the version, community links and credits in a FilmCraft window.	Muestra la versión, los enlaces de la comunidad y los créditos en una ventana de FilmCraft.
 	Couldn't open your web browser	No se pudo abrir el navegador web
 	Open this address in your browser yourself:	Abre esta dirección tú mismo en el navegador:
+	Avid DNxHR 444	Avid DNxHR 444
+	Avid DNxHR HQX	Avid DNxHR HQX
+	MXF OP1a DNxHD 1080i 8-bit	MXF OP1a DNxHD 1080i 8 bits
+	MXF OP1a DNxHD 1080p 10-bit	MXF OP1a DNxHD 1080p 10 bits
+	MXF OP1a, DNxHD 1080i CID 1242 (8-bit 4:2:2, upper field first; 121 Mb/s at 25 fps, 145 at 29.97), 24-bit 48 kHz PCM, start timecode	MXF OP1a, DNxHD 1080i CID 1242 (8 bits 4:2:2, campo superior primero; 121 Mb/s a 25 fps, 145 a 29,97), PCM de 24 bits y 48 kHz, código de tiempo inicial
+	MXF OP1a, DNxHD 1080p CID 1235 (10-bit 4:2:2; 184 Mb/s at 25 fps, 220 at 29.97), 24-bit 48 kHz PCM, start timecode	MXF OP1a, DNxHD 1080p CID 1235 (10 bits 4:2:2; 184 Mb/s a 25 fps, 220 a 29,97), PCM de 24 bits y 48 kHz, código de tiempo inicial
+	QuickTime, DNxHR 444 (10-bit 4:4:4), 24-bit 48 kHz PCM	QuickTime, DNxHR 444 (10 bits 4:4:4), PCM de 24 bits y 48 kHz
+	QuickTime, DNxHR HQX (10-bit 4:2:2), 24-bit 48 kHz PCM	QuickTime, DNxHR HQX (10 bits 4:2:2), PCM de 24 bits y 48 kHz
+	DNxHD codes {w}×{h}: the sequence is fitted into it	DNxHD codifica {w}×{h}: la secuencia se ajusta a ese tamaño
