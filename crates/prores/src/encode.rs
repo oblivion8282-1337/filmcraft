@@ -1,4 +1,5 @@
-//! ProRes frame encoding (progressive) with per-slice quantiser rate control.
+//! ProRes frame encoding (progressive, or interlaced as two field pictures) with per-slice
+//! quantiser rate control.
 
 use crate::bits::{Counter, Sink, Writer};
 use crate::dct::fdct8x8;
@@ -25,6 +26,9 @@ pub struct EncoderConfig {
     pub threads: bool,
     /// Four-character encoder identifier written into the frame header.
     pub encoder_id: [u8; 4],
+    /// Progressive frames (the default), or interlaced: each frame coded as two field pictures,
+    /// the first coded one the temporally first field (top: the even lines, bottom: the odd lines).
+    pub interlace: Interlace,
 }
 
 impl EncoderConfig {
@@ -41,11 +45,12 @@ impl EncoderConfig {
             encode_alpha: true,
             threads: true,
             encoder_id: *b"fmcr",
+            interlace: Interlace::Progressive,
         }
     }
 }
 
-/// ProRes encoder for one stream of same-sized progressive frames.
+/// ProRes encoder for one stream of same-sized frames.
 #[derive(Debug, Clone)]
 pub struct Encoder {
     cfg: EncoderConfig,
@@ -111,32 +116,45 @@ impl Encoder {
             return Err(Error::Input("log2_slice_mbs must be 0..=3".into()));
         }
 
+        let interlaced = cfg.interlace != Interlace::Progressive;
+        if interlaced && h < 2 {
+            return Err(Error::Input("an interlaced frame needs at least two lines".into()));
+        }
+
+        // The coded pictures: the frame, or its two fields (temporally first field first), each
+        // `ceil(height / 32)` macroblock rows high, as decoders lay them out.
+        let parities: &[usize] = match cfg.interlace {
+            Interlace::Progressive => &[0],
+            Interlace::TopFieldFirst => &[0, 1],
+            Interlace::BottomFieldFirst => &[1, 0],
+        };
+        let fields: Vec<Frame> = if interlaced { parities.iter().map(|&p| field(frame, w, cw, p)).collect() } else { Vec::new() };
+        let pictures: Vec<&Frame> = if interlaced { fields.iter().collect() } else { vec![frame] };
         let mb_width = w.div_ceil(16);
-        let mb_height = h.div_ceil(16);
+        let mb_height = if interlaced { h.div_ceil(32) } else { h.div_ceil(16) };
         let widths = row_slice_widths(mb_width, cfg.log2_slice_mbs);
-        let mut jobs = Vec::with_capacity(widths.len() * mb_height);
-        for row in 0..mb_height {
-            let mut x = 0;
-            for &sw in &widths {
-                jobs.push((x, row, sw));
-                x += sw;
+        let scale = (2f32).powi(12 - frame.bit_depth as i32);
+        let sources: Vec<Source> = pictures
+            .iter()
+            .map(|&f| Source { frame: f, w, h: f.height as usize, cw, chroma444: chroma == ChromaFormat::Yuv444, scale, alpha: with_alpha })
+            .collect();
+        let mut jobs = Vec::with_capacity(sources.len() * widths.len() * mb_height);
+        for src in &sources {
+            for row in 0..mb_height {
+                let mut x = 0;
+                for &sw in &widths {
+                    jobs.push((src, x, row, sw));
+                    x += sw;
+                }
             }
         }
-        let src = Source {
-            frame,
-            w,
-            h,
-            cw,
-            chroma444: chroma == ChromaFormat::Yuv444,
-            scale: (2f32).powi(12 - frame.bit_depth as i32),
-            alpha: with_alpha,
-            bits_per_mb: self.bits_per_mb(),
-        };
         let threads = cfg.threads;
-        let prepared: Vec<SliceData> = par_map(threads, &jobs, |&(x, row, sw)| prepare_slice(&src, x, row, sw));
-        let qs = choose_quantisers(&prepared, &src, mb_width * mb_height, threads);
+        let prepared: Vec<SliceData> = par_map(threads, &jobs, |&(src, x, row, sw)| prepare_slice(src, x, row, sw));
+        let total_mbs = sources.len() * mb_width * mb_height;
+        let qs = choose_quantisers(&prepared, self.bits_per_mb(), total_mbs, sources.len(), threads);
+        let scan = if interlaced { &SCAN_INTERLACED } else { &SCAN_PROGRESSIVE };
         let items: Vec<(&SliceData, u8)> = prepared.iter().zip(qs).collect();
-        let slices: Vec<Vec<u8>> = par_map(threads, &items, |&(sd, q)| write_slice(sd, q));
+        let slices: Vec<Vec<u8>> = par_map(threads, &items, |&(sd, q)| write_slice(sd, q, scan));
 
         let hdr = FrameHeader {
             header_size: 0,
@@ -145,7 +163,7 @@ impl Encoder {
             width: cfg.width as u16,
             height: cfg.height as u16,
             chroma,
-            interlace: Interlace::Progressive,
+            interlace: cfg.interlace,
             aspect_ratio: cfg.aspect_ratio & 15,
             frame_rate_code: cfg.frame_rate_code & 15,
             color: cfg.color,
@@ -156,19 +174,23 @@ impl Encoder {
             chroma_matrix_present: false,
         };
         let fh = hdr.write();
-        let slice_bytes: usize = slices.iter().map(Vec::len).sum();
-        let pic_size = 8 + 2 * slices.len() + slice_bytes;
-        let total = 8 + fh.len() + pic_size;
+        // every picture has the same number of slices, in picture order
+        let per_picture = widths.len() * mb_height;
+        let picture_slices: Vec<&[Vec<u8>]> = slices.chunks(per_picture.max(1)).collect();
+        let pic_sizes: Vec<usize> = picture_slices.iter().map(|ps| 8 + 2 * ps.len() + ps.iter().map(Vec::len).sum::<usize>()).collect();
+        let total = 8 + fh.len() + pic_sizes.iter().sum::<usize>();
         let mut out = Vec::with_capacity(total);
         out.extend_from_slice(&(total as u32).to_be_bytes());
         out.extend_from_slice(&FRAME_ID);
         out.extend_from_slice(&fh);
-        PictureHeader { header_size: 8, picture_size: pic_size, num_slices: slices.len(), log2_slice_mbs: cfg.log2_slice_mbs }.write(&mut out);
-        for s in &slices {
-            out.extend_from_slice(&(s.len() as u16).to_be_bytes());
-        }
-        for s in &slices {
-            out.extend_from_slice(s);
+        for (ps, &pic_size) in picture_slices.iter().zip(&pic_sizes) {
+            PictureHeader { header_size: 8, picture_size: pic_size, num_slices: ps.len(), log2_slice_mbs: cfg.log2_slice_mbs }.write(&mut out);
+            for s in ps.iter() {
+                out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            }
+            for s in ps.iter() {
+                out.extend_from_slice(s);
+            }
         }
         debug_assert_eq!(out.len(), total);
         Ok(out)
@@ -184,7 +206,28 @@ struct Source<'a> {
     /// Multiplier from input sample values to the 12-bit domain.
     scale: f32,
     alpha: bool,
-    bits_per_mb: u32,
+}
+
+/// One field of `frame` (`parity` 0: the even lines, 1: the odd ones) as a frame of its own, the
+/// picture an interlaced frame codes for it. The planes were checked to hold `height` lines.
+fn field(frame: &Frame, w: usize, cw: usize, parity: usize) -> Frame {
+    let lines = |plane: &[u16], stride: usize| -> Vec<u16> {
+        plane.chunks_exact(stride.max(1)).take(frame.height as usize).skip(parity).step_by(2).flatten().copied().collect()
+    };
+    Frame {
+        width: frame.width,
+        height: (frame.height as usize).saturating_sub(parity).div_ceil(2) as u32,
+        chroma: frame.chroma,
+        bit_depth: frame.bit_depth,
+        y: lines(&frame.y, w),
+        cb: lines(&frame.cb, cw),
+        cr: lines(&frame.cr, cw),
+        alpha: frame.alpha.as_deref().map(|a| lines(a, w)),
+        interlace: Interlace::Progressive,
+        color: frame.color,
+        aspect_ratio: frame.aspect_ratio,
+        frame_rate_code: frame.frame_rate_code,
+    }
 }
 
 /// Load an 8×8 block (edge-replicated) into the 12-bit signed domain and transform it.
@@ -348,11 +391,11 @@ fn slice_bits(sd: &SliceData, q: u8) -> u64 {
 /// Frame-level rate control: the smallest uniform quantiser whose frame fits the budget, then
 /// one step finer on as many slices as the remaining budget allows. Uniform quantisation
 /// approximately minimises frame MSE for a given size.
-fn choose_quantisers(slices: &[SliceData], src: &Source, total_mbs: usize, threads: bool) -> Vec<u8> {
+fn choose_quantisers(slices: &[SliceData], bits_per_mb: u32, total_mbs: usize, pictures: usize, threads: bool) -> Vec<u8> {
     let n = slices.len();
     let hsize = slices.first().map_or(6, SliceData::header_size);
-    let fixed = 8 * (8 + 20 + 8 + n * (2 + hsize)) as u64;
-    let budget = (src.bits_per_mb as u64 * total_mbs as u64).saturating_sub(fixed);
+    let fixed = 8 * (8 + 20 + 8 * pictures + n * (2 + hsize)) as u64;
+    let budget = (bits_per_mb as u64 * total_mbs as u64).saturating_sub(fixed);
     let bits_at = |q: u8| -> Vec<u64> { par_map(threads, slices, |sd| slice_bits(sd, q)) };
     let sum = |v: &[u64]| v.iter().sum::<u64>();
 
@@ -399,14 +442,14 @@ fn choose_quantisers(slices: &[SliceData], src: &Source, total_mbs: usize, threa
     qs
 }
 
-fn write_slice(sd: &SliceData, q: u8) -> Vec<u8> {
+fn write_slice(sd: &SliceData, q: u8, scan: &[u8; 64]) -> Vec<u8> {
     let mut lv = [Vec::new(), Vec::new(), Vec::new()];
     quantise_all(sd, q, &mut lv);
     let comps: Vec<Vec<u8>> = lv
         .iter()
         .map(|l| {
             let mut w = Writer::new();
-            encode_component(&mut w, l, &SCAN_PROGRESSIVE);
+            encode_component(&mut w, l, scan);
             w.finish()
         })
         .collect();

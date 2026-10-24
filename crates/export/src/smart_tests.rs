@@ -126,6 +126,38 @@ fn unchanged_dnx_frames_are_copied_into_a_dnx_export() {
     }
 }
 
+/// Interlaced ProRes media is copied into an export with its field order (QuickTime or MXF), never
+/// into a progressive one or one with the other field order; progressive media is never copied into
+/// an interlaced export.
+#[test]
+fn interlaced_prores_frames_are_copied_only_with_their_field_order() {
+    let hq = ExportSettings { format: Format::ProRes, prores_profile: "hq".into(), ..Default::default() };
+    for (order, other) in [(FieldOrder::UpperFirst, FieldOrder::LowerFirst), (FieldOrder::LowerFirst, FieldOrder::UpperFirst)] {
+        let il = ExportSettings { field_order: order, ..hq.clone() };
+        let src = source_file(&format!("src_il_{order:?}.mov"), il.clone());
+        assert_eq!(filmcraft_prores::probe(&stored(&src, 5)).unwrap().interlace, il.prores_interlace());
+        let (p, seq, m) = edit(&src);
+        let (r, out) = run(&p, seq, &m, &format!("out_il_{order:?}.mov"), il.clone());
+        assert_copied(&src, &out, &r, &format!("{order:?}"));
+        let mxf = ExportSettings { format: Format::MxfOp1a, mxf_video_codec: MxfVideoCodec::ProRes, ..il.clone() };
+        let (r, out) = run(&p, seq, &m, &format!("out_il_{order:?}.mxf"), mxf);
+        assert_copied(&src, &out, &r, &format!("{order:?} in MXF"));
+        // progressive, or the other order: every frame is encoded, in the export's own field order
+        for (name, s) in [("prog", hq.clone()), ("other", ExportSettings { field_order: other, ..hq.clone() })] {
+            let (r, out) = run(&p, seq, &m, &format!("out_il_{order:?}_{name}.mov"), s.clone());
+            assert_eq!(r.smart_frames, 0, "{order:?} into {name}");
+            assert_eq!(filmcraft_prores::probe(&stored(&out, 3)).unwrap().interlace, s.prores_interlace(), "{order:?} into {name}");
+        }
+    }
+    // progressive media into an interlaced export
+    let src = source_file("src_prog_hq.mov", hq.clone());
+    let (p, seq, m) = edit(&src);
+    for order in [FieldOrder::UpperFirst, FieldOrder::LowerFirst] {
+        let (r, _) = run(&p, seq, &m, &format!("out_prog_{order:?}.mov"), ExportSettings { field_order: order, ..hq.clone() });
+        assert_eq!(r.smart_frames, 0, "progressive into {order:?}");
+    }
+}
+
 #[test]
 fn frames_coded_otherwise_are_encoded() {
     let src = source_file("src_std.mov", ExportSettings { format: Format::ProRes, prores_profile: "standard".into(), ..Default::default() });

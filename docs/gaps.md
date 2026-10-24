@@ -224,7 +224,8 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 - **Missing:** AV1 export (software or hardware), MPEG-2 / DVD / Blu-ray, DCP, JPEG 2000 MXF,
   AS-10 / AS-11, XDCAM HD MXF, P2, PIZ / PXR24 / B44 / DWA OpenEXR compression, MP3 audio,
-  interlaced encoding (beyond DNxHD 1080i), smart render of long-GOP codecs (H.264 / HEVC), HEVC
+  interlaced H.264 / HEVC / DNxHR encoding (ProRes codes fields in either order, DNxHD 1080i upper
+  field first), smart render of long-GOP codecs (H.264 / HEVC), HEVC
   software encoder (HEVC exists only where a hardware encoder does).
 - **Have:** PNG, TIFF, BMP, JPEG, Targa and DPX (10-bit) image sequences (#779); OpenEXR
   sequences (half float, linear; uncompressed, RLE, ZIPS or ZIP; #806, #874); AAC Audio

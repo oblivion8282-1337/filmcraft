@@ -58,8 +58,11 @@ fn picture(settings: &ExportSettings, w: u32, h: u32) -> PictureDesc {
     if settings.video_format() == Format::DnxHr {
         let c = crate::dnx_config(&settings.dnx_profile, w, h);
         d.depth = u32::from(c.bit_depth);
-        d.interlaced = settings.dnx_field_coded();
     }
+    // interlaced DNxHD (upper field first) and ProRes (either): two fields per frame
+    let order = settings.output_field_order();
+    d.interlaced = order != crate::FieldOrder::Progressive;
+    d.bottom_field_first = order == crate::FieldOrder::LowerFirst;
     d.color = match settings.signal {
         s if s == ColorSignal::PQ => ColorSpace::Rec2020Pq,
         s if s == ColorSignal::HLG => ColorSpace::Rec2020Hlg,

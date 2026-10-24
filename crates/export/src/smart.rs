@@ -9,8 +9,9 @@
 //!
 //! "Coded the way the export codes" is strict, so the file stays one consistent stream that says
 //! what it holds: the same ProRes profile (the sample entry's four-character code is the only place
-//! it is stated) or DNx compression ID and depth, the output's frame size, progressive (or the
-//! interlaced DNxHD ID asked for), no alpha, and Rec. 709 colour as the export signals it. The
+//! it is stated) or DNx compression ID and depth, the output's frame size, the output's field
+//! order (progressive, ProRes fields in the order asked for, or the interlaced DNxHD ID asked for:
+//! a frame's fields are never copied into a progressive file, nor in the other order), no alpha, and Rec. 709 colour as the export signals it. The
 //! output must be the sequence's picture as rendered: same size, no Export effects or overlays, no
 //! HDR. Anything else is rendered and encoded as before.
 
@@ -27,7 +28,7 @@ use crate::{ExportSettings, Format};
 /// What a copied frame must be coded as.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Coding {
-    ProRes { fourcc: [u8; 4], chroma: filmcraft_prores::ChromaFormat },
+    ProRes { fourcc: [u8; 4], chroma: filmcraft_prores::ChromaFormat, interlace: filmcraft_prores::Interlace },
     Dnx { cid: u32, bit_depth: u8, interlaced: bool },
 }
 
@@ -57,7 +58,7 @@ impl SmartRender {
         let coding = match settings.video_format() {
             Format::ProRes => {
                 let p = crate::prores_profile(&settings.prores_profile);
-                Coding::ProRes { fourcc: p.fourcc(), chroma: p.chroma() }
+                Coding::ProRes { fourcc: p.fourcc(), chroma: p.chroma(), interlace: settings.prores_interlace() }
             }
             Format::DnxHr => {
                 let c = crate::dnx_config(&settings.dnx_profile, out.width, out.height);
@@ -89,7 +90,7 @@ impl SmartRender {
     /// what the decoder makes of it) rather than copied.
     fn fits(&self, s: &CodedSample) -> bool {
         match self.coding {
-            Coding::ProRes { fourcc, chroma } => {
+            Coding::ProRes { fourcc, chroma, interlace } => {
                 if s.format != CodedFormat::ProRes || s.fourcc != fourcc {
                     return false;
                 }
@@ -97,7 +98,7 @@ impl SmartRender {
                 let h = l.header;
                 (u32::from(h.width), u32::from(h.height)) == (self.width, self.height)
                     && h.chroma == chroma
-                    && h.interlace == filmcraft_prores::Interlace::Progressive
+                    && h.interlace == interlace
                     && h.alpha == filmcraft_prores::AlphaType::None
                     // the frame's own colour fields: BT.709 or unspecified (decoders that read
                     // them, rather than the container's, show it as our frames)

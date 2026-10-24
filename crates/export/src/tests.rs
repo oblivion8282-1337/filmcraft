@@ -250,6 +250,104 @@ fn dnxhd_1080i_is_upper_field_first() {
     assert!(export(&p, seq, &hq, &m, &Progress::default()).is_err());
 }
 
+/// ProRes codes interlaced frames in either field order (QuickTime and MXF); other formats stay
+/// progressive.
+#[test]
+fn prores_exports_interlaced_frames() {
+    let (p, seq, m) = project();
+    for (order, il, detail) in
+        [(FieldOrder::UpperFirst, filmcraft_prores::Interlace::TopFieldFirst, 1u8), (FieldOrder::LowerFirst, filmcraft_prores::Interlace::BottomFieldFirst, 6)]
+    {
+        let path = tmp(&format!("prores_{order:?}.mov"));
+        let mut s = ExportSettings { format: Format::ProRes, path: path.clone(), field_order: order, ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(2)));
+        assert!(s.supports_field_order(order));
+        assert_eq!(s.prores_interlace(), il);
+        assert!(s.summary(320, 180, FrameRate::FPS_24, 48_000, Tick(TICKS_PER_SECOND)).video.contains(order.label()));
+        export(&p, seq, &s, &m, &Progress::default()).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let fiel = data.windows(4).position(|w| w == b"fiel").expect("the movie says it is interlaced");
+        assert_eq!(data.get(fiel + 4..fiel + 6), Some(&[2u8, detail][..]), "{order:?}");
+        let src = filmcraft_codecs::open_bytes("p.mov", data.into()).unwrap();
+        let sample = src.coded_sample(Tick::ZERO).expect("a stored ProRes frame");
+        let h = filmcraft_prores::probe(&sample.data).unwrap();
+        assert_eq!(h.interlace, il, "the frames are field-coded");
+        let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 24))).unwrap();
+        let px = f.to_rgba8();
+        let mid = ((90 * 320 + 160) * 4) as usize;
+        assert!(px[mid] > 240 && px[mid + 1] < 15 && px[mid + 2] < 15, "{order:?}: {:?}", &px[mid..mid + 4]);
+        // MXF OP1a ProRes too
+        let mxf = ExportSettings { format: Format::MxfOp1a, mxf_video_codec: MxfVideoCodec::ProRes, path: tmp(&format!("prores_{order:?}.mxf")), ..s.clone() };
+        assert!(mxf.supports_field_order(order));
+        export(&p, seq, &mxf, &m, &Progress::default()).unwrap();
+        let file = filmcraft_mxf::open(&std::fs::read(&mxf.path).unwrap()).unwrap();
+        let pic = file.tracks.iter().find_map(|t| t.picture.clone()).unwrap();
+        assert_eq!((pic.frame_layout, pic.field_dominance, pic.frame_height()), (1, if order == FieldOrder::LowerFirst { 2 } else { 1 }, 180), "{order:?}");
+    }
+    // progressive ProRes stays progressive; H.264 and DNxHR have no field coding
+    let prog = ExportSettings { format: Format::ProRes, ..Default::default() };
+    assert_eq!(prog.prores_interlace(), filmcraft_prores::Interlace::Progressive);
+    for (format, dnx) in [(Format::H264, ""), (Format::DnxHr, "hq")] {
+        let s = ExportSettings { format, dnx_profile: dnx.into(), field_order: FieldOrder::LowerFirst, path: tmp("interlaced.mov"), ..Default::default() };
+        assert!(!s.supports_field_order(FieldOrder::LowerFirst) && !s.supports_field_order(FieldOrder::UpperFirst), "{format:?}");
+        assert!(export(&p, seq, &s, &m, &Progress::default()).is_err(), "{format:?}");
+    }
+    let dnxhd = ExportSettings { format: Format::DnxHr, dnx_profile: "dnxhd-1242".into(), ..Default::default() };
+    assert!(dnxhd.supports_field_order(FieldOrder::UpperFirst) && !dnxhd.supports_field_order(FieldOrder::LowerFirst));
+}
+
+/// Interlaced ProRes in QuickTime and MXF OP1a: ffprobe (an external test oracle only) reads the
+/// field order, and ffmpeg decodes every frame without complaint. (MXF says lower field first the
+/// way SMPTE ST 377-1 does, field dominance 2 with the SMPTE 274M line map; ffmpeg names that
+/// `tb`, "bottom displayed first", and would say `bb` only for a line map with other line numbers.)
+#[test]
+fn prores_interlaced_exports_ffprobe_oracle() {
+    let (Some(ffprobe), Some(ffmpeg)) =
+        (filmcraft_testkit::ffprobe_or_skip("interlaced ProRes probe"), filmcraft_testkit::ffmpeg_or_skip("interlaced ProRes decode"))
+    else {
+        return;
+    };
+    let (p, seq, m) = project();
+    for (format, ext) in [(Format::ProRes, "mov"), (Format::MxfOp1a, "mxf")] {
+        for (profile, pix) in [("hq", "yuv422p10le"), ("4444", "yuv444p12le")] {
+            for (order, want) in [(FieldOrder::UpperFirst, "tt"), (FieldOrder::LowerFirst, if ext == "mxf" { "tb" } else { "bb" })] {
+                let path = tmp(&format!("prores_il_{profile}_{order:?}_{format:?}.{ext}"));
+                let mut s = ExportSettings {
+                    format,
+                    path: path.clone(),
+                    prores_profile: profile.into(),
+                    mxf_video_codec: MxfVideoCodec::ProRes,
+                    field_order: order,
+                    ..Default::default()
+                };
+                s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(3)));
+                export(&p, seq, &s, &m, &Progress::default()).unwrap();
+                let what = format!("{profile} {order:?} {format:?}");
+                let probe = std::process::Command::new(&ffprobe)
+                    .args([
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-show_entries",
+                        "stream=codec_name,width,height,pix_fmt,field_order",
+                        "-of",
+                        "compact=p=0",
+                    ])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                let probe = String::from_utf8_lossy(&probe.stdout);
+                assert!(probe.contains("codec_name=prores") && probe.contains("width=320|height=180"), "{what}: {probe}");
+                assert!(probe.contains(&format!("pix_fmt={pix}")), "{what}: {probe}");
+                assert!(probe.contains(&format!("field_order={want}")), "{what}: {probe}");
+                let dec = std::process::Command::new(&ffmpeg).args(["-v", "error", "-xerror", "-i"]).arg(&path).args(["-f", "null", "-"]).output().unwrap();
+                assert!(dec.status.success() && dec.stderr.is_empty(), "{what}: {}", String::from_utf8_lossy(&dec.stderr));
+            }
+        }
+    }
+}
+
 /// Burn-in: an H.264 export of a dark-blue matte with a caption, decoded by ffmpeg (external test
 /// oracle only), has bright caption pixels in the lower part of the frame, and none without
 /// `burn_captions` or above the caption.

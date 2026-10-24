@@ -644,10 +644,9 @@ impl ExportSettings {
             let codec = if self.audio_codec() == AudioCodec::Flac { "FLAC" } else { self.format.label() };
             return Err(ExportError::Unsupported(format!("{codec} audio has no {} samples: choose 16, 24 or 32 bit", sample_format.label())));
         }
-        // (an interlaced DNxHD id is coded upper field first, which the setting may say)
-        if self.field_order != FieldOrder::Progressive && !(self.dnx_field_coded() && self.field_order == FieldOrder::UpperFirst) && self.has_video() {
+        if self.has_video() && !self.supports_field_order(self.field_order) {
             return Err(ExportError::Unsupported(format!(
-                "{} field order: FilmCraft's encoders write progressive frames (and DNxHD 1080i upper field first)",
+                "{} field order: FilmCraft writes interlaced video as ProRes (either field first) and DNxHD 1080i (upper field first); other formats are progressive",
                 self.field_order.label()
             )));
         }
@@ -1213,6 +1212,16 @@ impl VideoEncoder for ProResEncoder {
     fn sample_entry(&self) -> SampleEntry {
         let mut e = SampleEntry::prores(filmcraft_isobmff::FourCc(self.profile.fourcc()), self.w as u16, self.h as u16);
         self.signal.apply_to(&mut e, true);
+        // two fields, coded as two pictures, the temporally first one first: QuickTime's
+        // "T displayed earliest, T stored first" (1) or the same for B (6)
+        let detail = match self.enc.config().interlace {
+            filmcraft_prores::Interlace::Progressive => None,
+            filmcraft_prores::Interlace::TopFieldFirst => Some(1),
+            filmcraft_prores::Interlace::BottomFieldFirst => Some(6),
+        };
+        if let (Some(v), Some(detail)) = (e.video.as_mut(), detail) {
+            v.field_info = Some(filmcraft_isobmff::FieldInfo { fields: 2, detail });
+        }
         e
     }
     fn timescale(&self) -> u32 {
@@ -1357,6 +1366,7 @@ fn prores_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSet
         }
         let alpha = s.keeps_alpha();
         cfg.encode_alpha = alpha;
+        cfg.interlace = s.prores_interlace();
         let enc = filmcraft_prores::Encoder::with_config(cfg);
         Ok(Box::new(ProResEncoder { enc, profile, alpha, w, h, rate, signal: s.signal }) as Box<dyn VideoEncoder>)
     })

@@ -21,7 +21,8 @@ pub enum Scaling {
     StretchToFill,
 }
 
-/// Field order of the encoded video. FilmCraft's encoders write progressive frames.
+/// Field order of the encoded video: progressive frames, or interlaced ones (ProRes either field
+/// first, DNxHD 1080i upper field first; see [`ExportSettings::supports_field_order`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FieldOrder {
@@ -518,6 +519,27 @@ impl ExportSettings {
     /// ID, which is always coded upper field first.
     pub fn output_field_order(&self) -> FieldOrder {
         if self.dnx_field_coded() { FieldOrder::UpperFirst } else { self.field_order }
+    }
+
+    /// Whether the video can be written with field order `order`: progressive always; interlaced
+    /// as ProRes (QuickTime or MXF, either field first, two field pictures per frame) and as an
+    /// interlaced DNxHD compression ID (upper field first).
+    pub fn supports_field_order(&self, order: FieldOrder) -> bool {
+        match order {
+            FieldOrder::Progressive => true,
+            FieldOrder::UpperFirst => self.video_format() == Format::ProRes || self.dnx_field_coded(),
+            FieldOrder::LowerFirst => self.video_format() == Format::ProRes,
+        }
+    }
+
+    /// How the ProRes encoder codes the output's frames: progressive, or two field pictures in
+    /// [`ExportSettings::output_field_order`].
+    pub fn prores_interlace(&self) -> filmcraft_prores::Interlace {
+        match self.output_field_order() {
+            FieldOrder::Progressive => filmcraft_prores::Interlace::Progressive,
+            FieldOrder::UpperFirst => filmcraft_prores::Interlace::TopFieldFirst,
+            FieldOrder::LowerFirst => filmcraft_prores::Interlace::BottomFieldFirst,
+        }
     }
 
     /// Whether the video is an interlaced DNxHD compression ID (two fields per frame).
