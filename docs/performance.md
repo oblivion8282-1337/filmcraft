@@ -611,6 +611,28 @@ The output is bit-identical: ffmpeg's framemd5 of every frame equals the earlier
 `hqx_rate_control_refinement_is_bit_exact` (`crates/dnx/tests/roundtrip.rs`) pins the coded bytes
 of a frame that takes the refinement path, with and without the `threads` feature.
 
+## Results (10/12-bit exports from a 16-bit picture, before → after)
+
+SDR exports handed every encoder RGBA8, so 10- and 12-bit codings got 8 bits of precision: a
+10-bit ramp of 64 luma levels came out of a ProRes 422 HQ or DNxHR HQX export with 19. The
+pipeline now quantises each rendered frame once into the form its output keeps, 16 bits per
+channel for ProRes, DNx at 10 / 12 bits, APV, DPX and OpenEXR (`pipeline::Pixels`), and the ramp
+keeps all 64 levels, with CPU and GPU rendering alike; 8-bit codings keep RGBA8 (an H.264 export
+is frame-for-frame identical). A 16-bit frame is twice an RGBA8 one, so an overlapped 4K export
+keeps 4 frames per batch in flight instead of 8 (`overlap_batch`). 100 frames of 3840×2160 25 fps
+ProRes 422 (`ProRes_422_UHD25.mov`), headless `filmcraft-cli`, smart rendering off, no audio,
+release build, Linux, AMD Ryzen 7 7800X3D (16 threads), RTX 4090, 2026-10-24, mean of two runs
+after against three before:
+
+| export | CPU rendering | GPU rendering |
+|---|---:|---:|
+| ProRes 422 HQ | 10.5 → 10.35 fps | 12.4 → 12.4 fps |
+| DNxHR HQX 10-bit | 15.2 → **17.25 fps** | 19.4 → **22.15 fps** |
+
+ProRes is unchanged within the noise. DNxHR HQX got faster, presumably from the picture it is
+given: the 8-bit steps the old path put into smooth gradients are gone, and rate control's
+per-macroblock refinement has less to do (not profiled further).
+
 ## Results (#847: AV1 in-loop filters in parallel row bands, before → after)
 
 The AV1 decoder ran deblocking, CDEF and loop restoration on one thread per frame. A single-tile

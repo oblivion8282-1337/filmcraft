@@ -547,6 +547,17 @@ impl ExportSettings {
         self.video_format() == Format::DnxHr && crate::dnx_config(&self.dnx_profile, 0, 0).hd_cid.is_some_and(crate::dnx_interlaced)
     }
 
+    /// Whether SDR frames reach the encoder at 16 bits per channel rather than as RGBA8: the
+    /// outputs that code more than 8 bits (ProRes, APV, DNx at 10 or 12 bits, DPX and OpenEXR).
+    /// 8-bit codings keep RGBA8 (half the memory per frame in flight).
+    pub fn keeps_deep_picture(&self) -> bool {
+        match self.video_format() {
+            Format::ProRes | Format::Apv | Format::DpxSequence | Format::ExrSequence => true,
+            Format::DnxHr => crate::dnx_config(&self.dnx_profile, 0, 0).bit_depth > 8,
+            _ => false,
+        }
+    }
+
     /// Whether the exported frames keep their alpha channel instead of being flattened over black.
     pub fn keeps_alpha(&self) -> bool {
         self.alpha && self.supports_alpha()

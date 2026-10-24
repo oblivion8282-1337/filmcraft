@@ -330,7 +330,7 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   not zero (`VideoFrame::alpha_region`, `to_linear_f32_region`, `blend::composite_at`), the rest
   being transparent anyway; and working images are recycled through `filmcraft_frame::pool`
   (`take_f32_overwritten` / `recycle_f32`: the buffer comes back with its old contents, so there is
-  no zero-fill) by the export pipeline once a frame is converted to 8 bits; a standalone export's
+  no zero-fill) by the export pipeline once a frame is converted to its output form; a standalone export's
   pipeline frees the idle float images (`pool::trim_f32`) when it goes away, so a finished export
   leaves none behind (parts of a batch, such as render-preview segments, keep them for the next part). A clip
   with effects, opacity masks, frame blending, colour management, or a picture that is not placed
@@ -588,6 +588,13 @@ frame (Y'CbCr/RGB + metadata) ─► source colour space: Interpret Footage over
   frame header, `colr`, and for PQ `mdcv` (BT.2020 / D65, 1000 / 0.0001 cd/m²) and `clli`
   (MaxCLL/MaxFALL 0 = unknown, they are not measured) plus the matching H.264 SEI. `sdr: true`
   exports the tone-mapped SDR picture instead; render previews always do.
+- **Export precision.** The export pipeline quantises each rendered float frame once, into the
+  form its output keeps (`pipeline::Pixels`): straight sRGB RGBA8 for 8-bit codings (H.264, HEVC
+  Main, DNxHR LB / SQ / HQ and DNxHD 8-bit, MJPEG, PNG / TIFF / JPEG / Targa / GIF); the same
+  picture at 16 bits per channel (`EncoderFrame::rgba16`, through a 65536-entry linear → sRGB table)
+  for the outputs that code more (ProRes, DNx at 10 / 12 bits, APV, DPX, OpenEXR), which convert it
+  at their coded depth (ProRes 4444 and 12-bit DNx at 12 bits); the encoded R'G'B' floats for HDR.
+  CPU and GPU rendering take the same path (the GPU's read-back is a float picture too).
 - **Monitors / display colour management.** The monitors are SDR (sRGB-encoded RGBA8 textures):
   HDR sequences are shown tone mapped. macOS EDR (extended-range `CAMetalLayer` output) is not
   wired up: there is no `platform` crate yet and eframe/wgpu do not expose an EDR surface, so HDR

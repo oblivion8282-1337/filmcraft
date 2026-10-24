@@ -15,10 +15,46 @@ use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
 use crate::smart::{OutputPicture, SmartRender};
 use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
 
+/// The pixels of a rendered output frame, in the one form its export takes ([`Pipeline::frame`]).
+pub(crate) enum Pixels {
+    /// Straight sRGB RGBA8.
+    Rgba8(Vec<u8>),
+    /// Straight sRGB R'G'B'A at 16 bits per channel: SDR output to encoders and still formats that
+    /// keep more than 8 bits ([`ExportSettings::keeps_deep_picture`]).
+    Rgba16(Vec<u16>),
+    /// HDR exports: the encoded R'G'B' floats, 3 per pixel.
+    Hdr(Vec<f32>),
+}
+
+impl Pixels {
+    /// Bytes per pixel of each form (memory budgeting, see `job::frame_bytes`).
+    pub const fn bytes_per_pixel(deep: bool, hdr: bool) -> u64 {
+        if hdr {
+            12
+        } else if deep {
+            8
+        } else {
+            4
+        }
+    }
+
+    /// The picture as straight sRGB RGBA8 (rounded down from the deeper forms, which only the
+    /// formats that keep them are given: a fallback, not a path frames normally take).
+    pub fn into_rgba8(self) -> Vec<u8> {
+        match self {
+            Pixels::Rgba8(p) => p,
+            Pixels::Rgba16(p) => p.iter().map(|&v| ((u32::from(v) * 255 + 32767) / 65535) as u8).collect(),
+            Pixels::Hdr(p) => {
+                p.as_chunks::<3>().0.iter().flat_map(|c| [c[0], c[1], c[2]].map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).into_iter().chain([255])).collect()
+            }
+        }
+    }
+}
+
 /// One output frame of an encoded export.
 pub(crate) enum Frame {
-    /// The rendered picture: straight sRGB RGBA8, or for HDR exports the encoded R'G'B' floats.
-    Rendered(Vec<u8>, Vec<f32>),
+    /// The rendered picture.
+    Rendered(Pixels),
     /// A source's stored picture, coded as the export codes, to copy (smart rendering).
     Stored(Arc<[u8]>),
 }
@@ -135,6 +171,8 @@ pub(crate) struct Pipeline {
     geom: Geometry,
     opts: RenderOptions,
     pub hdr_out: bool,
+    /// SDR frames are 16 bits per channel ([`Pixels::Rgba16`]), not RGBA8.
+    pub deep: bool,
     /// Keep straight alpha in the RGBA8 output instead of flattening over black.
     alpha: bool,
     out_tf: Option<filmcraft_color::OutputTransform>,
@@ -234,6 +272,7 @@ impl Pipeline {
             geom,
             opts,
             hdr_out,
+            deep: !hdr_out && settings.keeps_deep_picture(),
             alpha: settings.keeps_alpha(),
             out_tf,
             effects,
@@ -248,13 +287,14 @@ impl Pipeline {
         if let Some(data) = self.smart.as_ref().and_then(|s| s.stored(&self.project, self.seq, self.rate.tick_of(f), self.opts, sources)) {
             return Frame::Stored(data);
         }
-        let (rgba, hdr) = self.frame(f, sources);
-        Frame::Rendered(rgba, hdr)
+        Frame::Rendered(self.frame(f, sources))
     }
 
-    /// Output frame `f` as straight sRGB RGBA8 at the output size, or for HDR exports the encoded
-    /// R'G'B' floats (3 per pixel).
-    pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
+    /// Output frame `f` at the output size: straight sRGB RGBA8, or at 16 bits per channel for
+    /// outputs that keep more than 8 bits, or for HDR exports the encoded R'G'B' floats (3 per
+    /// pixel). Whichever renderer drew it (the GPU's read-back is a float picture too), the frame
+    /// is quantised once, here.
+    pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> Pixels {
         let t = self.rate.tick_of(f);
         // The registered GPU renderer goes first; `None` (no adapter, a plan the GPU cannot
         // draw, any internal error) falls back to the CPU reference renderer below. A frame the
@@ -303,7 +343,17 @@ impl Pipeline {
             }
             // the float image is not needed any more: its buffer serves the next frame's layers
             filmcraft_frame::pool::recycle_f32(img.px);
-            return (Vec::new(), out);
+            return Pixels::Hdr(out);
+        }
+        if self.deep {
+            let mut out = vec![0u16; img.w * img.h * 4];
+            let alpha = self.alpha;
+            out.par_chunks_mut(img.w.max(1) * 4).zip(img.px.par_chunks(img.w.max(1) * 4)).for_each(|(o, s)| linear_premul_to_srgb16(s, o, alpha));
+            filmcraft_frame::pool::recycle_f32(img.px);
+            if lim.enabled {
+                limit_rgba16(&mut out, lim.min_percent, lim.max_percent);
+            }
+            return Pixels::Rgba16(out);
         }
         let mut rgba = if self.alpha { img.to_rgba8() } else { img.over_black_rgba8() };
         // the float image is not needed any more: its buffer serves the next frame's layers
@@ -311,7 +361,7 @@ impl Pipeline {
         if lim.enabled {
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
-        (rgba, Vec::new())
+        Pixels::Rgba8(rgba)
     }
 
     /// Fit the rendered picture into the output frame.
@@ -502,6 +552,39 @@ pub fn limit_rgba8(rgba: &mut [u8], min_percent: f32, max_percent: f32) {
             limit_px(&mut c, lo, hi);
             for i in 0..3 {
                 p[i] = (c[i] * 255.0).floor().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+}
+
+/// Premultiplied linear RGBA floats → straight sRGB R'G'B'A at 16 bits, or with `alpha` false
+/// the picture over black, opaque (as `Image::to_rgba8` / `over_black_rgba8` do at 8 bits).
+fn linear_premul_to_srgb16(src: &[f32], dst: &mut [u16], alpha: bool) {
+    use filmcraft_color::linear_to_srgb_u16 as enc;
+    for (s, o) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+        if !alpha {
+            *o = [enc(s[0]), enc(s[1]), enc(s[2]), u16::MAX];
+            continue;
+        }
+        let a = s[3].clamp(0.0, 1.0);
+        if a <= 0.0 || a.is_nan() {
+            *o = [0; 4];
+            continue;
+        }
+        let inv = 1.0 / a;
+        *o = [enc(s[0] * inv), enc(s[1] * inv), enc(s[2] * inv), (a * 65535.0 + 0.5) as u16];
+    }
+}
+
+/// [`limit_rgba8`] on 16-bit R'G'B'A.
+fn limit_rgba16(rgba: &mut [u16], min_percent: f32, max_percent: f32) {
+    let (lo, hi) = (min_percent.clamp(0.0, 100.0) / 100.0, max_percent.clamp(0.0, 100.0) / 100.0);
+    rgba.par_chunks_mut(4 * 1024).for_each(|chunk| {
+        for p in chunk.as_chunks_mut::<4>().0 {
+            let mut c = [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0];
+            limit_px(&mut c, lo, hi);
+            for (d, v) in p.iter_mut().zip(c) {
+                *d = (v * 65535.0).floor().clamp(0.0, 65535.0) as u16;
             }
         }
     });

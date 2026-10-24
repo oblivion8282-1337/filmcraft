@@ -71,7 +71,7 @@ use rayon::prelude::*;
 
 use crate::audio_out::AudioOut;
 use crate::mxf_out::{MxfMux, MxfSetup};
-use crate::pipeline::{Frame, Pipeline};
+use crate::pipeline::{Frame, Pipeline, Pixels};
 use crate::settings::{AudioCodec, BitrateMode};
 use crate::{
     AudioEncoder, ColorSignal, EncodedPacket, EncoderFrame, ExportError, ExportSettings, Format, H264Pass, Out, Progress, Report, Result, Stage, VideoEncoder,
@@ -87,9 +87,10 @@ pub const INTERLEAVE: i64 = 16;
 /// the one being rendered), see [`overlap_batch`].
 pub const IN_FLIGHT_BUDGET: u64 = 1 << 29;
 
-/// Bytes of one rendered [`Frame`] of a `w` x `h` export (RGBA8, or three f32 per pixel for HDR).
-pub(crate) fn frame_bytes(w: u32, h: u32, hdr: bool) -> u64 {
-    u64::from(w).saturating_mul(u64::from(h)).saturating_mul(if hdr { 12 } else { 4 })
+/// Bytes of one rendered [`Frame`] of a `w` x `h` export at `bytes_per_pixel` (RGBA8: 4, 16-bit
+/// RGBA: 8, three f32 per pixel for HDR: 12; see [`crate::pipeline::Pixels::bytes_per_pixel`]).
+pub(crate) fn frame_bytes(w: u32, h: u32, bytes_per_pixel: u64) -> u64 {
+    u64::from(w).saturating_mul(u64::from(h)).saturating_mul(bytes_per_pixel)
 }
 
 /// Frames per batch when two batches are in flight: `batch` (what a sequential export would use),
@@ -337,7 +338,11 @@ impl Exporter {
     /// Frames in the next batch, bounded before Rayon can steal nested frame tasks.
     fn batch_len(&self) -> i64 {
         let batch = self.pipe.render_batch_limit(self.batch);
-        if self.overlapping() { overlap_batch(batch, frame_bytes(self.pipe.w, self.pipe.h, self.pipe.hdr_out), self.budget) } else { batch }
+        if self.overlapping() {
+            overlap_batch(batch, frame_bytes(self.pipe.w, self.pipe.h, Pixels::bytes_per_pixel(self.pipe.deep, self.pipe.hdr_out)), self.budget)
+        } else {
+            batch
+        }
     }
 
     fn sample_at_frame(&self, f: i64, sr: u32) -> i64 {
@@ -639,8 +644,8 @@ impl Exporter {
     }
 
     fn encode(&mut self, frame: &Frame, f: i64) -> Result<Vec<EncodedPacket>> {
-        let (rgba, hdr) = match frame {
-            Frame::Rendered(rgba, hdr) => (rgba, hdr),
+        let px = match frame {
+            Frame::Rendered(px) => px,
             Frame::Stored(data) => {
                 // copied as stored; every frame of these intra codecs is a sync sample one frame long
                 if !self.first_pass {
@@ -649,7 +654,12 @@ impl Exporter {
                 return Ok(vec![EncodedPacket { data: data.to_vec(), key: true, duration: self.pipe.rate.den as u32, composition_offset: 0 }]);
             }
         };
-        let fr = EncoderFrame { width: self.pipe.w, height: self.pipe.h, rgba, hdr: self.pipe.hdr_out.then_some(hdr.as_slice()), index: (f - self.f0) as u64 };
+        let (rgba, rgba16, hdr): (&[u8], _, _) = match px {
+            Pixels::Rgba8(p) => (p, None, None),
+            Pixels::Rgba16(p) => (&[], Some(p.as_slice()), None),
+            Pixels::Hdr(p) => (&[], None, Some(p.as_slice())),
+        };
+        let fr = EncoderFrame { width: self.pipe.w, height: self.pipe.h, rgba, hdr, rgba16, index: (f - self.f0) as u64 };
         self.venc.encode(&fr)
     }
 }
@@ -662,25 +672,25 @@ mod tests {
 
     #[test]
     fn frame_bytes_by_format() {
-        assert_eq!(frame_bytes(1920, 1080, false), 1920 * 1080 * 4);
-        assert_eq!(frame_bytes(3840, 2160, true), 3840 * 2160 * 12);
-        assert_eq!(frame_bytes(u32::MAX, u32::MAX, true), u64::MAX, "saturates");
-        assert_eq!(frame_bytes(0, 1080, false), 0);
+        assert_eq!(frame_bytes(1920, 1080, 4), 1920 * 1080 * 4);
+        assert_eq!(frame_bytes(3840, 2160, 12), 3840 * 2160 * 12);
+        assert_eq!(frame_bytes(u32::MAX, u32::MAX, 12), u64::MAX, "saturates");
+        assert_eq!(frame_bytes(0, 1080, 4), 0);
     }
 
     #[test]
     fn the_overlap_batch_fits_the_memory_budget() {
         let budget = IN_FLIGHT_BUDGET;
         // 1080p keeps the full 16 frames, 4K SDR (33 MB a frame) 8 + 8 in flight (2 x 8 x 33 MB = 512 MiB)
-        assert_eq!(overlap_batch(16, frame_bytes(1920, 1080, false), budget), 16);
-        assert_eq!(overlap_batch(16, frame_bytes(3840, 2160, false), budget), 8);
+        assert_eq!(overlap_batch(16, frame_bytes(1920, 1080, 4), budget), 16);
+        assert_eq!(overlap_batch(16, frame_bytes(3840, 2160, 4), budget), 8);
         // 4K HDR (100 MB a frame): 256 MiB per batch is 2 frames, not 16
-        let hdr4k = frame_bytes(3840, 2160, true);
+        let hdr4k = frame_bytes(3840, 2160, 12);
         let n = overlap_batch(16, hdr4k, budget);
         assert_eq!(n, 2);
         assert!(2 * n as u64 * hdr4k <= budget);
         // 8K HDR: one frame at a time, even though two do not fit (never fewer than one)
-        assert_eq!(overlap_batch(16, frame_bytes(7680, 4320, true), budget), 1);
+        assert_eq!(overlap_batch(16, frame_bytes(7680, 4320, 12), budget), 1);
         // a smaller batch (web: 1) is never raised, a degenerate one is one frame
         assert_eq!(overlap_batch(1, 4, budget), 1);
         assert_eq!(overlap_batch(0, 4, budget), 1);

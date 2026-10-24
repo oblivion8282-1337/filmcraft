@@ -348,6 +348,133 @@ fn prores_interlaced_exports_ffprobe_oracle() {
     }
 }
 
+/// A 10-bit Y'CbCr 4:2:2 ramp, 320×180: luma 400 + x / 5 (64 levels), neutral chroma, as a
+/// decoder hands 10-bit media to the renderer.
+struct Ramp10 {
+    info: filmcraft_media::MediaInfo,
+}
+
+impl Ramp10 {
+    const W: u32 = 320;
+    const H: u32 = 180;
+}
+
+impl MediaSource for Ramp10 {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        &self.info
+    }
+    fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+        let (w, h) = (Self::W as usize, Self::H as usize);
+        let y: Vec<u16> = (0..h).flat_map(|_| (0..w).map(|x| 400 + (x / 5) as u16)).collect();
+        let c = vec![512u16; w.div_ceil(2) * h];
+        Ok(Arc::new(filmcraft_frame::VideoFrame {
+            width: Self::W,
+            height: Self::H,
+            data: filmcraft_frame::PixelData::Yuv16 {
+                planes: [Arc::new(y), Arc::new(c.clone()), Arc::new(c)],
+                chroma: filmcraft_frame::Chroma::C422,
+                bits: 10,
+                alpha: None,
+            },
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: req.time,
+        }))
+    }
+    fn audio(&self, _start: i64, _frames: usize, _sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        Err(filmcraft_media::MediaError::NoStream("audio"))
+    }
+}
+
+/// A sequence of [`Ramp10`] alone.
+fn ramp_project() -> (Arc<Project>, ItemId, SourceMap) {
+    let mut p = Project::new("ramp");
+    let g = GeneratorSource::new(Generator::BlackVideo, Ramp10::W, Ramp10::H, FrameRate::FPS_24, Tick(TICKS_PER_SECOND));
+    let info = g.info().clone();
+    let item = p.add_item(
+        "ramp",
+        Label::Iris,
+        ItemKind::Media(MediaClip {
+            media: MediaRef::Generator(g.generator.clone()),
+            info: info.clone(),
+            interpret: Default::default(),
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            offline: false,
+            proxy: None,
+            identity: None,
+        }),
+        None,
+    );
+    let seq = p.new_sequence("s", SequenceSettings { width: Ramp10::W, height: Ramp10::H, frame_rate: FrameRate::FPS_24, ..Default::default() }, 1, 0, None);
+    let r = FrameRate::FPS_24;
+    let v = p.make_track_item(item, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(2)), r).unwrap();
+    p.sequence_mut(seq).unwrap().video_tracks[0].items.push(v);
+    let mut m = SourceMap::default();
+    m.0.insert(item, Arc::new(Ramp10 { info }));
+    (Arc::new(p), seq, m)
+}
+
+fn distinct(v: impl Iterator<Item = u32>) -> usize {
+    v.collect::<std::collections::BTreeSet<_>>().len()
+}
+
+/// SDR exports to 10/12-bit codings keep more than 8 bits: a 64-level 10-bit ramp keeps its levels
+/// through ProRes 422 HQ, DNxHR HQX and DPX (it came out with 19 when frames reached the encoders
+/// as RGBA8); 8-bit codings keep RGBA8 frames.
+#[test]
+fn ten_bit_exports_keep_ten_bit_precision() {
+    let (p, seq, m) = ramp_project();
+    let row = (Ramp10::H / 2) as usize * Ramp10::W as usize;
+    let range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(1)));
+    let open = |path: &str| filmcraft_codecs::open_bytes(path, std::fs::read(path).unwrap().into()).unwrap();
+    let w = Ramp10::W as usize;
+
+    let s = ExportSettings { format: Format::ProRes, path: tmp("ramp_prores.mov"), smart_render: false, include_audio: false, range, ..Default::default() };
+    assert!(s.keeps_deep_picture());
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    let f = filmcraft_prores::decode_frame(&open(&s.path).coded_sample(Tick::ZERO).unwrap().data).unwrap();
+    let n = distinct(f.y[row..row + w].iter().map(|&v| u32::from(v)));
+    assert!(n >= 60, "ProRes 422 HQ keeps {n} of 64 levels");
+
+    let s = ExportSettings {
+        format: Format::DnxHr,
+        dnx_profile: "hqx".into(),
+        path: tmp("ramp_hqx.mov"),
+        smart_render: false,
+        include_audio: false,
+        range,
+        ..Default::default()
+    };
+    assert!(s.keeps_deep_picture());
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    let f = filmcraft_dnx::decode_frame(&open(&s.path).coded_sample(Tick::ZERO).unwrap().data).unwrap();
+    let n = distinct(f.y[row..row + w].iter().map(|&v| u32::from(v)));
+    assert!(n >= 60, "DNxHR HQX keeps {n} of 64 levels");
+
+    // a DPX sequence: 10-bit RGB words after the 2048-byte header
+    let dir = std::path::PathBuf::from(tmp("ramp_dpx"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let s = ExportSettings { format: Format::DpxSequence, path: dir.join("f.dpx").to_string_lossy().into(), range, ..Default::default() };
+    assert!(s.keeps_deep_picture());
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    let file = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).find(|e| e.path().extension().is_some_and(|x| x == "dpx")).unwrap().path();
+    let d = std::fs::read(file).unwrap();
+    let words = d[2048..].as_chunks::<4>().0;
+    let n = distinct(words[row..row + w].iter().map(|c| u32::from_be_bytes(*c) >> 22));
+    assert!(n >= 60, "DPX keeps {n} of 64 levels");
+
+    // 8-bit codings take RGBA8, as before
+    for s in [
+        ExportSettings { format: Format::H264, ..Default::default() },
+        ExportSettings { format: Format::DnxHr, dnx_profile: "hq".into(), ..Default::default() },
+        ExportSettings { format: Format::PngSequence, ..Default::default() },
+    ] {
+        assert!(!s.keeps_deep_picture(), "{:?}", s.format);
+    }
+}
+
 /// Burn-in: an H.264 export of a dark-blue matte with a caption, decoded by ffmpeg (external test
 /// oracle only), has bright caption pixels in the lower part of the frame, and none without
 /// `burn_captions` or above the caption.

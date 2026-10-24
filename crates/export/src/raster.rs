@@ -1,4 +1,5 @@
-//! Uncompressed still formats written directly from RGBA8 frames: Targa, DPX and OpenEXR.
+//! Uncompressed still formats written directly from RGBA frames: Targa (8 bits per channel), DPX
+//! and OpenEXR (from 8- or 16-bit frames, see [`Sample`]).
 //!
 //! Targa follows the Truevision TGA File Format Specification 2.0 (image type 2, uncompressed
 //! true-colour, bottom-left origin, the layout every reader accepts). DPX follows SMPTE ST 268
@@ -9,10 +10,63 @@
 //! expect; uncompressed, RLE, ZIPS (zlib per scan line) or ZIP (zlib per 16 scan lines). The
 //! compressed modes first split each chunk's bytes into even and odd halves and delta-code them
 //! (the format's predictor); a chunk that would not shrink is stored raw, as the format allows.
+use std::sync::OnceLock;
+
 use crate::{ExportError, ExrCompression, Result};
 
-/// `w * h * 4` when `rgba` holds exactly that many bytes.
-fn checked_len(rgba: &[u8], w: u32, h: u32) -> Result<usize> {
+/// A channel value of an RGBA frame: sRGB-encoded, 8 bits (0..=255) or 16 bits (0..=65535).
+pub(crate) trait Sample: Copy {
+    /// The value at 10 bits (DPX).
+    fn ten(self) -> u32;
+    /// The value decoded to linear light.
+    fn linear(self) -> f32;
+    /// The value as a fraction of full scale (alpha).
+    fn unit(self) -> f32;
+    fn is_max(self) -> bool;
+    /// [`Sample::linear`] as a half float.
+    fn linear_half(self) -> u16;
+}
+
+impl Sample for u8 {
+    /// widened by bit replication, so 0 → 0 and 255 → 1023
+    fn ten(self) -> u32 {
+        (u32::from(self) << 2) | (u32::from(self) >> 6)
+    }
+    fn linear(self) -> f32 {
+        filmcraft_color::srgb_u8_to_linear_table()[usize::from(self)]
+    }
+    fn unit(self) -> f32 {
+        f32::from(self) / 255.0
+    }
+    fn is_max(self) -> bool {
+        self == u8::MAX
+    }
+    fn linear_half(self) -> u16 {
+        static T: OnceLock<[u16; 256]> = OnceLock::new();
+        T.get_or_init(|| std::array::from_fn(|i| half(filmcraft_color::srgb_u8_to_linear_table()[i])))[usize::from(self)]
+    }
+}
+
+impl Sample for u16 {
+    fn ten(self) -> u32 {
+        (u32::from(self) * 1023 + 32767) / 65535
+    }
+    fn linear(self) -> f32 {
+        filmcraft_color::srgb_u16_to_linear_table().get(usize::from(self)).copied().unwrap_or(1.0)
+    }
+    fn unit(self) -> f32 {
+        f32::from(self) / 65535.0
+    }
+    fn is_max(self) -> bool {
+        self == u16::MAX
+    }
+    fn linear_half(self) -> u16 {
+        half(self.linear())
+    }
+}
+
+/// `w * h * 4` when `rgba` holds exactly that many samples.
+fn checked_len<T>(rgba: &[T], w: u32, h: u32) -> Result<usize> {
     let n = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)).ok_or_else(|| ExportError::Encode("frame size".into()))?;
     if w == 0 || h == 0 || rgba.len() != n {
         return Err(ExportError::Encode("frame size".into()));
@@ -62,10 +116,11 @@ pub(crate) fn tga(rgba: &[u8], w: u32, h: u32, alpha: bool) -> Result<Vec<u8>> {
 /// Header size of the DPX files we write (file + image + orientation + film + TV headers).
 const DPX_HEADER: usize = 2048;
 
-/// A DPX file: 10-bit RGB (8-bit values widened by bit replication, so 0 → 0 and 255 → 1023).
-pub(crate) fn dpx(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
+/// A DPX file: 10-bit RGB (8-bit values widened by bit replication, so 0 → 0 and 255 → 1023;
+/// 16-bit values rounded).
+pub(crate) fn dpx<T: Sample>(rgba: &[T], w: u32, h: u32) -> Result<Vec<u8>> {
     let n = checked_len(rgba, w, h)?;
-    // one 32-bit word per pixel; `n` is already `w * h * 4`
+    // one 32-bit word per pixel, four bytes; `n` is already `w * h * 4`
     let size = n.checked_add(DPX_HEADER).ok_or_else(|| ExportError::Encode("frame size".into()))?;
     let file_size = u32::try_from(size).map_err(|_| ExportError::Unsupported(format!("a {w}×{h} DPX frame exceeds 4 GB")))?;
     // SMPTE ST 268: undefined numeric fields are all ones, undefined text fields are NUL
@@ -127,9 +182,8 @@ pub(crate) fn dpx(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     hd[1928] = 0;
     let mut out = Vec::with_capacity(size);
     out.extend_from_slice(&hd);
-    let ten = |v: u8| (u32::from(v) << 2) | (u32::from(v) >> 6);
     for &[r, g, b, _] in rgba.as_chunks::<4>().0 {
-        out.extend_from_slice(&((ten(r) << 22) | (ten(g) << 12) | (ten(b) << 2)).to_be_bytes());
+        out.extend_from_slice(&((r.ten() << 22) | (g.ten() << 12) | (b.ten() << 2)).to_be_bytes());
     }
     Ok(out)
 }
@@ -166,7 +220,7 @@ fn half(v: f32) -> u16 {
 
 /// An OpenEXR file: half-float scene-linear Rec.709 RGB, or RGBA with `alpha` (premultiplied, as
 /// EXR defines alpha; the frame's straight alpha is multiplied in after linearisation).
-pub(crate) fn exr(rgba: &[u8], w: u32, h: u32, alpha: bool, compression: ExrCompression) -> Result<Vec<u8>> {
+pub(crate) fn exr<T: Sample>(rgba: &[T], w: u32, h: u32, alpha: bool, compression: ExrCompression) -> Result<Vec<u8>> {
     let n = checked_len(rgba, w, h)?;
     let too_large = || ExportError::Unsupported(format!("an OpenEXR frame of {w}×{h} is too large"));
     let (Ok(x_max), Ok(y_max)) = (i32::try_from(w - 1), i32::try_from(h - 1)) else {
@@ -224,8 +278,6 @@ pub(crate) fn exr(rgba: &[u8], w: u32, h: u32, alpha: bool, compression: ExrComp
     out.extend_from_slice(&hd);
     let table_at = out.len();
     out.resize(table_at + chunks * 8, 0);
-    let lin = filmcraft_color::srgb_u8_to_linear_table();
-    let opaque: [u16; 256] = std::array::from_fn(|i| half(lin[i]));
     let row = w as usize * 4;
     let wn = w as usize;
     let mut px = vec![0_u16; wn * names.len()];
@@ -237,14 +289,14 @@ pub(crate) fn exr(rgba: &[u8], w: u32, h: u32, alpha: bool, compression: ExrComp
             for (x, &[r, g, b, a]) in src.as_chunks::<4>().0.iter().enumerate() {
                 let rgb = [b, g, r];
                 if alpha {
-                    let k = f32::from(a) / 255.0;
+                    let k = a.unit();
                     px[x] = half(k);
                     for (c, &v) in rgb.iter().enumerate() {
-                        px[(c + 1) * wn + x] = if a == 255 { opaque[v as usize] } else { half(lin[v as usize] * k) };
+                        px[(c + 1) * wn + x] = if a.is_max() { v.linear_half() } else { half(v.linear() * k) };
                     }
                 } else {
                     for (c, &v) in rgb.iter().enumerate() {
-                        px[c * wn + x] = opaque[v as usize];
+                        px[c * wn + x] = v.linear_half();
                     }
                 }
             }
@@ -321,7 +373,7 @@ mod tests {
     #[test]
     fn dpx_header_and_packing() {
         // 2×1: pure red, then (1, 128, 255)
-        let px = [255, 0, 0, 255, 1, 128, 255, 7];
+        let px: [u8; 8] = [255, 0, 0, 255, 1, 128, 255, 7];
         let f = dpx(&px, 2, 1).unwrap();
         assert_eq!(&f[0..4], b"SDPX");
         assert_eq!(f.len(), 2048 + 8);
@@ -384,7 +436,7 @@ mod tests {
     #[test]
     fn exr_layout() {
         // 2×1: opaque white, then (255, 0, 0) at alpha 0.5
-        let px = [255, 255, 255, 255, 255, 0, 0, 128];
+        let px: [u8; 8] = [255, 255, 255, 255, 255, 0, 0, 128];
         for alpha in [false, true] {
             let f = exr(&px, 2, 1, alpha, ExrCompression::None).unwrap();
             let nch = if alpha { 4 } else { 3 };
@@ -553,16 +605,16 @@ mod tests {
 
     #[test]
     fn hostile_sizes_are_errors() {
-        assert!(dpx(&[0; 7], 2, 1).is_err());
-        assert!(dpx(&[], 0, 0).is_err());
+        assert!(dpx(&[0u8; 7], 2, 1).is_err());
+        assert!(dpx::<u8>(&[], 0, 0).is_err());
         assert!(tga(&[0; 4], 1, 2, false).is_err());
         assert!(tga(&[0; 4], u32::MAX, u32::MAX, false).is_err());
         assert!(rgb(&[0; 3], 1, 1).is_err());
-        assert!(dpx(&[0; 4], u32::MAX, u32::MAX).is_err());
+        assert!(dpx(&[0u8; 4], u32::MAX, u32::MAX).is_err());
         for c in ExrCompression::ALL {
-            assert!(exr(&[0; 4], u32::MAX, u32::MAX, true, c).is_err());
-            assert!(exr(&[0; 7], 2, 1, false, c).is_err());
-            assert!(exr(&[], 0, 1, false, c).is_err());
+            assert!(exr(&[0u8; 4], u32::MAX, u32::MAX, true, c).is_err());
+            assert!(exr(&[0u8; 7], 2, 1, false, c).is_err());
+            assert!(exr::<u8>(&[], 0, 1, false, c).is_err());
         }
     }
 }

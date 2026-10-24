@@ -140,6 +140,32 @@ fn gpu_export_matches_cpu_and_counts() {
 
     // (the frame renderer registry is process-wide: the coded-media exports run here, after it)
     coded_media_exports_decode_on_the_gpu();
+    ten_bit_exports_keep_ten_bits_on_the_gpu();
+}
+
+/// GPU rendering feeds 10-bit encoders the 16-bit picture too: a 64-level 10-bit ProRes ramp keeps
+/// its levels through a GPU-rendered ProRes 422 HQ export (19 when encoders got RGBA8).
+fn ten_bit_exports_keep_ten_bits_on_the_gpu() {
+    let (w, h) = (320u32, 180u32);
+    let (wu, hu) = (w as usize, h as usize);
+    let mut f = filmcraft_prores::Frame::new(w, h, filmcraft_prores::ChromaFormat::Yuv422, 10, false);
+    f.y = (0..hu).flat_map(|_| (0..wu).map(|x| 400 + (x / 5) as u16)).collect();
+    let ramp = filmcraft_prores::Encoder::new(filmcraft_prores::Profile::Hq, w, h).encode(&f).unwrap();
+    let media = mov(filmcraft_isobmff::SampleEntry::prores(filmcraft_isobmff::FourCc(*b"apch"), w as u16, h as u16), &[ramp.clone(), ramp]);
+    let (p, seq, m) = clip_project(&media, w, h, 1);
+    let path = std::env::temp_dir().join(format!("fc-gpu-export-ramp-{}.mov", std::process::id())).to_string_lossy().into_owned();
+    let mut s = ExportSettings { format: Format::ProRes, path: path.clone(), smart_render: false, include_audio: false, ..Default::default() };
+    s.range = Some(TimeRange::new(filmcraft_time::Tick::ZERO, filmcraft_time::FrameRate::FPS_24.tick_of(1)));
+    s.gpu_rendering = GpuRendering::Auto;
+    let before = filmcraft_export::gpu_render_stats().frames;
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    assert!(filmcraft_export::gpu_render_stats().frames > before, "the frame was rendered on the GPU");
+    let out = filmcraft_codecs::open_bytes("ramp.mov", std::fs::read(&path).unwrap().into()).unwrap();
+    let d = filmcraft_prores::decode_frame(&out.coded_sample(filmcraft_time::Tick::ZERO).unwrap().data).unwrap();
+    let row = hu / 2 * wu;
+    let levels: std::collections::BTreeSet<u16> = d.y[row..row + wu].iter().copied().collect();
+    assert!(levels.len() >= 60, "GPU-rendered ProRes keeps {} of 64 levels", levels.len());
+    let _ = std::fs::remove_file(path);
 }
 
 /// A MOV of `frames` (VC-3 or ProRes, one per frame at 24 fps).

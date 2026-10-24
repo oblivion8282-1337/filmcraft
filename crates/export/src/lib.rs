@@ -746,14 +746,143 @@ pub struct EncodedPacket {
     pub composition_offset: i32,
 }
 
-/// Input picture for encoders: straight sRGB RGBA8 (encoders convert to their own YUV), or for
-/// HDR exports the encoded R'G'B' (PQ/HLG, BT.2020; 3 floats per pixel, 0..1) in `hdr`.
+/// Input picture for encoders: straight sRGB RGBA8 (encoders convert to their own YUV); for SDR
+/// exports to encoders that code more than 8 bits the same picture at 16 bits per channel in
+/// `rgba16` (and `rgba` empty); for HDR exports the encoded R'G'B' (PQ/HLG, BT.2020; 3 floats per
+/// pixel, 0..1) in `hdr`. [`EncoderFrame::picture`] picks the one given.
 pub struct EncoderFrame<'a> {
     pub width: u32,
     pub height: u32,
     pub rgba: &'a [u8],
     pub hdr: Option<&'a [f32]>,
+    /// Straight R'G'B'A, 16 bits per channel (0..=65535), the sRGB / BT.709 curve of `rgba`.
+    pub rgba16: Option<&'a [u16]>,
     pub index: u64,
+}
+
+impl EncoderFrame<'_> {
+    /// The picture to convert: HDR floats, else the 16-bit picture, else RGBA8.
+    pub fn picture(&self) -> Picture<'_> {
+        match (self.hdr, self.rgba16) {
+            (Some(rgb), _) => Picture::Rgb32F(rgb),
+            (None, Some(rgba)) => Picture::Rgba16(rgba),
+            (None, None) => Picture::Rgba8(self.rgba),
+        }
+    }
+}
+
+/// A borrowed encoder input picture (see [`EncoderFrame`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Picture<'a> {
+    /// Straight sRGB / BT.709 R'G'B'A, 8 bits per channel.
+    Rgba8(&'a [u8]),
+    /// The same at 16 bits per channel (0..=65535).
+    Rgba16(&'a [u16]),
+    /// Encoded R'G'B' floats (HDR), 3 per pixel, no alpha.
+    Rgb32F(&'a [f32]),
+}
+
+impl Picture<'_> {
+    /// Pixel `i`'s R'G'B' (nominally 0..1); black past the end.
+    #[inline]
+    pub fn rgb(&self, i: usize) -> [f32; 3] {
+        const K8: f32 = 1.0 / 255.0;
+        const K16: f32 = 1.0 / 65535.0;
+        let at = i.saturating_mul(4);
+        match self {
+            Picture::Rgba8(p) => p.get(at..at.saturating_add(3)).map_or([0.0; 3], |p| [p[0] as f32 * K8, p[1] as f32 * K8, p[2] as f32 * K8]),
+            Picture::Rgba16(p) => p.get(at..at.saturating_add(3)).map_or([0.0; 3], |p| [p[0] as f32 * K16, p[1] as f32 * K16, p[2] as f32 * K16]),
+            Picture::Rgb32F(p) => {
+                let at = i.saturating_mul(3);
+                p.get(at..at.saturating_add(3)).map_or([0.0; 3], |p| [p[0], p[1], p[2]])
+            }
+        }
+    }
+    /// Pixel `i`'s alpha (0..1, straight); opaque for float pictures and past the end.
+    #[inline]
+    pub fn alpha(&self, i: usize) -> f32 {
+        let at = i.saturating_mul(4).saturating_add(3);
+        match self {
+            Picture::Rgba8(p) => p.get(at).map_or(1.0, |&a| a as f32 / 255.0),
+            Picture::Rgba16(p) => p.get(at).map_or(1.0, |&a| a as f32 / 65535.0),
+            Picture::Rgb32F(_) => 1.0,
+        }
+    }
+    pub fn is_hdr(&self) -> bool {
+        matches!(self, Picture::Rgb32F(_))
+    }
+}
+
+/// Limited-range Y'CbCr levels at `bits` per sample (8..=16): black and luma range, chroma zero
+/// and range, and the lowest and highest codes used (one 8-bit step inside the full range, as
+/// 4..1019 at 10 bits).
+#[derive(Clone, Copy)]
+struct Levels {
+    black: f32,
+    luma: f32,
+    zero: f32,
+    chroma: f32,
+    lo: f32,
+    hi: f32,
+}
+
+fn levels(bits: u8) -> Levels {
+    let b = u32::from(bits.clamp(8, 16));
+    let s = (1u32 << (b - 8)) as f32;
+    Levels { black: 16.0 * s, luma: 219.0 * s, zero: 128.0 * s, chroma: 224.0 * s, lo: s, hi: ((1u32 << b) - 1) as f32 - s }
+}
+
+/// Limited-range 4:4:4 at `bits` with matrix (Kr, Kb) from any [`Picture`]; `alpha` (full range at
+/// `bits`, 0 = transparent) takes the picture's alpha (opaque for HDR floats).
+#[allow(clippy::too_many_arguments)]
+pub fn to_yuv444(pic: Picture, w: usize, h: usize, kr: f32, kb: f32, bits: u8, y: &mut [u16], cb: &mut [u16], cr: &mut [u16], alpha: Option<&mut [u16]>) {
+    let (w, n) = (w.max(1), w.saturating_mul(h));
+    let l = levels(bits);
+    let kg = 1.0 - kr - kb;
+    let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
+    y.par_chunks_mut(w).zip(cb.par_chunks_mut(w).zip(cr.par_chunks_mut(w))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
+        for (x, (yv, (cbv, crv))) in yr.iter_mut().zip(cbr.iter_mut().zip(crr.iter_mut())).enumerate() {
+            let [r, g, b] = pic.rgb(row * w + x);
+            let yy = kr * r + kg * g + kb * b;
+            *yv = (l.black + l.luma * yy).round().clamp(l.lo, l.hi) as u16;
+            *cbv = (l.zero + l.chroma * (b - yy) / sb).round().clamp(l.lo, l.hi) as u16;
+            *crv = (l.zero + l.chroma * (r - yy) / sr).round().clamp(l.lo, l.hi) as u16;
+        }
+    });
+    if let Some(a) = alpha {
+        let max = ((1u32 << u32::from(bits.clamp(8, 16))) - 1) as f32;
+        a.par_iter_mut().take(n).enumerate().for_each(|(i, d)| *d = (pic.alpha(i).clamp(0.0, 1.0) * max).round() as u16);
+    }
+}
+
+/// Limited-range 4:2:2 at `bits` with matrix (Kr, Kb) from any [`Picture`] (chroma averaged
+/// horizontally).
+#[allow(clippy::too_many_arguments)]
+pub fn to_yuv422(pic: Picture, w: usize, h: usize, kr: f32, kb: f32, bits: u8, y: &mut [u16], cb: &mut [u16], cr: &mut [u16]) {
+    let w = w.max(1);
+    let cw = w.div_ceil(2);
+    let _ = h;
+    let l = levels(bits);
+    let kg = 1.0 - kr - kb;
+    let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
+    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
+        let mut us = vec![0f32; w];
+        let mut vs = vec![0f32; w];
+        for (x, (yv, (u, v))) in yr.iter_mut().zip(us.iter_mut().zip(vs.iter_mut())).enumerate() {
+            let [r, g, b] = pic.rgb(row * w + x);
+            let yy = kr * r + kg * g + kb * b;
+            *yv = (l.black + l.luma * yy).round().clamp(l.lo, l.hi) as u16;
+            *u = (b - yy) / sb;
+            *v = (r - yy) / sr;
+        }
+        for (cx, (cbv, crv)) in cbr.iter_mut().zip(crr.iter_mut()).enumerate() {
+            let (a, b2) = (cx * 2, (cx * 2 + 1).min(w - 1));
+            let u = (us.get(a).copied().unwrap_or(0.0) + us.get(b2).copied().unwrap_or(0.0)) * 0.5;
+            let v = (vs.get(a).copied().unwrap_or(0.0) + vs.get(b2).copied().unwrap_or(0.0)) * 0.5;
+            *cbv = (l.zero + l.chroma * u).round().clamp(l.lo, l.hi) as u16;
+            *crv = (l.zero + l.chroma * v).round().clamp(l.lo, l.hi) as u16;
+        }
+    });
 }
 
 pub trait VideoEncoder: Send {
@@ -1229,18 +1358,15 @@ impl VideoEncoder for ProResEncoder {
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         let chroma = self.profile.chroma();
-        let mut fr = filmcraft_prores::Frame::new(f.width, f.height, chroma, 10, self.alpha);
+        // the coded precision: 10 bits for 4:2:2, 12 for 4:4:4
+        let depth = if chroma == filmcraft_prores::ChromaFormat::Yuv444 { 12 } else { 10 };
+        let mut fr = filmcraft_prores::Frame::new(f.width, f.height, chroma, depth, self.alpha);
         let (w, h) = (f.width as usize, f.height as usize);
-        timed(Stage::Convert, || match (chroma, f.hdr) {
-            (filmcraft_prores::ChromaFormat::Yuv444, hdr) => {
-                let (kr, kb) = if hdr.is_some() { self.signal.kr_kb() } else { (0.2126, 0.0722) };
-                to_yuv444_10(f.rgba, hdr, w, h, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr, fr.alpha.as_deref_mut())
-            }
-            (_, Some(rgb)) => {
-                let (kr, kb) = self.signal.kr_kb();
-                rgbf_to_yuv422_10(rgb, w, h, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr)
-            }
-            (_, None) => rgba_to_yuv422_10(f.rgba, w, h, &mut fr.y, &mut fr.cb, &mut fr.cr),
+        let pic = f.picture();
+        let (kr, kb) = if pic.is_hdr() { self.signal.kr_kb() } else { (0.2126, 0.0722) };
+        timed(Stage::Convert, || match chroma {
+            filmcraft_prores::ChromaFormat::Yuv444 => to_yuv444(pic, w, h, kr, kb, depth, &mut fr.y, &mut fr.cb, &mut fr.cr, fr.alpha.as_deref_mut()),
+            filmcraft_prores::ChromaFormat::Yuv422 => to_yuv422(pic, w, h, kr, kb, depth, &mut fr.y, &mut fr.cb, &mut fr.cr),
         });
         let data = self.enc.encode(&fr).map_err(|e| ExportError::Encode(e.to_string()))?;
         Ok(vec![EncodedPacket { data, key: true, duration: self.rate.den as u32, composition_offset: 0 }])
@@ -1251,8 +1377,7 @@ impl VideoEncoder for ProResEncoder {
 }
 
 /// Limited-range 10-bit 4:4:4 with matrix (Kr, Kb) from straight RGBA8, or from encoded R'G'B'
-/// floats (3 per pixel) when `hdr` is given. `alpha` (full range, 0 = transparent) takes the
-/// RGBA8 alpha; it stays opaque for float input, which carries none.
+/// floats (3 per pixel) when `hdr` is given ([`to_yuv444`] at 10 bits).
 #[allow(clippy::too_many_arguments)]
 pub fn to_yuv444_10(
     rgba: &[u8],
@@ -1266,55 +1391,13 @@ pub fn to_yuv444_10(
     cr: &mut [u16],
     alpha: Option<&mut [u16]>,
 ) {
-    let (w, n) = (w.max(1), w.saturating_mul(h));
-    let kg = 1.0 - kr - kb;
-    let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
-    let rgb_at = |i: usize| -> [f32; 3] {
-        match hdr {
-            Some(f) => f.get(i * 3..i * 3 + 3).map_or([0.0; 3], |p| [p[0], p[1], p[2]]),
-            None => rgba.get(i * 4..i * 4 + 3).map_or([0.0; 3], |p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]),
-        }
-    };
-    y.par_chunks_mut(w).zip(cb.par_chunks_mut(w).zip(cr.par_chunks_mut(w))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
-        for (x, (yv, (cbv, crv))) in yr.iter_mut().zip(cbr.iter_mut().zip(crr.iter_mut())).enumerate() {
-            let [r, g, b] = rgb_at(row * w + x);
-            let yy = kr * r + kg * g + kb * b;
-            *yv = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
-            *cbv = (512.0 + 896.0 * (b - yy) / sb).round().clamp(4.0, 1019.0) as u16;
-            *crv = (512.0 + 896.0 * (r - yy) / sr).round().clamp(4.0, 1019.0) as u16;
-        }
-    });
-    if let (Some(a), None) = (alpha, hdr) {
-        for (i, dst) in a.iter_mut().enumerate().take(n) {
-            *dst = rgba.get(i * 4 + 3).map_or(1023, |&v| ((v as u32 * 1023 + 127) / 255) as u16);
-        }
-    }
+    let pic = hdr.map_or(Picture::Rgba8(rgba), Picture::Rgb32F);
+    to_yuv444(pic, w, h, kr, kb, 10, y, cb, cr, alpha)
 }
 
 /// BT.709 limited-range 10-bit 4:2:2 from straight RGBA8 (chroma averaged horizontally).
 pub fn rgba_to_yuv422_10(rgba: &[u8], w: usize, h: usize, y: &mut [u16], cb: &mut [u16], cr: &mut [u16]) {
-    let cw = w.div_ceil(2);
-    debug_assert!(y.len() >= w * h && rgba.len() >= w * h * 4);
-    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
-        let src = &rgba[row * w * 4..(row + 1) * w * 4];
-        let mut us = vec![0f32; w];
-        let mut vs = vec![0f32; w];
-        for x in 0..w {
-            let (r, g, b) = (src[x * 4] as f32 / 255.0, src[x * 4 + 1] as f32 / 255.0, src[x * 4 + 2] as f32 / 255.0);
-            let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            yr[x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
-            us[x] = (b - yy) / 1.8556;
-            vs[x] = (r - yy) / 1.5748;
-        }
-        for cx in 0..cw {
-            let a = cx * 2;
-            let b2 = (a + 1).min(w - 1);
-            let u = (us[a] + us[b2]) * 0.5;
-            let v = (vs[a] + vs[b2]) * 0.5;
-            cbr[cx] = (512.0 + 896.0 * u).round().clamp(4.0, 1019.0) as u16;
-            crr[cx] = (512.0 + 896.0 * v).round().clamp(4.0, 1019.0) as u16;
-        }
-    });
+    to_yuv422(Picture::Rgba8(rgba), w, h, 0.2126, 0.0722, 10, y, cb, cr)
 }
 
 /// The ProRes profile named by [`ExportSettings::prores_profile`].
@@ -1333,28 +1416,7 @@ pub fn prores_profile(name: &str) -> filmcraft_prores::Profile {
 /// Limited-range 10-bit 4:2:2 from encoded R'G'B' floats with matrix (Kr, Kb).
 #[allow(clippy::too_many_arguments)]
 pub fn rgbf_to_yuv422_10(rgb: &[f32], w: usize, h: usize, kr: f32, kb: f32, y: &mut [u16], cb: &mut [u16], cr: &mut [u16]) {
-    let cw = w.div_ceil(2);
-    debug_assert!(rgb.len() >= w * h * 3 && y.len() >= w * h);
-    let kg = 1.0 - kr - kb;
-    let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
-    y.par_chunks_mut(w).zip(cb.par_chunks_mut(cw).zip(cr.par_chunks_mut(cw))).enumerate().for_each(|(row, (yr, (cbr, crr)))| {
-        let src = &rgb[row * w * 3..(row + 1) * w * 3];
-        let mut us = vec![0f32; w];
-        let mut vs = vec![0f32; w];
-        for x in 0..w {
-            let (r, g, b) = (src[x * 3], src[x * 3 + 1], src[x * 3 + 2]);
-            let yy = kr * r + kg * g + kb * b;
-            yr[x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
-            us[x] = (b - yy) / sb;
-            vs[x] = (r - yy) / sr;
-        }
-        for cx in 0..cw {
-            let a = cx * 2;
-            let b2 = (a + 1).min(w - 1);
-            cbr[cx] = (512.0 + 896.0 * (us[a] + us[b2]) * 0.5).round().clamp(4.0, 1019.0) as u16;
-            crr[cx] = (512.0 + 896.0 * (vs[a] + vs[b2]) * 0.5).round().clamp(4.0, 1019.0) as u16;
-        }
-    });
+    to_yuv422(Picture::Rgb32F(rgb), w, h, kr, kb, 10, y, cb, cr)
 }
 
 fn prores_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
@@ -1454,21 +1516,17 @@ impl VideoEncoder for DnxEncoder {
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         let chroma = self.enc.config().chroma();
-        let mut fr = filmcraft_dnx::Frame::new(f.width, f.height, chroma, 10, false);
+        // 12-bit codings get 12-bit input; the encoder rescales 10-bit input to 8 bits
+        let depth = self.enc.config().bit_depth.max(10);
+        let mut fr = filmcraft_dnx::Frame::new(f.width, f.height, chroma, depth, false);
         let (w, h) = (f.width as usize, f.height as usize);
-        match (chroma, f.hdr) {
-            (filmcraft_dnx::ChromaFormat::Yuv444, hdr) => {
-                // Y'CbCr 4:4:4 (every macroblock flagged so), as for ProRes 4444
-                let (kr, kb) = if hdr.is_some() { self.signal.kr_kb() } else { (0.2126, 0.0722) };
-                to_yuv444_10(f.rgba, hdr, w, h, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr, None)
-            }
-            (_, Some(rgb)) => {
-                let (kr, kb) = self.signal.kr_kb();
-                rgbf_to_yuv422_10(rgb, w, h, kr, kb, &mut fr.y, &mut fr.cb, &mut fr.cr)
-            }
-            (_, None) => rgba_to_yuv422_10(f.rgba, w, h, &mut fr.y, &mut fr.cb, &mut fr.cr),
-        }
-        // the encoder rescales 10-bit input to its coded depth
+        let pic = f.picture();
+        let (kr, kb) = if pic.is_hdr() { self.signal.kr_kb() } else { (0.2126, 0.0722) };
+        timed(Stage::Convert, || match chroma {
+            // Y'CbCr 4:4:4 (every macroblock flagged so), as for ProRes 4444
+            filmcraft_dnx::ChromaFormat::Yuv444 => to_yuv444(pic, w, h, kr, kb, depth, &mut fr.y, &mut fr.cb, &mut fr.cr, None),
+            _ => to_yuv422(pic, w, h, kr, kb, depth, &mut fr.y, &mut fr.cb, &mut fr.cr),
+        });
         let data = self.enc.encode(&fr).map_err(|e| ExportError::Encode(e.to_string()))?;
         Ok(vec![EncodedPacket { data, key: true, duration: self.rate.den as u32, composition_offset: 0 }])
     }
@@ -1524,42 +1582,24 @@ impl VideoEncoder for ApvEncoder {
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         let (w, h) = (f.width as usize, f.height as usize);
-        let mut fr = filmcraft_apv::Frame::new(f.width, f.height, self.chroma, 10, self.chroma == filmcraft_apv::ChromaFormat::Yuv4444);
-        let mut y422 = vec![0u16; w * h];
-        let cw = w.div_ceil(2);
-        let mut cb422 = vec![0u16; cw * h];
-        let mut cr422 = vec![0u16; cw * h];
-        match f.hdr {
-            Some(rgb) => {
-                let (kr, kb) = self.signal.kr_kb();
-                rgbf_to_yuv422_10(rgb, w, h, kr, kb, &mut y422, &mut cb422, &mut cr422);
-            }
-            None => rgba_to_yuv422_10(f.rgba, w, h, &mut y422, &mut cb422, &mut cr422),
-        }
-        fr.y = y422;
-        match self.chroma {
+        // the coded depth (10 or 12 bits)
+        let depth = self.enc.config().bit_depth.clamp(10, 16);
+        let mut fr = filmcraft_apv::Frame::new(f.width, f.height, self.chroma, depth, self.chroma == filmcraft_apv::ChromaFormat::Yuv4444);
+        let pic = f.picture();
+        let (kr, kb) = if pic.is_hdr() { self.signal.kr_kb() } else { (0.2126, 0.0722) };
+        timed(Stage::Convert, || match self.chroma {
             filmcraft_apv::ChromaFormat::Monochrome => {
+                let (mut cb, mut cr) = (vec![0u16; w.div_ceil(2) * h], vec![0u16; w.div_ceil(2) * h]);
+                fr.y.resize(w * h, 0);
+                to_yuv422(pic, w, h, kr, kb, depth, &mut fr.y, &mut cb, &mut cr);
                 fr.cb.clear();
                 fr.cr.clear();
             }
-            filmcraft_apv::ChromaFormat::Yuv422 => {
-                fr.cb = cb422;
-                fr.cr = cr422;
-            }
+            filmcraft_apv::ChromaFormat::Yuv422 => to_yuv422(pic, w, h, kr, kb, depth, &mut fr.y, &mut fr.cb, &mut fr.cr),
             filmcraft_apv::ChromaFormat::Yuv444 | filmcraft_apv::ChromaFormat::Yuv4444 => {
-                for row in 0..h {
-                    for x in 0..w {
-                        fr.cb[row * w + x] = cb422[row * cw + x / 2];
-                        fr.cr[row * w + x] = cr422[row * cw + x / 2];
-                    }
-                }
-                if let Some(a) = fr.alpha.as_mut() {
-                    for (i, dst) in a.iter_mut().enumerate() {
-                        *dst = f.rgba.get(i * 4 + 3).map_or(1023, |&v| ((v as u32 * 1023 + 127) / 255) as u16);
-                    }
-                }
+                to_yuv444(pic, w, h, kr, kb, depth, &mut fr.y, &mut fr.cb, &mut fr.cr, fr.alpha.as_deref_mut())
             }
-        }
+        });
         let data = self.enc.encode_raw_au(&fr).map_err(|e| ExportError::Encode(e.to_string()))?;
         Ok(vec![EncodedPacket { data, key: true, duration: self.rate.den as u32, composition_offset: 0 }])
     }
@@ -2040,7 +2080,7 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
                 }
                 let end = (f + batch).min(f1);
                 if let Some(enc) = gif.as_mut() {
-                    let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).0).collect();
+                    let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).into_rgba8()).collect();
                     for (fi, rgba) in (f..end).zip(frames) {
                         let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| ExportError::Encode("frame".into()))?;
                         let delay = image::Delay::from_numer_denom_ms(u32::from(gif_delay_cs(pipe.rate, fi - f0)) * 10, 1);
@@ -2050,15 +2090,14 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
                     let written: Vec<Result<u64>> = (f..end)
                         .into_par_iter()
                         .map(|fi| {
-                            let data = encode_still_with(
-                                settings.format,
-                                pipe.frame(fi, sources).0,
-                                w,
-                                h,
-                                settings.alpha,
-                                settings.quality,
-                                settings.exr_compression,
-                            )?;
+                            let data = match pipe.frame(fi, sources) {
+                                // DPX and OpenEXR keep more than 8 bits
+                                pipeline::Pixels::Rgba16(p) if settings.format == Format::DpxSequence => raster::dpx(&p, w, h)?,
+                                pipeline::Pixels::Rgba16(p) if settings.format == Format::ExrSequence => {
+                                    raster::exr(&p, w, h, settings.alpha, settings.exr_compression)?
+                                }
+                                px => encode_still_with(settings.format, px.into_rgba8(), w, h, settings.alpha, settings.quality, settings.exr_compression)?,
+                            };
                             write_output(settings, &pcm::image_sequence_path(&settings.path, (fi - f0) as u64, count), data)
                         })
                         .collect();

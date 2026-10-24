@@ -247,6 +247,28 @@ pub fn linear_to_srgb_u8(v: f32) -> u8 {
     linear_to_srgb_u8_table()[i]
 }
 
+/// 65536-entry table: linear (0..1, quantised to 16 bits) → sRGB-encoded u16 (0..65535). Fine
+/// enough for 10- and 12-bit outputs: a step of the table moves the encoded value by less than a
+/// 12-bit code even where the curve is steepest (the linear segment near black), where the
+/// 4096-entry 8-bit table would skip 10-bit codes.
+pub fn linear_to_srgb_u16_table() -> &'static [u16] {
+    static T: OnceLock<Vec<u16>> = OnceLock::new();
+    T.get_or_init(|| (0..=65535u32).map(|i| (linear_to_srgb(i as f32 / 65535.0) * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16).collect())
+}
+
+/// Linear (clamped to 0..1; NaN as 0) → sRGB-encoded 16-bit value.
+#[inline]
+pub fn linear_to_srgb_u16(v: f32) -> u16 {
+    let i = (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize;
+    linear_to_srgb_u16_table().get(i).copied().unwrap_or(0)
+}
+
+/// 65536-entry table: sRGB-encoded u16 → linear f32.
+pub fn srgb_u16_to_linear_table() -> &'static [f32] {
+    static T: OnceLock<Vec<f32>> = OnceLock::new();
+    T.get_or_init(|| (0..=65535u32).map(|i| srgb_to_linear(i as f32 / 65535.0)).collect())
+}
+
 /// Rec.709 luma of a linear or encoded RGB triple.
 #[inline]
 pub fn luma709(r: f32, g: f32, b: f32) -> f32 {
@@ -316,6 +338,21 @@ pub fn to_hex(c: [f32; 4]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sixteen_bit_srgb_keeps_every_ten_bit_code() {
+        // every 10-bit sRGB code survives linear → 16-bit sRGB → 10 bits, black included
+        for c in 0..1024u32 {
+            let lin = super::srgb_to_linear(c as f32 / 1023.0);
+            let back = (super::linear_to_srgb_u16(lin) as u32 * 1023 + 32767) / 65535;
+            assert_eq!(back, c, "code {c}");
+        }
+        assert_eq!(super::linear_to_srgb_u16(f32::NAN), 0);
+        assert_eq!(super::linear_to_srgb_u16(2.0), 65535);
+        assert_eq!(super::linear_to_srgb_u16(-1.0), 0);
+        let t = super::srgb_u16_to_linear_table();
+        assert_eq!((t.len(), t[0], t[65535]), (65536, 0.0, 1.0));
+    }
+
     use super::*;
 
     #[test]
