@@ -175,7 +175,7 @@ fn mxf_formats_and_presets() {
     assert_eq!(s.audio_codec(), AudioCodec::Pcm);
     assert!(s.summary(1920, 1080, FrameRate::FPS_24, 48_000, Tick(TICKS_PER_SECOND)).format.contains("MXF OP1a (Apple ProRes)"));
     let names: Vec<String> = builtin_presets().into_iter().filter(|p| p.settings.format.is_mxf()).map(|p| p.name).collect();
-    assert_eq!(names.len(), 4, "{names:?}");
+    assert_eq!(names.len(), 6, "{names:?}");
     assert_eq!(
         opatom_audio_paths("/a/b/clip.mxf", 2).iter().map(std::path::PathBuf::from).collect::<Vec<_>>(),
         vec![std::path::PathBuf::from("/a/b/clip_A1.mxf"), std::path::PathBuf::from("/a/b/clip_A2.mxf")]
