@@ -164,3 +164,42 @@ fn corrupt_streams_never_panic() {
         let _ = decode_frame(&d);
     }
 }
+
+/// FNV-1a over the coded bytes: a compact fingerprint for the golden test below.
+fn fnv1a(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Heavy texture makes 10-bit HQX choose a coarse uniform q, so rate control runs its per-macroblock
+/// refinement (q > 1). That step is computed in parallel with the `threads` feature; its result must be
+/// bit-identical to the serial computation the hashes were recorded with. Update them only when the
+/// encoder's output changes on purpose.
+#[test]
+fn hqx_rate_control_refinement_is_bit_exact() {
+    let (w, h) = (960u32, 540u32);
+    let mut cfg = EncoderConfig::new(Profile::Hqx, w, h);
+    cfg.bit_depth = 10;
+    let mut enc = Encoder::with_config(cfg).unwrap();
+    let mut hashes = Vec::new();
+    for seed in 0..2u32 {
+        let mut f = picture(w, h, ChromaFormat::Yuv422, 10, seed);
+        let noise = |x: u32, y: u32, k: u32| (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503) ^ (seed + k).wrapping_mul(97)).wrapping_mul(2246822519) >> 22;
+        for y in 0..h {
+            for x in 0..w {
+                f.y[(y * w + x) as usize] = (64 + noise(x, y, 0) % 877) as u16;
+            }
+        }
+        let cw = f.chroma_width();
+        for y in 0..h {
+            for x in 0..cw {
+                f.cb[(y * cw + x) as usize] = (64 + noise(x, y, 1) % 897) as u16;
+                f.cr[(y * cw + x) as usize] = (64 + noise(x, y, 2) % 897) as u16;
+            }
+        }
+        let data = enc.encode(&f).unwrap();
+        assert_eq!(data.len() as u32, enc.frame_size());
+        decode_frame(&data).unwrap();
+        hashes.push(fnv1a(&data));
+    }
+    assert_eq!(hashes, [0xbda6_ab28_0eeb_6218, 0x1ac1_5ea9_b10c_a73e]);
+}

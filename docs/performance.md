@@ -591,6 +591,26 @@ The copy is the source bit for bit: ffmpeg's framemd5 of the output equals the s
 CPU and GPU runs write the same file. A frame that changed (an effect, Motion, a transition, a
 clip over it) is rendered and encoded as before, so the gain follows the share of untouched frames.
 
+## Results (DNxHR HQX encoder: rate-control refinement in parallel, before → after)
+
+The DNx encoder's rate control first finds the smallest uniform quantiser that fits the frame
+budget (in parallel scan lines), then lets each macroblock take one finer step while the budget
+allows. That refinement measured every macroblock at q and at q − 1 in three serial passes over
+the frame. It only runs when the uniform q is above 1, which is almost always the case for 10-bit
+HQX on camera footage (HQ and 444 usually settle at q = 1 or are cheaper), so HQX exports kept
+about 5 of 16 cores busy. Both measurements now come from one parallel pass, and the scan-line
+sums are taken from it. 100 frames of 3840×2160 25 fps ProRes 422 source, exported headless with
+`filmcraft-cli`, release build, Linux, AMD Ryzen 7 7800X3D (16 threads), RTX 4090, 2026-10-24:
+
+| export | before | after |
+|---|---:|---:|
+| DNxHR HQX 10-bit | 5.9 fps, 5.1 cores busy | **14.9 fps, 12.3 cores busy** |
+| DNxHR HQ / 444 (unchanged) | ~11.5 cores busy | ~11.5 cores busy |
+
+The output is bit-identical: ffmpeg's framemd5 of every frame equals the earlier export's, and
+`hqx_rate_control_refinement_is_bit_exact` (`crates/dnx/tests/roundtrip.rs`) pins the coded bytes
+of a frame that takes the refinement path, with and without the `threads` feature.
+
 ## Results (#847: AV1 in-loop filters in parallel row bands, before → after)
 
 The AV1 decoder ran deblocking, CDEF and loop restoration on one thread per frame. A single-tile

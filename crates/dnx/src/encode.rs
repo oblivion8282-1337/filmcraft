@@ -366,10 +366,15 @@ impl Encoder {
         let mut qs = vec![q; nmb];
         if q > 1 {
             // refine: one finer step per macroblock while the budget allows
-            let mut row_bits: Vec<u64> = (0..prep.ns).map(|s| (0..prep.nw).map(|m| mb_bits(s * prep.nw + m, q) as u64).sum()).collect();
+            #[cfg(feature = "threads")]
+            let (cur, finer): (Vec<u32>, Vec<u32>) = {
+                use rayon::prelude::*;
+                (0..nmb).into_par_iter().map(|mb| (mb_bits(mb, q), mb_bits(mb, q - 1))).unzip()
+            };
+            #[cfg(not(feature = "threads"))]
+            let (cur, finer): (Vec<u32>, Vec<u32>) = (0..nmb).map(|mb| (mb_bits(mb, q), mb_bits(mb, q - 1))).unzip();
+            let mut row_bits: Vec<u64> = (0..prep.ns).map(|s| (0..prep.nw).map(|m| cur[s * prep.nw + m] as u64).sum()).collect();
             let mut total: u64 = row_bits.iter().map(|&b| row_bytes(b) * 8).sum();
-            let cur: Vec<u32> = (0..nmb).map(|mb| mb_bits(mb, q)).collect();
-            let finer: Vec<u32> = (0..nmb).map(|mb| mb_bits(mb, q - 1)).collect();
             // spread the refinement evenly over the frame: visit macroblocks in a strided order
             let stride = 7919usize;
             let mut idx = 0usize;
