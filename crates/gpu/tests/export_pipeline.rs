@@ -543,30 +543,11 @@ impl Drop for PairMode {
     }
 }
 
-/// `filmcraft_export`'s post-render settings as `filmcraft-gpu` takes them (as the apps convert).
-fn post_config(p: &filmcraft_export::PostSettings) -> filmcraft_gpu::PostConfig {
-    filmcraft_gpu::PostConfig {
-        rendered: p.rendered,
-        width: p.width,
-        height: p.height,
-        content: p.content,
-        offset: p.offset,
-        limiter: p.limiter,
-        hdr: p.hdr,
-        floats: p.floats,
-        alpha: p.alpha,
-        kr: p.planes.kr,
-        kb: p.planes.kb,
-        chroma_422: p.planes.chroma_422,
-        bit_depth: p.planes.bit_depth,
-        overlays: p.image_overlay || p.name_overlay || p.timecode_overlay,
-    }
-}
+/// A renderer of the shipped pair whose frames are read back (mode 1): its resident methods are
+/// the trait's defaults.
+struct ReadBack(Box<dyn FrameRenderer>);
 
-/// The renderer the pair makes: the app's wrapper with the resident path.
-struct PairedRenderer(filmcraft_gpu::ExportRenderer);
-
-impl FrameRenderer for PairedRenderer {
+impl FrameRenderer for ReadBack {
     fn render(
         &mut self,
         project: &filmcraft_project::Project,
@@ -581,36 +562,22 @@ impl FrameRenderer for PairedRenderer {
     fn caps(&self) -> filmcraft_render::plan::DeviceCaps {
         self.0.caps()
     }
-
-    fn resident_supported(&self, post: &filmcraft_export::PostSettings) -> bool {
-        PAIR_MODE.load(std::sync::atomic::Ordering::SeqCst) == 2 && self.0.resident_supported(&post_config(post))
-    }
-
-    fn render_resident(
-        &mut self,
-        project: &filmcraft_project::Project,
-        seq: filmcraft_project::ItemId,
-        t: filmcraft_time::Tick,
-        opts: filmcraft_render::RenderOptions,
-        sources: &dyn filmcraft_render::SourceProvider,
-        post: &filmcraft_export::PostSettings,
-    ) -> Option<filmcraft_export::ResidentFrame> {
-        self.0.render_resident(project, seq, t, opts, sources, &post_config(post)).map(|p| Box::new(p) as filmcraft_export::ResidentFrame)
-    }
 }
 
-/// The pair the apps register: renderer and encoders on one device.
-struct Pair(filmcraft_gpu::ExportDevice);
+/// The pair the apps register (`filmcraft_gpu_export::gpu_pair`), its renderers wrapped in
+/// [`ReadBack`] in mode 1.
+struct Pair(Box<dyn filmcraft_export::GpuPair>);
 
 impl filmcraft_export::GpuPair for Pair {
     fn renderer(&self) -> Option<Box<dyn FrameRenderer>> {
-        self.0.renderer().map(|r| Box::new(PairedRenderer(r)) as Box<dyn FrameRenderer>)
+        let r = self.0.renderer()?;
+        Some(if PAIR_MODE.load(std::sync::atomic::Ordering::SeqCst) == 2 { r } else { Box::new(ReadBack(r)) })
     }
     fn prores_backend(&self) -> Option<Box<dyn filmcraft_prores::SliceBackend>> {
-        self.0.prores_encoder().map(|e| Box::new(e) as _)
+        self.0.prores_backend()
     }
     fn dnx_backend(&self) -> Option<Box<dyn filmcraft_dnx::MacroblockBackend>> {
-        self.0.dnx_encoder().map(|e| Box::new(e) as _)
+        self.0.dnx_backend()
     }
 }
 
@@ -619,7 +586,7 @@ fn register_pair() {
         if PAIR_MODE.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             return None;
         }
-        filmcraft_gpu::ExportDevice::shared().map(|d| Box::new(Pair(d)) as Box<dyn filmcraft_export::GpuPair>)
+        filmcraft_gpu_export::gpu_pair().map(|p| Box::new(Pair(p)) as Box<dyn filmcraft_export::GpuPair>)
     });
 }
 
@@ -799,6 +766,12 @@ fn an_unsupported_setting_keeps_the_read_back_path() {
     assert_eq!(after.resident_fallbacks, before.resident_fallbacks, "and none was tried there");
     assert!(after.encoded >= before.encoded + 3, "the frames are still encoded on the GPU");
     assert_eq!(decoded(&r).len(), 3);
+    // the control: the same export without the overlay keeps every frame on the GPU
+    s.effects.timecode_overlay.enabled = false;
+    let before = filmcraft_export::gpu_render_stats();
+    resident_export(&media, "timecode-overlay-control", &s);
+    let after = filmcraft_export::gpu_render_stats();
+    assert_eq!((after.resident - before.resident, after.resident_fallbacks - before.resident_fallbacks), (3, 0), "without the overlay: {after:?}");
 }
 
 /// Odd and tiny frames stay on the GPU and match the read-back export too: the export rounds a
