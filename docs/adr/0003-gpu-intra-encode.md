@@ -7,11 +7,11 @@
 
 ## Context
 
-ProRes and DNx exports spend their time in the encoder. Measured through the running app
-(2026-10-24, RTX 4090, Ryzen 7 7800X3D, 100 frames of 3840x2160 25p camera footage, smart
-rendering off, `perf.stats` -> `export.stages`), ProRes 422 HQ took 8.8 to 10.3 s and DNxHR HQ 4.7 to
-6.5 s, with the encode stage serial and `waitMs` 0: the encoder, not the renderer, was the
-bottleneck. Both codecs are built for parallel work. ProRes slices (about 4000 per UHD frame) are
+ProRes and DNx exports spend their time in the encoder. Measured before this work, on 2026-10-24
+(RTX 4090, Ryzen 7 7800X3D, 100 frames of 3840x2160 25p real camera footage, smart rendering off,
+`perf.stats` -> `export.stages`): ProRes 422 HQ took 10.3 s with CPU rendering and 8.8 s with GPU
+rendering; DNxHR HQ took 6.5 s and 4.7 s. The encode stage was serial (9.5 / 7.9 s for ProRes, 5.6 /
+3.8 s for DNxHR) and `waitMs` was 0: the encoder, not the renderer, was the bottleneck. Both codecs are built for parallel work. ProRes slices (about 4000 per UHD frame) are
 coded independently. A DNx scan line is one entropy run, but when encoding every coefficient and
 every DC predictor is known before a bit is written, so even DNx's bit layout can be computed in
 parallel. No vendor hardware encodes either codec outside Apple silicon (NVENC, AMF and Quick Sync
@@ -25,8 +25,11 @@ so the CPU path needed the same fix first.
 
 FilmCraft gets GPU encoders for ProRes and DNx in WGSL compute shaders, a second implementation of
 the same bitstream writers, chosen per export and per frame, with the CPU encoders as reference
-and fallback. The project owner asked for everything on the GPU (colour, alpha, rate control,
-interlaced, and the frame staying on the GPU); all of it is implemented.
+and fallback. The goal is everything on the GPU: colour, alpha, rate control, interlaced, and the
+frame staying on the GPU. All of it is implemented. In this ADR, *Step 1* means GPU encoders fed
+Y'CbCr planes read back from the renderer, and *Step 2* means the rendered frame stays on the GPU
+into the encoder. The goals were: encoding a UHD frame in at most 10 ms, a 100-frame UHD ProRes HQ
+export in at most 4 s with Step 1 and at most 2.5 s with Step 2.
 
 ### A backend seam in the codec crates
 
@@ -52,7 +55,7 @@ error scope.
 
 ### Byte-identical to the CPU, not just close
 
-The ADR drafted for this work only required a decoded PSNR within 0.1 dB of the CPU encoder. The
+The required bar is a decoded PSNR within 0.1 dB of the CPU encoder. The
 implementation reaches byte identity, which makes every test an equality. Two tricks make it so:
 
 - **`mul()`**: every product in the DCT and in quantisation goes through
@@ -97,9 +100,9 @@ export is not part of this work.
 
 For SDR exports `EncoderFrame` carries 16-bit R'G'B'A floats after the output transfer function
 (the representation the HDR path uses) and the ProRes / DNx / APV encoders convert from it; 8-bit
-outputs keep RGBA8. This is taken over from open PR #3928 (JonRC), cherry-picked with its
-authorship; if the PR merges first this step shrinks to a rebase. The ramp keeps 64 of 64 levels
-through ProRes 422 HQ and DNxHR HQX.
+outputs keep RGBA8. This is based on PR #3928 (JonRC), whose commits keep their authorship. A 10-bit
+ramp with 64 luma levels used to come out of a ProRes 422 HQ export with 19; it now keeps 64 of 64
+levels through ProRes 422 HQ and DNxHR HQX.
 
 ### Registration and selection
 
@@ -177,13 +180,12 @@ Measured on the reference machine (RTX 4090 / Vulkan, Ryzen 7 7800X3D), release 
   | DNxHR HQX | 9.14 s | 4.06 s | **1.05 s** |
 
   Resident exports are encode-bound: the stage is the GPU encoder's own read-back of the coded
-  frame plus the CPU's frame assembly. The goals drafted for this work (encode at most 10 ms per
-  frame, Step 1 at most 4 s, Step 2 at most 2.5 s for ProRes HQ) are met except the per-frame
-  encode of ProRes HQ, which sits at about 10.6 ms.
+  frame plus the CPU's frame assembly. The goals above are met (3.83 s with Step 1, 0.99 s with Step 2)
+  except the per-frame encode of ProRes HQ, which sits at about 10.6 ms.
 - **GPU rate control is not free for DNx.** Over GPU-measured bits with the CPU algorithm on the
   CPU, DNxHR HQ took about 7.5 ms per 4K frame; with the search on the GPU it takes about 8.2 ms
   (ProRes: within noise). The rounds are sequential single-quantiser measurements. Accepted
-  because the owner asked for rate control on the GPU, and recorded here. An idea not done: measure
+  because rate control on the GPU is a stated requirement, and recorded here. An idea not done: measure
   both outcomes of the next question per round, which would halve the live rounds.
 - Two encoders per codec to keep in step. The byte-identity tests make drift visible at once.
 - A GPU that is busy rendering is busy encoding too; on a weak GPU `auto` may be slower than the
@@ -191,7 +193,7 @@ Measured on the reference machine (RTX 4090 / Vulkan, Ryzen 7 7800X3D), release 
 
 ### Known gaps
 
-- Tested only on NVIDIA (RTX 4090, Vulkan). AMD, Intel and Apple GPUs need the owner's machines;
+- Tested only on NVIDIA (RTX 4090, Vulkan). AMD, Intel and Apple GPUs are untested;
   another GPU's `pow` may differ by one code in the sRGB curve, so the post-pass test allows one
   code on at most 2 % of samples (0 differed on the 4090).
 - HDR exports and exports with overlays do not take the resident path.
@@ -201,5 +203,7 @@ Measured on the reference machine (RTX 4090 / Vulkan, Ryzen 7 7800X3D), release 
   write.
 - ProRes 4444 / DNx lossless alpha from an 8-bit source goes 8 -> 10 -> 8 bits and can differ from
   the source by one code.
+- Interlaced smart render is not part of this work: smart render itself is not on this branch, and
+  open PR #3074 covers smart rendering.
 - VideoToolbox's ProRes engines on Apple silicon stay a possible later addition behind the same
   seam.
