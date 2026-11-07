@@ -256,90 +256,11 @@ fn format_for(path: &str) -> Option<&'static str> {
 
 /// OS hardware video decoders (VideoToolbox on macOS, Media Foundation on Windows) in front of our
 /// own, as in the desktop app. Also what `mcp` and the headless commands decode with.
-/// The GPU export frame renderer (filmcraft-gpu's off-screen compositor behind filmcraft-export's
-/// frame-renderer hook): exports with GPU rendering Auto composite on the GPU and fall back to the
-/// CPU reference renderer wherever it cannot.
-struct GpuFrameRenderer(filmcraft_gpu::ExportRenderer);
-
-impl filmcraft_export::FrameRenderer for GpuFrameRenderer {
-    fn render(
-        &mut self,
-        project: &filmcraft_project::Project,
-        seq: filmcraft_project::ItemId,
-        t: filmcraft_time::Tick,
-        opts: filmcraft_render::RenderOptions,
-        sources: &dyn filmcraft_render::SourceProvider,
-    ) -> Option<filmcraft_render::Image> {
-        self.0.render(project, seq, t, opts, sources)
-    }
-
-    fn caps(&self) -> filmcraft_render::plan::DeviceCaps {
-        self.0.caps()
-    }
-
-    fn resident_supported(&self, post: &filmcraft_export::PostSettings) -> bool {
-        self.0.resident_supported(&post_config(post))
-    }
-
-    fn render_resident(
-        &mut self,
-        project: &filmcraft_project::Project,
-        seq: filmcraft_project::ItemId,
-        t: filmcraft_time::Tick,
-        opts: filmcraft_render::RenderOptions,
-        sources: &dyn filmcraft_render::SourceProvider,
-        post: &filmcraft_export::PostSettings,
-    ) -> Option<filmcraft_export::ResidentFrame> {
-        self.0.render_resident(project, seq, t, opts, sources, &post_config(post)).map(|p| Box::new(p) as filmcraft_export::ResidentFrame)
-    }
-}
-
-/// The export's post-render settings as filmcraft-gpu's post pass takes them.
-fn post_config(p: &filmcraft_export::PostSettings) -> filmcraft_gpu::PostConfig {
-    filmcraft_gpu::PostConfig {
-        rendered: p.rendered,
-        width: p.width,
-        height: p.height,
-        content: p.content,
-        offset: p.offset,
-        limiter: p.limiter,
-        hdr: p.hdr,
-        floats: p.floats,
-        alpha: p.alpha,
-        kr: p.planes.kr,
-        kb: p.planes.kb,
-        chroma_422: p.planes.chroma_422,
-        bit_depth: p.planes.bit_depth,
-        overlays: p.image_overlay || p.name_overlay || p.timecode_overlay,
-    }
-}
-
-/// Export renderers and ProRes / DNxHR encoders on one device (filmcraft-gpu's `ExportDevice`):
-/// with GPU rendering and Hardware encoding both Auto, a rendered frame stays on the GPU into the
-/// encoder (ADR 0004 Step 2).
-struct GpuPair(filmcraft_gpu::ExportDevice);
-
-impl filmcraft_export::GpuPair for GpuPair {
-    fn renderer(&self) -> Option<Box<dyn filmcraft_export::FrameRenderer>> {
-        self.0.renderer().map(|r| Box::new(GpuFrameRenderer(r)) as Box<dyn filmcraft_export::FrameRenderer>)
-    }
-    fn prores_backend(&self) -> Option<Box<dyn filmcraft_prores::SliceBackend>> {
-        self.0.prores_encoder().map(|e| Box::new(e) as _)
-    }
-    fn dnx_backend(&self) -> Option<Box<dyn filmcraft_dnx::MacroblockBackend>> {
-        self.0.dnx_encoder().map(|e| Box::new(e) as _)
-    }
-}
-
+/// GPU export: filmcraft-gpu's frame renderer and ProRes / DNxHR encoders behind filmcraft-export's
+/// hooks, paired on one device so a rendered frame stays on the GPU into the encoder; exports fall
+/// back to the CPU renderer and encoders wherever the GPU cannot.
 fn register_gpu_frame_renderer() {
-    filmcraft_export::register_frame_renderer(|| {
-        filmcraft_gpu::ExportRenderer::new().map(|r| Box::new(GpuFrameRenderer(r)) as Box<dyn filmcraft_export::FrameRenderer>)
-    });
-    // Hardware encoding: Auto codes ProRes and DNxHR on the same device (the CPU encodes what it declines)
-    filmcraft_export::register_prores_backend(|| filmcraft_gpu::ProResGpuEncoder::new().map(|e| Box::new(e) as _));
-    filmcraft_export::register_dnx_backend(|| filmcraft_gpu::DnxGpuEncoder::new().map(|e| Box::new(e) as _));
-    // tried first: renderers and encoders paired on one device keep the frame on the GPU
-    filmcraft_export::register_gpu_pair(|| filmcraft_gpu::ExportDevice::shared().map(|d| Box::new(GpuPair(d)) as Box<dyn filmcraft_export::GpuPair>));
+    filmcraft_gpu_export::register();
 }
 
 fn register_hardware_decoders() -> filmcraft_platform::Availability {

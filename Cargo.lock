@@ -1881,13 +1881,12 @@ dependencies = [
  "craft-update",
  "eframe",
  "egui",
- "filmcraft-dnx",
  "filmcraft-engine",
  "filmcraft-export",
  "filmcraft-gpu",
+ "filmcraft-gpu-export",
  "filmcraft-platform",
  "filmcraft-project",
- "filmcraft-prores",
  "filmcraft-render",
  "filmcraft-time",
  "filmcraft-ui-egui",
@@ -2008,17 +2007,16 @@ version = "0.17.0"
 dependencies = [
  "filmcraft-automation",
  "filmcraft-codecs",
- "filmcraft-dnx",
  "filmcraft-engine",
  "filmcraft-export",
  "filmcraft-gpu",
+ "filmcraft-gpu-export",
  "filmcraft-media",
  "filmcraft-mpegts",
  "filmcraft-mxf",
  "filmcraft-ogg",
  "filmcraft-platform",
  "filmcraft-project",
- "filmcraft-prores",
  "filmcraft-render",
  "filmcraft-testkit",
  "filmcraft-time",
@@ -2242,6 +2240,7 @@ dependencies = [
  "filmcraft-export",
  "filmcraft-frame",
  "filmcraft-geom",
+ "filmcraft-gpu-export",
  "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-project",
@@ -2253,6 +2252,20 @@ dependencies = [
  "log",
  "pollster 1.0.1",
  "rayon",
+ "wgpu",
+]
+
+[[package]]
+name = "filmcraft-gpu-export"
+version = "0.17.0"
+dependencies = [
+ "filmcraft-dnx",
+ "filmcraft-export",
+ "filmcraft-gpu",
+ "filmcraft-project",
+ "filmcraft-prores",
+ "filmcraft-render",
+ "filmcraft-time",
  "wgpu",
 ]
 
