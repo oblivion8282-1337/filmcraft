@@ -176,6 +176,10 @@ impl Encoder {
         let (qs, q) = backend_quantisers(backend, self.last_q, nw, ns, budget_bits, &mut measured)?;
         // the bits of every macroblock at the quantiser it will be written at
         let want = bits_at_qs(backend, &mut measured, &qs)?;
+        if padded_frame_bits(&want, nw) > budget_bits {
+            // the search found no quantiser that fits: the CPU reports it
+            return None;
+        }
         let written = backend.write(&qs)?;
         let alpha = self.cfg.alpha;
         let ycbcr444 = self.cfg.chroma() == ChromaFormat::Yuv444 && !f.rgb;
@@ -370,7 +374,10 @@ pub trait MacroblockBackend: Send {
     /// The rate control (the quantiser of every macroblock for a frame of `budget` bits, given
     /// the previous frame's uniform quantiser as `hint`), run where the bits are: one value in
     /// `1..=2047` per macroblock. `None`: the encoder runs its search over `bits`. An answer is
-    /// used only when it is in range and the frame then fits `budget`.
+    /// used only when it is in range, the frame then fits `budget`, and it uses at most 16
+    /// distinct values (each distinct value costs the encoder one `bits` call to check the
+    /// fit; the CPU algorithm and its GPU port use at most 2). Any other answer is ignored,
+    /// however well it would fit, and the encoder runs its search.
     fn choose(&mut self, hint: u32, budget: u64) -> Option<Vec<u32>> {
         let _ = (hint, budget);
         None
@@ -1202,7 +1209,16 @@ mod backend_tests {
         let nmb = 8 * 4;
         let f = test_frame(&cfg, 13);
         let cpu = cpu_frame(&cfg, &f);
-        let many: Vec<u32> = (0..nmb as u32).map(|i| 1 + i).collect();
+        // 32 distinct, fairly coarse levels: this answer fits the budget (checked below), so
+        // only the cap on distinct levels can make the encoder ignore it
+        let many: Vec<u32> = (0..nmb as u32).map(|i| 60 + i).collect();
+        {
+            let mut probe = CpuMbBackend::default();
+            assert!(probe.load(&cfg, &f));
+            let want = bits_at_qs(&mut probe, &mut Vec::new(), &many).unwrap();
+            let budget = (Encoder::with_config(cfg.clone()).unwrap().frame_size() as u64 - header::header_size_for(h) as u64 - 4) * 8;
+            assert!(padded_frame_bits(&want, 8) <= budget, "the many-levels answer must fit without the cap");
+        }
         let cases = [
             ("q = 0", Choose::Fixed(vec![0; nmb])),
             ("q = 2048", Choose::Fixed(vec![2048; nmb])),
