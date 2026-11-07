@@ -303,7 +303,7 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   (`filmcraft_export::register_hdr_probe`, `hdr_available`; NVENC with 10-bit support), otherwise it is
   tone-mapped to SDR as on macOS: `register()` hands `platform::nvenc::hevc_available` to
   `filmcraft_export::register_format_probe`, so the H.265 format exists where an HEVC encoder does,
-  and choosing it is the opt-in (the Hardware encoding toggle governs H.264 only). With no software
+  and choosing it is the opt-in (the Hardware encoding toggle governs H.264 and the GPU ProRes / DNx encoders, not H.265). With no software
   H.265 encoder, what NVENC declines is counted and ends the export with an error that says why.
   On macOS, `platform::hardware_encode` (VideoToolbox H.264, opt-in the same way, and H.265) is
   registered likewise. It too takes the RGBA pictures as they are (`32BGRA` buffers tagged BT.709)
