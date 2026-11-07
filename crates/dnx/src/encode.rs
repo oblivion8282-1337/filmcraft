@@ -622,6 +622,53 @@ pub fn rate_control_for_tests(
     rate_control(hint, nw, ns, budget_bits, mb_bits_at)
 }
 
+/// This crate's own CPU functions behind [`MacroblockBackend`]: what a correct backend must
+/// give, for tests of the seam in other crates (a stand-in for a device that works).
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ReferenceBackend {
+    enc: Option<Encoder>,
+    prep: Option<Prepared>,
+    rgb: bool,
+}
+
+impl MacroblockBackend for ReferenceBackend {
+    fn load(&mut self, cfg: &EncoderConfig, frame: &Frame) -> bool {
+        let Ok(enc) = Encoder::with_config(cfg.clone()) else { return false };
+        self.prep = Some(enc.prepare(frame));
+        self.enc = Some(enc);
+        self.rgb = frame.rgb;
+        true
+    }
+    fn bits(&mut self, q: u32) -> Option<Vec<u32>> {
+        let (enc, prep) = (self.enc.as_ref()?, self.prep.as_ref()?);
+        Some(Coder::new(&enc.cfg, enc.info, prep, self.rgb).all_bits(q))
+    }
+    fn write(&mut self, qs: &[u32]) -> Option<Vec<(Vec<u8>, u32)>> {
+        let (enc, prep) = (self.enc.as_ref()?, self.prep.as_ref()?);
+        let coder = Coder::new(&enc.cfg, enc.info, prep, self.rgb);
+        let mut out = Vec::new();
+        for s in 0..prep.ns {
+            let mut pred = [0i32; 4];
+            for mb in 0..prep.nw {
+                let m = s * prep.nw + mb;
+                let mut w = Writer::new();
+                coder.put_colour(&mut w, m, *qs.get(m)?, &mut pred);
+                out.push(w.finish_bits());
+            }
+            if enc.cfg.alpha.is_some() {
+                for mb in 0..prep.nw {
+                    let m = s * prep.nw + mb;
+                    let mut w = Writer::new();
+                    coder.put_alpha(&mut w, m, *qs.get(m)?, &mut pred);
+                    out.push(w.finish_bits());
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
 /// The entropy coding of macroblocks: bits and bit strings from the transformed blocks.
 struct Coder<'a> {
     prep: &'a Prepared,

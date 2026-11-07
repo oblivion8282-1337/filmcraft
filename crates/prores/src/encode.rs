@@ -692,6 +692,32 @@ pub fn rate_control_for_tests(budget: u64, limits: &[u64], hint: u8, bits_at: &m
     choose_quantisers(budget, limits, hint, bits_at)
 }
 
+/// This crate's own CPU functions behind [`SliceBackend`]: what a correct backend must give,
+/// for tests of the seam in other crates (a stand-in for a device that works).
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ReferenceBackend {
+    slices: Vec<SliceData>,
+}
+
+impl SliceBackend for ReferenceBackend {
+    fn load(&mut self, cfg: &EncoderConfig, frame: &Frame, jobs: &[SliceJob]) -> bool {
+        let alpha = cfg.encode_alpha && cfg.profile.chroma() == ChromaFormat::Yuv444 && frame.alpha.is_some();
+        let src = Source::new(cfg, frame, alpha);
+        self.slices = jobs.iter().map(|j| prepare_slice(&src, j.mb_x as usize, j.mb_y as usize, j.mbs as usize)).collect();
+        true
+    }
+    fn bits(&mut self, q: u8) -> Option<Vec<[u32; 3]>> {
+        Some(self.slices.iter().map(|sd| slice_comp_bits(sd, q).map(|b| b as u32)).collect())
+    }
+    fn write(&mut self, qs: &[u8]) -> Option<Vec<[Vec<u8>; 3]>> {
+        Some(self.slices.iter().zip(qs).map(|(sd, &q)| write_components(sd, q)).collect())
+    }
+    fn alpha(&mut self) -> Option<Vec<Vec<u8>>> {
+        self.slices.iter().map(|sd| sd.alpha.clone()).collect()
+    }
+}
+
 /// The Y, Cb and Cr payloads of a slice at quantiser `q`.
 fn write_components(sd: &SliceData, q: u8) -> [Vec<u8>; 3] {
     let mut lv = [Vec::new(), Vec::new(), Vec::new()];
