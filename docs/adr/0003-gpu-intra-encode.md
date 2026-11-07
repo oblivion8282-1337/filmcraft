@@ -38,10 +38,18 @@ rate control, slice and macroblock headers, frame assembly. Each gets a narrow b
 the per-block, parallel work: `filmcraft_prores::SliceBackend` and `filmcraft_dnx::MacroblockBackend`
 (`load`, `bits` at a quantiser, `write`, `alpha`, `choose`). `Encoder::encode_with(frame, backend)`
 calls the backend instead of its own functions and encodes the frame itself when the backend
-declines, fails or answers inconsistently (counts that do not match, byte lengths that do not
-match the bits it measured, a frame that does not parse). `Encoder::encode_resident` does the
-same for a frame the backend already holds. `ReferenceBackend` (a CPU test double, `doc(hidden)`)
-drives the seam in tests.
+declines, fails or answers inconsistently: counts that do not match, byte lengths that do not
+match the bits it measured, quantisers out of range, DNx macroblock headers that disagree with
+their quantiser. The encoder checks these parts before it assembles the frame; it does not parse
+the assembled frame. `Encoder::encode_resident` does the same for a frame the backend already holds. `ReferenceBackend` (a CPU test double, behind
+the codec crates' `test-support` feature, which only other crates' dev-dependencies enable) drives
+the seam in tests.
+
+A backend's own rate control (`choose`) is checked differently by the two encoders. ProRes takes
+any answer in range: its frames have no fixed size, so an answer that overshoots the budget only
+makes a larger frame, and each slice's 16-bit size fields are still checked when it is written.
+DNxHR re-measures the answer and keeps it only when the frame fits the budget: a DNxHR frame has
+the profile's constant size, and one that does not fit cannot be written.
 
 ### `filmcraft-gpu::intra_enc`
 
@@ -56,7 +64,9 @@ error scope.
 ### Byte-identical to the CPU, not just close
 
 The required bar is a decoded PSNR within 0.1 dB of the CPU encoder. The
-implementation reaches byte identity, which makes every test an equality. Two tricks make it so:
+implementation reaches byte identity: the byte-identity tests assert that at least 90 % of the
+frames are identical (leaving room for other drivers), and on the reference GPU 100 % are. Two
+tricks make it so:
 
 - **`mul()`**: every product in the DCT and in quantisation goes through
   `bitcast(bitcast(a*b) ^ zero)`, `zero` being a uniform that is always 0. The driver cannot see
@@ -93,14 +103,14 @@ export has not been verified against Avid's decoder; ffmpeg and our decoder read
 first first, with one rate control over both; the GPU codes both pictures from the same planes.
 In MOV the `fiel` atom carries 9 (TFF) or 14 (BFF), as Apple writes it. Caveat: ffprobe maps
 those to container-level `field_order` `tb` / `bt`; the coded order is read from the decoder
-(`top_field_first` per frame). MXF (DNx) writes the SeparateFields descriptor. Interlaced DNxHD
-export is not part of this work.
+(`top_field_first` per frame). Interlaced ProRes in MXF writes the SeparateFields descriptor.
+Interlaced DNxHD export is not part of this work.
 
-### 16-bit hand-off
+### Float hand-off
 
-For SDR exports `EncoderFrame` carries 16-bit R'G'B'A floats after the output transfer function
-(the representation the HDR path uses) and the ProRes / DNx / APV encoders convert from it; 8-bit
-outputs keep RGBA8. This is based on PR #3928 (JonRC), whose commits keep their authorship. A 10-bit
+For SDR exports `EncoderFrame` carries f32 R'G'B' after the output transfer function (the
+representation the HDR path uses), with alpha, when the export keeps it, from the RGBA8 picture;
+the ProRes / DNx / APV encoders convert from it; 8-bit outputs keep RGBA8. This is based on PR #3928 (JonRC), whose commits keep their authorship. A 10-bit
 ramp with 64 luma levels used to come out of a ProRes 422 HQ export with 19; it now keeps 64 of 64
 levels through ProRes 422 HQ and DNxHR HQX.
 
@@ -155,9 +165,10 @@ only for the rest of the export. The export then completes on the CPU. A restart
   160 progressive and 274 of 274 interlaced ProRes frames and 135 of 135 DNx frames are
   byte-identical to the CPU encoder, across profiles, depths, chroma formats, alpha, odd sizes
   (1x1, 17x13, 1919x1079) and 1 to 8 macroblocks per slice.
-- **Per frame:** a frame whose backend output is inconsistent, does not parse, exceeds a limit, or
-  whose backend failed or panicked is encoded again on the CPU. Every frame is intra, so a file
-  may mix both.
+- **Per frame:** a frame whose backend output is inconsistent (lengths, quantisers, DNx
+  macroblock headers: the encoder checks these, it does not parse the assembled frame), exceeds a
+  limit, or whose backend failed or panicked is encoded again on the CPU. Every frame is intra,
+  so a file may mix both.
 - **Up front:** no compute support, a frame above the device's storage or texture limits (8K
   DNxHR 444, 16K), a pipeline that fails validation or an unsupported configuration: the CPU
   encoder takes the export or the frame.
