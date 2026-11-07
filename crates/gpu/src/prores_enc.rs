@@ -22,8 +22,9 @@ use crate::intra_enc::{Fail, Gpu, fits, le_bytes, max_binding, own_device, pack_
 
 /// Rounds of measurement the rate control runs on the GPU: the most distinct quantisers the CPU's
 /// `choose_quantisers` measures before its size guard. The search from a hint at 1 to a frame that
-/// first fits at 130 measures 16 (the hint, eight widening steps, seven bisection steps; the
-/// refinement's finer quantiser is among them, elsewhere it can be one more);
+/// first fits at 130 measures 16 (the hint, eight widening steps, seven bisection steps). The
+/// refinement adds none: it reads the finer quantiser only when the uniform one fits, and then the
+/// finer one is the bracket's `lo`, already measured (the shader's `PH_FINER` stays as a guard);
 /// `the_rate_control_rounds_cover_every_cpu_search` checks every hint against every place the frame
 /// can start to fit. (The size guard raises each slice on its own, in one pass after the rounds.)
 pub(crate) const RC_ROUNDS: usize = 16;

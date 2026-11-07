@@ -223,14 +223,19 @@ fn gpu_rate_control_picks_the_cpus_quantisers() {
         let (_, right) = cpu_choice(&mut enc, budget, &limits, 4).unwrap();
         // a budget exactly the frame at the right quantiser
         let exact: u64 = slice_bits(&mut enc, right).iter().sum();
-        // the size guard: no slice fits on every third slice (it ends at Q_MAX), the bits two steps
-        // coarser on the next, no limit on the rest
-        let coarser = slice_bits(&mut enc, right.saturating_add(2).min(224));
-        let tight: Vec<u64> = (0..n).map(|i| [0, coarser[i], u64::MAX][i % 3]).collect();
-        let questions: [(u8, u64, &[u64]); 10] = [
+        // the size guard: limits at the bits five and two steps coarser (those slices are raised a
+        // few quantisers), no limit on the rest; on small frames also no slice fitting at all on
+        // every third slice (it ends at Q_MAX: a round of whole-frame bits per quantiser on the CPU)
+        let coarser = |enc: &mut ProResGpuEncoder, by: u8| slice_bits(enc, right.saturating_add(by).min(224));
+        let (five, two) = (coarser(&mut enc, 5), coarser(&mut enc, 2));
+        let tight: Vec<u64> = (0..n).map(|i| [five[i], two[i], u64::MAX][i % 3]).collect();
+        let none_fit: Vec<u64> = (0..n).map(|i| [0, two[i], u64::MAX][i % 3]).collect();
+        let mut questions: Vec<(u8, u64, &[u64])> = vec![
+            (0, budget, &limits),
             (1, budget, &limits),
             (right, budget, &limits),
             (224, budget, &limits),
+            (255, budget, &limits),
             (right, exact, &limits),
             (right.saturating_sub(1).max(1), exact.saturating_sub(1), &limits),
             // nothing fits
@@ -238,9 +243,13 @@ fn gpu_rate_control_picks_the_cpus_quantisers() {
             (224, 1, &limits),
             // everything fits at Q_MIN
             (224, u64::MAX, &limits),
-            (right, u64::MAX, &tight),
+            (right, budget, &tight),
             (1, budget, &tight),
+            (right, exact, &tight),
         ];
+        if c.cfg.width <= 64 {
+            questions.extend([(right, budget, &none_fit[..]), (right, u64::MAX, &none_fit[..])]);
+        }
         for (hint, budget, limits) in questions {
             let gpu = enc.choose(hint, budget, limits);
             let cpu = cpu_choice(&mut enc, budget, limits, hint);

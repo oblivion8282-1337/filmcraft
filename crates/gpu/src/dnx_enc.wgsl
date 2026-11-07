@@ -630,10 +630,10 @@ fn write(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
 // ---------------------------------------------------------------------------------------------
 //
 // `rc_bits` measures every macroblock at the quantiser the state asks for into the next slot of
-// the slot table; `rc_pick` (one workgroup) adds the slot's scan lines up (each padded to 4 bytes)
-// and runs `search_q` as a state machine until it needs a quantiser not measured yet (or has the
+// the slot table; `rc_lines` (one workgroup per scan line) adds each line up; `rc_pick` (one
+// workgroup) adds the lines up (each padded to 4 bytes) and runs `search_q` as a state machine until it needs a quantiser not measured yet (or has the
 // answer, and then the uniform and the one finer quantiser the refinement reads). The host
-// alternates the two as often as the CPU search can measure (`RC_ROUNDS`); once the state is done
+// alternates the three as often as the CPU search can measure (`RC_ROUNDS`); once the state is done
 // the later rounds return at once. `rc_refine` (one workgroup) is the one-step-finer refinement
 // in the CPU's strided order (stride 7919), `rc_final` (one invocation per macroblock) copies the
 // rows the host keeps (the uniform quantiser's and the finer one's).
@@ -854,6 +854,41 @@ fn rc_advance() {
 var<workgroup> wg_word: u32;
 var<workgroup> wg_sum: array<vec2<u32>, 64>;
 
+// One workgroup per scan line: the line's bits in the newest slot (64-bit, unpadded).
+@compute @workgroup_size(64)
+fn rc_lines(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    if lid == 0u {
+        wg_word = select(0u, 1u, outp[R_DONE] != 0u || outp[R_SLOTS] >= MAX_SLOTS);
+    }
+    if workgroupUniformLoad(&wg_word) != 0u {
+        return;
+    }
+    let s = wid.x;
+    let k = outp[R_SLOTS];
+    var acc = vec2<u32>(0u, 0u);
+    rc_bad = false;
+    if s < P.ns {
+        for (var x = lid; x < P.nw; x = x + 64u) {
+            acc = add64(acc, vec2<u32>(slot_mb(k, s * P.nw + x), 0u));
+        }
+    }
+    if rc_bad {
+        fail();
+    }
+    wg_sum[lid] = acc;
+    for (var w = 32u; w > 0u; w = w / 2u) {
+        workgroupBarrier();
+        if lid < w {
+            wg_sum[lid] = add64(wg_sum[lid], wg_sum[lid + w]);
+        }
+    }
+    if lid == 0u && s < P.ns {
+        let at = lines_base() + (k * P.ns + s) * 2u;
+        outp[at] = wg_sum[0].x;
+        outp[at + 1u] = wg_sum[0].y;
+    }
+}
+
 @compute @workgroup_size(64)
 fn rc_pick(@builtin(local_invocation_index) lid: u32) {
     if lid == 0u {
@@ -864,21 +899,12 @@ fn rc_pick(@builtin(local_invocation_index) lid: u32) {
     }
     let k = outp[R_SLOTS];
     var acc = vec2<u32>(0u, 0u);
-    rc_bad = false;
     if k < MAX_SLOTS {
+        // the frame: every line padded to 32 bits (`rc_lines` added the lines up)
         for (var s = lid; s < P.ns; s = s + 64u) {
-            var line = vec2<u32>(0u, 0u);
-            for (var x = 0u; x < P.nw; x = x + 1u) {
-                line = add64(line, vec2<u32>(slot_mb(k, s * P.nw + x), 0u));
-            }
             let at = lines_base() + (k * P.ns + s) * 2u;
-            outp[at] = line.x;
-            outp[at + 1u] = line.y;
-            acc = add64(acc, pad64(line));
+            acc = add64(acc, pad64(vec2<u32>(outp[at], outp[at + 1u])));
         }
-    }
-    if rc_bad {
-        fail();
     }
     wg_sum[lid] = acc;
     for (var w = 32u; w > 0u; w = w / 2u) {
@@ -991,8 +1017,13 @@ fn refine_load(lid: u32, base: u32, kq: u32, kf: u32) -> u32 {
         let idx = visit(base + j);
         let f = slot_mb(kf, idx);
         let s = idx / P.nw;
+        let e = f - min(slot_mb(kq, idx), f);
+        // (`refine_each` and `refine_all` add it to a line below RF_WIDE: no wrap)
+        if e >= RF_WIDE {
+            rc_bad = true;
+        }
         rf_at[j] = idx | (s << 20u);
-        rf_extra[j] = f - min(slot_mb(kq, idx), f);
+        rf_extra[j] = e;
         atomicStore(&rf_first[s], RF_SEEN);
         atomicStore(&rf_add[s], 0u);
     }

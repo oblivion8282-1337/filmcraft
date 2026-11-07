@@ -640,7 +640,7 @@ fn rc_bits(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
 }
 
 // The search's answer `qg`: then the finer quantiser, if the refinement reads it and it was not
-// measured yet.
+// measured yet (a guard: when the refinement reads it, it is the bracket's `lo`, measured).
 fn rc_found(qg: u32) {
     outp[R_QG] = qg;
     let k = slot_of(qg);

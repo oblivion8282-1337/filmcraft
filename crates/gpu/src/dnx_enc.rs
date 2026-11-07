@@ -281,7 +281,7 @@ fn parse_choice(words: &[u32], nmb: usize) -> Result<Choice, Fail> {
 
 struct Pipes {
     transform: wgpu::ComputePipeline,
-    rc: [wgpu::ComputePipeline; 4],
+    rc: [wgpu::ComputePipeline; 5],
     rle: wgpu::ComputePipeline,
     bits: wgpu::ComputePipeline,
     write: wgpu::ComputePipeline,
@@ -316,7 +316,7 @@ impl Pipes {
                 cache: None,
             })
         };
-        let rc = [pipeline("rc_bits"), pipeline("rc_pick"), pipeline("rc_refine"), pipeline("rc_final")];
+        let rc = [pipeline("rc_bits"), pipeline("rc_lines"), pipeline("rc_pick"), pipeline("rc_refine"), pipeline("rc_final")];
         Pipes { transform: pipeline("transform"), rc, rle: pipeline("rle"), bits: pipeline("bits"), write: pipeline("write"), bgl }
     }
 }
@@ -580,7 +580,7 @@ impl DnxGpuEncoder {
         ok.then_some(bytes)
     }
 
-    /// `rate_control` in compute passes: `RC_ROUNDS` rounds of measuring and picking and the
+    /// `rate_control` in compute passes: `RC_ROUNDS` rounds of measuring, adding up and picking, and the
     /// refinement, in one submission with one read-back.
     fn rate_control(&mut self, f: &Loaded, hint: u32, budget: u64) -> Result<Choice, Fail> {
         let nmb = f.nmb();
@@ -593,10 +593,12 @@ impl DnxGpuEncoder {
         self.gpu.queue.write_buffer(&rc, 0, &le_bytes(&state));
         self.gpu.queue.write_buffer(&aux, 0, &le_bytes(&[budget as u32, (budget >> 32) as u32, hint, 0]));
         let mbs = groups(nmb as u64, self.maxg()).ok_or(Fail::Decline)?;
-        let [bits, pick, refine, last] = &self.pipes.rc;
-        let mut passes = Vec::with_capacity(RC_ROUNDS * 2 + 2);
+        // (one workgroup per scan line: `rc_bytes` keeps them within a dimension's 1024)
+        let lines = (f.params.ns, 1);
+        let [bits, sums, pick, refine, last] = &self.pipes.rc;
+        let mut passes = Vec::with_capacity(RC_ROUNDS * 3 + 2);
         for _ in 0..RC_ROUNDS {
-            passes.extend([(bits, "dnx-enc-rc-bits", mbs), (pick, "dnx-enc-rc-pick", (1, 1))]);
+            passes.extend([(bits, "dnx-enc-rc-bits", mbs), (sums, "dnx-enc-rc-lines", lines), (pick, "dnx-enc-rc-pick", (1, 1))]);
         }
         passes.extend([(refine, "dnx-enc-rc-refine", (1, 1)), (last, "dnx-enc-rc-final", mbs)]);
         let mut enc = self.encoder();
