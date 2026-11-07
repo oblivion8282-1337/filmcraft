@@ -116,7 +116,7 @@ bits at a quantiser including DC differences, bit layout and coding, alpha, rate
 shaders in the app ([ADR 0003](../../docs/adr/0003-gpu-intra-encode.md)). Rate control, headers and frame
 assembly stay here, and a backend that declines, fails or answers inconsistently makes the encoder code
 the frame itself (the returned flag says which). `encode_resident` does the same for planes the backend
-already holds. `ReferenceBackend` (`doc(hidden)`) is the CPU test double. No new dependency.
+already holds. `ReferenceBackend` is the CPU test double, behind the `test-support` feature (off by default; other crates enable it in their dev-dependencies only). No new dependency.
 
 ## Accuracy (vs ffmpeg as an external oracle)
 
