@@ -3,7 +3,7 @@ use super::Ordering;
 use super::encoders::{aac_factory, apv_factory, dnx_factory, h264_factory, mjpeg_factory, prores_factory};
 use super::format::{ExportSettings, Format};
 #[cfg(test)]
-use super::stats::{GPU_FALLBACKS, GPU_FRAMES};
+use super::stats::{GPU_ENCODE_FALLBACKS, GPU_ENCODED, GPU_FALLBACKS, GPU_FRAMES};
 use super::{FrameRate, ItemId, OnceLock, PoisonError, Project, Result, RwLock, SampleEntry, SourceProvider, Tick};
 
 /// A packet produced by a video encoder.
@@ -163,6 +163,62 @@ pub(crate) fn reset_frame_renderers_for_tests() {
 pub(crate) fn build_frame_renderer() -> Option<Box<dyn FrameRenderer>> {
     let g = frame_renderer_factories().read().unwrap_or_else(PoisonError::into_inner);
     g.iter().filter_map(|f| f()).next()
+}
+
+/// Builds the ProRes slice backend (the GPU) for one export, or `None` when this host cannot.
+pub type ProResBackendFactory = fn() -> Option<Box<dyn filmcraft_prores::SliceBackend>>;
+
+/// Builds the DNxHR macroblock backend (the GPU) for one export, or `None` when this host cannot.
+pub type DnxBackendFactory = fn() -> Option<Box<dyn filmcraft_dnx::MacroblockBackend>>;
+
+fn prores_backend_factories() -> &'static RwLock<Vec<ProResBackendFactory>> {
+    static F: OnceLock<RwLock<Vec<ProResBackendFactory>>> = OnceLock::new();
+    F.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn dnx_backend_factories() -> &'static RwLock<Vec<DnxBackendFactory>> {
+    static F: OnceLock<RwLock<Vec<DnxBackendFactory>>> = OnceLock::new();
+    F.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Register a ProRes backend factory: under *Hardware encoding: Auto* the ProRes encoder takes a
+/// backend from it (tried before those registered earlier) for the per-block work, and codes a
+/// picture itself whenever the backend declines or fails. Registering the same factory twice is harmless.
+pub fn register_prores_backend(f: ProResBackendFactory) {
+    let mut g = prores_backend_factories().write().unwrap_or_else(PoisonError::into_inner);
+    if !g.iter().any(|x| std::ptr::fn_addr_eq(*x, f)) {
+        g.insert(0, f);
+    }
+}
+
+/// [`register_prores_backend`] for the DNxHR encoder.
+pub fn register_dnx_backend(f: DnxBackendFactory) {
+    let mut g = dnx_backend_factories().write().unwrap_or_else(PoisonError::into_inner);
+    if !g.iter().any(|x| std::ptr::fn_addr_eq(*x, f)) {
+        g.insert(0, f);
+    }
+}
+
+/// The first registered ProRes backend this host can make.
+pub(crate) fn build_prores_backend() -> Option<Box<dyn filmcraft_prores::SliceBackend>> {
+    let g = prores_backend_factories().read().unwrap_or_else(PoisonError::into_inner);
+    g.iter().filter_map(|f| f()).next()
+}
+
+/// The first registered DNxHR backend this host can make.
+pub(crate) fn build_dnx_backend() -> Option<Box<dyn filmcraft_dnx::MacroblockBackend>> {
+    let g = dnx_backend_factories().read().unwrap_or_else(PoisonError::into_inner);
+    g.iter().filter_map(|f| f()).next()
+}
+
+/// Clear the registered encoder backends and their counters. Test-only, like
+/// [`reset_frame_renderers_for_tests`].
+#[cfg(test)]
+pub(crate) fn reset_encoder_backends_for_tests() {
+    prores_backend_factories().write().unwrap_or_else(PoisonError::into_inner).clear();
+    dnx_backend_factories().write().unwrap_or_else(PoisonError::into_inner).clear();
+    GPU_ENCODED.store(0, Ordering::Relaxed);
+    GPU_ENCODE_FALLBACKS.store(0, Ordering::Relaxed);
 }
 
 pub fn register_audio_encoder(f: AudioEncoderFactory) {
