@@ -1027,9 +1027,7 @@ mod backend_tests {
     /// The crate's own CPU functions behind the backend trait.
     #[derive(Default)]
     struct CpuMbBackend {
-        enc: Option<Encoder>,
-        prep: Option<Prepared>,
-        rgb: bool,
+        inner: ReferenceBackend,
         lie: Lie,
         choose: Choose,
         choose_calls: usize,
@@ -1047,22 +1045,14 @@ mod backend_tests {
 
     impl MacroblockBackend for CpuMbBackend {
         fn load(&mut self, cfg: &EncoderConfig, frame: &Frame) -> bool {
-            if self.lie == Lie::Decline {
-                return false;
-            }
-            let Ok(enc) = Encoder::with_config(cfg.clone()) else { return false };
-            self.prep = Some(enc.prepare(frame));
-            self.enc = Some(enc);
-            self.rgb = frame.rgb;
-            true
+            self.lie != Lie::Decline && self.inner.load(cfg, frame)
         }
         fn bits(&mut self, q: u32) -> Option<Vec<u32>> {
             self.bits_calls += 1;
             if self.lie == Lie::FailBits {
                 return None;
             }
-            let (enc, prep) = (self.enc.as_ref()?, self.prep.as_ref()?);
-            let mut v = Coder::new(&enc.cfg, enc.info, prep, self.rgb).all_bits(q);
+            let mut v = self.inner.bits(q)?;
             if self.lie == Lie::ShortBits {
                 v.pop();
             }
@@ -1072,27 +1062,7 @@ mod backend_tests {
             if self.lie == Lie::FailWrite {
                 return None;
             }
-            let (enc, prep) = (self.enc.as_ref()?, self.prep.as_ref()?);
-            let coder = Coder::new(&enc.cfg, enc.info, prep, self.rgb);
-            let finish = |w: Writer| w.finish_bits();
-            let mut out = Vec::new();
-            for s in 0..prep.ns {
-                let mut pred = [0i32; 4];
-                for mb in 0..prep.nw {
-                    let m = s * prep.nw + mb;
-                    let mut w = Writer::new();
-                    coder.put_colour(&mut w, m, *qs.get(m)?, &mut pred);
-                    out.push(finish(w));
-                }
-                if enc.cfg.alpha.is_some() {
-                    for mb in 0..prep.nw {
-                        let m = s * prep.nw + mb;
-                        let mut w = Writer::new();
-                        coder.put_alpha(&mut w, m, *qs.get(m)?, &mut pred);
-                        out.push(finish(w));
-                    }
-                }
-            }
+            let mut out = self.inner.write(qs)?;
             match self.lie {
                 Lie::ExtraByte(i) => {
                     let e = out.get_mut(i)?;
@@ -1124,8 +1094,8 @@ mod backend_tests {
                 Choose::Default => None,
                 Choose::Fixed(qs) => Some(qs),
                 Choose::Cpu => {
-                    let (enc, prep) = (self.enc.as_ref()?, self.prep.as_ref()?);
-                    let coder = Coder::new(&enc.cfg, enc.info, prep, self.rgb);
+                    let (enc, prep) = (self.inner.enc.as_ref()?, self.inner.prep.as_ref()?);
+                    let coder = Coder::new(&enc.cfg, enc.info, prep, self.inner.rgb);
                     rate_control(hint, prep.nw, prep.ns, budget, &mut |q| Some(coder.all_bits(q))).map(|(qs, _)| qs)
                 }
             }

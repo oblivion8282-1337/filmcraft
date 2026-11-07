@@ -199,16 +199,24 @@ pub fn register_dnx_backend(f: DnxBackendFactory) {
     }
 }
 
+/// The first of `factories` that makes a backend. Device creation is where a driver fault is
+/// likeliest, so the factories run outside the registry lock and a panicking one counts as one
+/// that cannot (the export then encodes on the CPU). That is not counted in
+/// `encode_fallbacks`, which counts pictures given to a backend.
+fn first_backend<B: ?Sized>(factories: Vec<fn() -> Option<Box<B>>>) -> Option<Box<B>> {
+    factories.into_iter().find_map(|f| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok().flatten())
+}
+
 /// The first registered ProRes backend this host can make.
 pub(crate) fn build_prores_backend() -> Option<Box<dyn filmcraft_prores::SliceBackend>> {
-    let g = prores_backend_factories().read().unwrap_or_else(PoisonError::into_inner);
-    g.iter().filter_map(|f| f()).next()
+    let list = prores_backend_factories().read().unwrap_or_else(PoisonError::into_inner).clone();
+    first_backend(list)
 }
 
 /// The first registered DNxHR backend this host can make.
 pub(crate) fn build_dnx_backend() -> Option<Box<dyn filmcraft_dnx::MacroblockBackend>> {
-    let g = dnx_backend_factories().read().unwrap_or_else(PoisonError::into_inner);
-    g.iter().filter_map(|f| f()).next()
+    let list = dnx_backend_factories().read().unwrap_or_else(PoisonError::into_inner).clone();
+    first_backend(list)
 }
 
 /// Clear the registered encoder backends and their counters. Test-only, like
