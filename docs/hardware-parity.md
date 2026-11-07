@@ -43,7 +43,7 @@ and re-uploaded to wgpu (**no zero-copy** yet), which Premiere avoids.
 | DNxHD / DNxHR | n/a | software; wgpu compute encode in the app (untested on Apple GPUs, ADR 0003) | n/a | wgpu compute (tested on NVIDIA / Vulkan only), software fallback | wgpu compute (tested on NVIDIA / Vulkan only), software fallback |
 | AV1 | — | no | via plug-ins / newer GPUs | no | no |
 
-ProRes and DNxHR encode run in wgpu compute shaders (Export ▸ Hardware encoding: Auto) and are
+ProRes and DNxHR encode run in wgpu compute shaders (Export ▸ GPU Encoding, the Hardware encoding setting: Auto) and are
 byte-identical to the software encoder where tested; tested on NVIDIA / Vulkan only, other GPUs fall back to
 software if they cannot run it. 4K HQ frame,
 encoder alone: ProRes 42.4 → 10.6 ms, DNxHR 57.9 → 8.0 ms (RTX 4090; [performance.md](performance.md#results-gpu-prores-and-dnx-encode-adr-0003)).

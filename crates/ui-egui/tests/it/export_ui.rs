@@ -330,6 +330,40 @@ fn a_field_order_the_format_cannot_write_goes_back_to_progressive() {
     assert_eq!(d.app().ui.export.settings.field_order, FieldOrder::Progressive);
 }
 
+/// ProRes and DNxHR, on their own and in MXF, show the Hardware encoding setting as GPU encoding
+/// (the encoders run in compute shaders), under the same automation id as H.264's checkbox:
+/// clicking it switches the export's hardware encoding to Auto and back.
+#[test]
+fn prores_and_dnxhr_offer_gpu_encoding() {
+    use filmcraft_engine::export::{ExportSettings, Format, HardwareEncoding, MxfVideoCodec};
+    let mut d = Driver::new("gpu-encoding");
+    d.ok("ui.set", json!({"mode": "export"}));
+    d.frames(3);
+    let cases = [
+        ("ProRes", Format::ProRes, MxfVideoCodec::default()),
+        ("DNxHR", Format::DnxHr, MxfVideoCodec::default()),
+        ("MXF ProRes", Format::MxfOp1a, MxfVideoCodec::ProRes),
+        ("MXF OP-Atom DNxHR", Format::MxfOpAtom, MxfVideoCodec::Dnxhr),
+    ];
+    for (name, format, mxf_video_codec) in cases {
+        d.app().ui.export.settings = ExportSettings { format, mxf_video_codec, ..Default::default() };
+        d.frames(3);
+        assert!(d.has("export.video.hardwareEncoding"), "{name}");
+        let label = d.ok("ui.elements", json!({"prefix": "export.video.hardwareEncoding"}))[0]["label"].as_str().unwrap().to_string();
+        assert_eq!(label, "Encode on the GPU when available", "{name}");
+        assert_eq!(d.app().ui.export.settings.hardware_encoding, HardwareEncoding::Off, "{name}: off by default");
+        d.click("export.video.hardwareEncoding");
+        assert_eq!(d.app().ui.export.settings.hardware_encoding, HardwareEncoding::Auto, "{name}: on");
+        d.click("export.video.hardwareEncoding");
+        assert_eq!(d.app().ui.export.settings.hardware_encoding, HardwareEncoding::Off, "{name}: off again");
+    }
+    // H.264 keeps its hardware encoder wording
+    d.app().ui.export.settings = ExportSettings::default();
+    d.frames(3);
+    let label = d.ok("ui.elements", json!({"prefix": "export.video.hardwareEncoding"}))[0]["label"].as_str().unwrap().to_string();
+    assert_eq!(label, "Use the hardware encoder when available");
+}
+
 #[test]
 fn preset_manager_search_favourite_save_apply() {
     let mut d = Driver::new("manager");
