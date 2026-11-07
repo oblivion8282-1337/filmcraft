@@ -282,7 +282,8 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   Decoders run slices on rayon, so an export worker waiting inside a decode can pick up another
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.
-- **GPU ProRes / DNx encoding.** The same Export ▸ Hardware encoding setting (`Auto`) also lets
+- **GPU ProRes / DNx encoding.** The same Hardware encoding setting (`Auto`; for ProRes and DNxHR the Export
+  panel shows it as GPU Encoding) also lets
   `filmcraft-gpu-export` register wgpu compute encoders for ProRes and DNxHR, behind the codec crates'
   `SliceBackend` / `MacroblockBackend` ([ADR 0003](adr/0003-gpu-intra-encode.md)); output is
   byte-identical to the software encoders, which take any frame the GPU declines.
