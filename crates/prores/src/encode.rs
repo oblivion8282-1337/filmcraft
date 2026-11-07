@@ -1031,6 +1031,30 @@ mod backend_tests {
         fail_bits: bool,
         fail_write: bool,
         decline: bool,
+        choose: ChooseMode,
+        alpha_mode: AlphaMode,
+        choose_calls: usize,
+    }
+
+    #[derive(Default)]
+    enum ChooseMode {
+        #[default]
+        Default,
+        /// The CPU algorithm's own answer over this backend's bits.
+        Cpu,
+        /// A fixed answer, whatever the frame.
+        Fixed(Vec<u8>, u8),
+        /// The CPU algorithm's quantisers with one entry too many.
+        TooLong,
+    }
+
+    #[derive(Default)]
+    enum AlphaMode {
+        #[default]
+        Slices,
+        Nothing,
+        /// One entry too few.
+        WrongCount,
     }
 
     impl SliceBackend for CpuBackend {
@@ -1069,7 +1093,32 @@ mod backend_tests {
             Some(out)
         }
         fn alpha(&mut self) -> Option<Vec<Vec<u8>>> {
-            self.slices.iter().map(|sd| sd.alpha.clone()).collect()
+            match self.alpha_mode {
+                AlphaMode::Slices => self.slices.iter().map(|sd| sd.alpha.clone()).collect(),
+                AlphaMode::Nothing => None,
+                AlphaMode::WrongCount => {
+                    let mut v: Vec<Vec<u8>> = self.slices.iter().map(|sd| sd.alpha.clone()).collect::<Option<_>>()?;
+                    v.pop();
+                    Some(v)
+                }
+            }
+        }
+        fn choose(&mut self, hint: u8, budget: u64, limits: &[u64]) -> Option<(Vec<u8>, u8)> {
+            self.choose_calls += 1;
+            let cpu = || {
+                let slices = &self.slices;
+                choose_quantisers(budget, limits, hint, &mut |q| Some(slices.iter().map(|sd| slice_bits(sd, q)).collect()))
+            };
+            match &self.choose {
+                ChooseMode::Default => None,
+                ChooseMode::Cpu => cpu(),
+                ChooseMode::Fixed(qs, qg) => Some((qs.clone(), *qg)),
+                ChooseMode::TooLong => {
+                    let (mut qs, qg) = cpu()?;
+                    qs.push(qg);
+                    Some((qs, qg))
+                }
+            }
         }
     }
 
@@ -1174,5 +1223,55 @@ mod backend_tests {
         assert!(measured.iter().all(|&q| (Q_MIN..=Q_MAX).contains(&q)));
         let distinct = measured.iter().collect::<std::collections::BTreeSet<_>>().len();
         assert_eq!(distinct, measured.len(), "no quantiser is measured twice: {measured:?}");
+    }
+
+    #[test]
+    fn a_valid_choose_answer_is_used() {
+        let (w, h) = (128, 64);
+        for profile in [Profile::Hq, Profile::P4444] {
+            let f = test_frame(profile, w, h, 11);
+            let cpu = Encoder::new(profile, w, h).encode(&f).unwrap();
+            let mut b = CpuBackend { choose: ChooseMode::Cpu, ..Default::default() };
+            let (out, used) = Encoder::new(profile, w, h).encode_with(&f, Some(&mut b)).unwrap();
+            assert_eq!(b.choose_calls, 1);
+            assert!(used, "{profile:?}");
+            assert_eq!(out, cpu, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_choose_answer_is_ignored() {
+        let (w, h) = (128, 64);
+        let n = Encoder::new(Profile::Hq, w, h).slice_jobs().len();
+        let f = test_frame(Profile::Hq, w, h, 13);
+        let cpu = Encoder::new(Profile::Hq, w, h).encode(&f).unwrap();
+        let cases = [
+            ("q = 0", ChooseMode::Fixed(vec![0; n], 4)),
+            ("q = 225", ChooseMode::Fixed(vec![225; n], 4)),
+            ("qg = 0", ChooseMode::Fixed(vec![4; n], 0)),
+            ("too few", ChooseMode::Fixed(vec![4; n - 1], 4)),
+            ("too many", ChooseMode::TooLong),
+            ("empty", ChooseMode::Fixed(Vec::new(), 4)),
+        ];
+        for (name, choose) in cases {
+            let mut b = CpuBackend { choose, ..Default::default() };
+            let (out, used) = Encoder::new(Profile::Hq, w, h).encode_with(&f, Some(&mut b)).unwrap();
+            assert_eq!(b.choose_calls, 1, "{name}");
+            assert!(used, "{name}: the backend still codes it, over the CPU's rate control");
+            assert_eq!(out, cpu, "{name}");
+        }
+    }
+
+    #[test]
+    fn missing_or_miscounted_alpha_is_coded_by_the_cpu() {
+        let (w, h) = (128, 64);
+        let f = test_frame(Profile::P4444, w, h, 17);
+        let cpu = Encoder::new(Profile::P4444, w, h).encode(&f).unwrap();
+        for (name, alpha_mode) in [("none", AlphaMode::Nothing), ("wrong count", AlphaMode::WrongCount)] {
+            let mut b = CpuBackend { alpha_mode, ..Default::default() };
+            let (out, used) = Encoder::new(Profile::P4444, w, h).encode_with(&f, Some(&mut b)).unwrap();
+            assert!(used, "{name}");
+            assert_eq!(out, cpu, "{name}");
+        }
     }
 }
