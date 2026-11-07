@@ -333,6 +333,60 @@ fn interlaced_frames_are_declined() {
     assert!(!enc.load(&cfg, &frame));
 }
 
+/// Flat alpha with full-scale noise in macroblocks 1 and 5 (the rest fits the frame easily).
+fn alpha_noise_in_two_macroblocks(profile: Profile, w: u32, h: u32, depth: u8) -> Frame {
+    let mut f = test_frame(profile, w, h, depth, false, true, 21);
+    let mut s = 777u32;
+    let nw = w.div_ceil(16) as usize;
+    if let Some(a) = f.alpha.as_mut() {
+        for (i, v) in a.iter_mut().enumerate() {
+            let (x, y) = (i % w as usize, i / w as usize);
+            let m = (y / 16) * nw + x / 16;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *v = if m == 1 || m == 5 { (s % (1 << depth)) as u16 } else { 200 };
+        }
+    }
+    f
+}
+
+#[test]
+fn lossless_alpha_codes_noisy_macroblocks_as_raw_samples() {
+    let Some(mut enc) = encoder("lossless_alpha_codes_noisy_macroblocks_as_raw_samples") else { return };
+    for (profile, depth) in [(Profile::Hq, 8u8), (Profile::R444, 12)] {
+        let (w, h) = (128, 64);
+        let cfg = EncoderConfig { bit_depth: depth, alpha: Some(AlphaCoding::Lossless), ..EncoderConfig::new(profile, w, h) };
+        let frame = alpha_noise_in_two_macroblocks(profile, w, h, depth);
+        let name = format!("{profile:?} {depth}-bit");
+        // the backend's own answer: the noisy macroblocks' alpha parts are the raw escape (a zero
+        // 4-bit header, then 256 samples), the flat ones run-length coded (header 1)
+        assert!(enc.load(&cfg, &frame), "{name}");
+        let nw = (w / 16) as usize;
+        let parts = enc.write(&vec![30; nw * (h / 16) as usize]).unwrap();
+        let raw_bits = 4 + 256 * u32::from(depth);
+        let mut raw = Vec::new();
+        for (s, line) in parts.chunks(2 * nw).enumerate() {
+            for (mb, (bytes, bits)) in line.iter().skip(nw).enumerate() {
+                let header = bytes.first().map(|b| b >> 4);
+                if header == Some(0) {
+                    assert_eq!(*bits, raw_bits, "{name}: raw macroblock {mb} of line {s}");
+                    raw.push(s * nw + mb);
+                } else {
+                    assert_eq!(header, Some(1), "{name}: macroblock {mb} of line {s}");
+                }
+            }
+        }
+        assert_eq!(raw, vec![1, 5], "{name}: the macroblocks coded raw");
+        // and through the encoder: the CPU's frame, alpha decoded exactly
+        let (cpu, gpu, used) = both(&mut enc, &cfg, &frame).unwrap();
+        assert!(used, "{name}: the GPU did not encode the frame");
+        assert!(gpu == cpu, "{name}: the GPU frame is not the CPU's");
+        let dec = decode_frame(&gpu).unwrap();
+        assert!(dec.alpha.as_ref() == frame.alpha.as_ref(), "{name}: alpha not lossless");
+    }
+}
+
 #[test]
 fn questions_out_of_order_get_no_answer() {
     let Some(mut enc) = encoder("questions_out_of_order_get_no_answer") else { return };
@@ -366,12 +420,14 @@ fn gpu_dnx_frames_decode_in_ffmpeg() {
         let name = format!("{profile:?}_{depth}bit{}_{w}x{h}", if rgb { "_rgb" } else { "" });
         let cfg = EncoderConfig { bit_depth: depth, ..EncoderConfig::new(profile, w, h) };
         let frames: Vec<Frame> = (0..2).map(|i| test_frame(profile, w, h, depth, rgb, false, 9 + i)).collect();
-        let mut e = Encoder::with_config(cfg).unwrap();
+        let (mut e, mut cpu) = (Encoder::with_config(cfg.clone()).unwrap(), Encoder::with_config(cfg).unwrap());
         let coded: Vec<Vec<u8>> = frames
             .iter()
             .map(|f| {
                 let (c, used) = e.encode_with(f, Some(&mut enc)).unwrap();
                 assert!(used, "{name}");
+                // (so a difference to our decoder below is the CPU encoder's frame's too)
+                assert!(c == cpu.encode(f).unwrap(), "{name}: the GPU frame is not the CPU's");
                 c
             })
             .collect();
